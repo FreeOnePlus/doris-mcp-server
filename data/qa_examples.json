@@ -1,0 +1,52 @@
+[
+  {
+    "question": "查询销售额前10的产品及其销售数量",
+    "sql": "SELECT p.product_name, SUM(oi.price * oi.quantity) AS total_sales, SUM(oi.quantity) AS total_quantity FROM order_items oi JOIN products p ON oi.product_id = p.id GROUP BY p.product_name ORDER BY total_sales DESC LIMIT 10",
+    "explanation": "此查询计算每个产品的总销售额（价格乘以数量）和总销售数量，按销售额从高到低排序，并返回前10条记录。"
+  },
+  {
+    "question": "计算每个区域今年与去年同期的销售额对比",
+    "sql": "SELECT r.region_name, \n    SUM(CASE WHEN YEAR(o.order_date) = YEAR(CURDATE()) THEN oi.price * oi.quantity ELSE 0 END) AS current_year_sales,\n    SUM(CASE WHEN YEAR(o.order_date) = YEAR(CURDATE()) - 1 THEN oi.price * oi.quantity ELSE 0 END) AS previous_year_sales,\n    (SUM(CASE WHEN YEAR(o.order_date) = YEAR(CURDATE()) THEN oi.price * oi.quantity ELSE 0 END) - \n     SUM(CASE WHEN YEAR(o.order_date) = YEAR(CURDATE()) - 1 THEN oi.price * oi.quantity ELSE 0 END)) AS sales_difference,\n    CASE \n        WHEN SUM(CASE WHEN YEAR(o.order_date) = YEAR(CURDATE()) - 1 THEN oi.price * oi.quantity ELSE 0 END) > 0 \n        THEN ROUND((SUM(CASE WHEN YEAR(o.order_date) = YEAR(CURDATE()) THEN oi.price * oi.quantity ELSE 0 END) - \n                SUM(CASE WHEN YEAR(o.order_date) = YEAR(CURDATE()) - 1 THEN oi.price * oi.quantity ELSE 0 END)) / \n                SUM(CASE WHEN YEAR(o.order_date) = YEAR(CURDATE()) - 1 THEN oi.price * oi.quantity ELSE 0 END) * 100, 2)\n        ELSE NULL\n    END AS percentage_change\nFROM regions r\nJOIN stores s ON r.region_id = s.region_id\nJOIN orders o ON s.store_id = o.store_id\nJOIN order_items oi ON o.order_id = oi.order_id\nWHERE YEAR(o.order_date) >= YEAR(CURDATE()) - 1\nGROUP BY r.region_name\nORDER BY r.region_name",
+    "explanation": "此查询比较每个区域今年和去年的销售额，计算差额和百分比变化。使用CASE语句分别统计今年和去年的销售额。"
+  },
+  {
+    "question": "分析过去30天内每个用户的活跃度",
+    "sql": "SELECT \n    u.user_id, \n    COUNT(DISTINCT ua.activity_type) AS unique_activity_types,\n    COUNT(ua.id) AS total_activities,\n    MAX(ua.activity_time) AS last_activity_time,\n    DATEDIFF(CURDATE(), MIN(ua.activity_time)) AS days_since_first_activity\nFROM user_activities ua\nJOIN customers u ON ua.user_id = u.customer_id\nWHERE ua.activity_time >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)\nGROUP BY u.user_id\nORDER BY total_activities DESC",
+    "explanation": "此查询计算过去30天内每个用户的活动类型数量、总活动次数、最后活动时间和首次活动以来的天数，按总活动次数降序排列。"
+  },
+  {
+    "question": "统计各区域的销售总额和订单数量",
+    "sql": "SELECT \n    r.region_name, \n    COUNT(DISTINCT o.order_id) AS order_count,\n    SUM(oi.price * oi.quantity) AS total_sales,\n    AVG(oi.price * oi.quantity) AS avg_order_value\nFROM regions r\nJOIN stores s ON r.region_id = s.region_id\nJOIN orders o ON s.store_id = o.store_id\nJOIN order_items oi ON o.order_id = oi.order_id\nGROUP BY r.region_name\nORDER BY total_sales DESC",
+    "explanation": "此查询按区域统计订单数量、总销售额和平均订单金额，并按总销售额降序排列。"
+  },
+  {
+    "question": "查询每个类别的平均销售额和库存量",
+    "sql": "SELECT \n    p.category, \n    COUNT(DISTINCT p.id) AS product_count,\n    AVG(p.price) AS avg_price,\n    SUM(p.inventory) AS total_inventory,\n    SUM(oi.price * oi.quantity) AS total_sales\nFROM products p\nLEFT JOIN order_items oi ON p.id = oi.product_id\nGROUP BY p.category\nORDER BY total_sales DESC",
+    "explanation": "此查询按产品类别统计产品数量、平均价格、总库存和总销售额，并按总销售额降序排列。"
+  },
+  {
+    "question": "找出客户购买行为和消费模式",
+    "sql": "SELECT \n    c.customer_id, \n    c.customer_name,\n    COUNT(DISTINCT o.order_id) AS order_count,\n    SUM(oi.price * oi.quantity) AS total_spent,\n    AVG(oi.price * oi.quantity) AS avg_order_value,\n    MAX(o.order_date) AS last_order_date,\n    COUNT(DISTINCT p.category) AS purchased_categories\nFROM customers c\nJOIN orders o ON c.customer_id = o.customer_id\nJOIN order_items oi ON o.order_id = oi.order_id\nJOIN products p ON oi.product_id = p.id\nGROUP BY c.customer_id, c.customer_name\nORDER BY total_spent DESC",
+    "explanation": "此查询分析每个客户的购买行为，包括订单数量、总消费金额、平均订单价值、最近订单日期和购买的产品类别数量。"
+  },
+  {
+    "question": "分析不同时间段的销售趋势",
+    "sql": "SELECT \n    DATE_FORMAT(o.order_date, '%Y-%m') AS month,\n    COUNT(DISTINCT o.order_id) AS order_count,\n    SUM(oi.price * oi.quantity) AS total_sales,\n    COUNT(DISTINCT o.customer_id) AS unique_customers\nFROM orders o\nJOIN order_items oi ON o.order_id = oi.order_id\nWHERE o.order_date >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)\nGROUP BY DATE_FORMAT(o.order_date, '%Y-%m')\nORDER BY month",
+    "explanation": "此查询分析过去12个月内每个月的销售趋势，包括订单数量、总销售额和独立客户数量。"
+  },
+  {
+    "question": "计算产品利润率并按利润率排序",
+    "sql": "SELECT \n    p.id,\n    p.product_name,\n    p.category,\n    p.price,\n    p.cost,\n    (p.price - p.cost) AS profit_per_unit,\n    ROUND((p.price - p.cost) / p.cost * 100, 2) AS profit_margin_percentage,\n    SUM(oi.quantity) AS total_quantity_sold,\n    SUM((p.price - p.cost) * oi.quantity) AS total_profit\nFROM products p\nLEFT JOIN order_items oi ON p.id = oi.product_id\nGROUP BY p.id, p.product_name, p.category, p.price, p.cost\nORDER BY profit_margin_percentage DESC",
+    "explanation": "此查询计算每个产品的单位利润、利润率百分比和总利润，并按利润率降序排列。"
+  },
+  {
+    "question": "哪家店铺的销售额最高？",
+    "sql": "SELECT \n    s.store_id,\n    s.store_name,\n    r.region_name,\n    COUNT(DISTINCT o.order_id) AS order_count,\n    SUM(oi.price * oi.quantity) AS total_sales\nFROM stores s\nJOIN regions r ON s.region_id = r.region_id\nJOIN orders o ON s.store_id = o.store_id\nJOIN order_items oi ON o.order_id = oi.order_id\nGROUP BY s.store_id, s.store_name, r.region_name\nORDER BY total_sales DESC\nLIMIT 1",
+    "explanation": "此查询查找销售额最高的店铺，包括其订单数量、总销售额及所属区域。"
+  },
+  {
+    "question": "计算每个商品的库存周转率",
+    "sql": "SELECT \n    p.id,\n    p.product_name,\n    p.category,\n    p.inventory AS current_inventory,\n    SUM(oi.quantity) AS total_sold,\n    CASE \n        WHEN p.inventory > 0 THEN ROUND(SUM(oi.quantity) / p.inventory, 2)\n        ELSE NULL\n    END AS inventory_turnover_ratio\nFROM products p\nLEFT JOIN order_items oi ON p.id = oi.product_id\nGROUP BY p.id, p.product_name, p.category, p.inventory\nORDER BY inventory_turnover_ratio DESC",
+    "explanation": "此查询计算每个产品的库存周转率（总销售量除以当前库存），用于评估哪些产品卖得快。"
+  }
+] 

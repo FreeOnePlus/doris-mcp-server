@@ -1,0 +1,5 @@
+requests>=2.30.0
+python-dotenv>=1.0.0
+tqdm>=4.66.0
+jsonschema>=4.17.3
+PyYAML>=6.0 
