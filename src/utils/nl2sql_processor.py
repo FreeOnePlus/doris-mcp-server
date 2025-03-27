@@ -176,9 +176,59 @@ class NL2SQLProcessor:
         try:
             from src.utils.metadata_extractor import MetadataExtractor
             self.metadata_extractor = MetadataExtractor()
+            
+            # 在初始化阶段检查并保存内置关键词
+            self._ensure_built_in_keywords_saved()
         except Exception as e:
             logger.error(f"创建元数据提取器出错: {str(e)}")
             self.metadata_extractor = None
+            
+    def _ensure_built_in_keywords_saved(self):
+        """
+        确保内置关键词已保存到数据库中
+        只在初始化时执行一次，避免每次查询都重复保存
+        """
+        if not self.metadata_extractor:
+            return
+            
+        try:
+            # 检查数据库中是否已有内置关键词
+            db_keywords = self.metadata_extractor.get_business_keywords_from_database(self.db_name)
+            
+            # 获取内置关键词
+            strong_business_keywords = self._get_strong_business_keywords()
+            auxiliary_keywords = self._get_auxiliary_keywords()
+            
+            # 如果关键词数量不足，或者数据库中没有足够的内置关键词，执行保存操作
+            # 这里使用简单的数量比较作为判断标准，可以根据需要改进判断逻辑
+            if len(db_keywords) < (len(strong_business_keywords) + len(auxiliary_keywords)) * 0.9:
+                logger.info("数据库中内置关键词不完整，执行保存操作")
+                
+                # 准备关键词数据
+                keywords_to_save = []
+                for keyword in strong_business_keywords:
+                    keywords_to_save.append({
+                        'keyword': keyword,
+                        'confidence': 0.9,  # 强业务关键词给予更高置信度
+                        'category': '强业务关键词',
+                        'source': '系统默认'
+                    })
+                
+                for keyword in auxiliary_keywords:
+                    keywords_to_save.append({
+                        'keyword': keyword,
+                        'confidence': 0.5,  # 辅助关键词给予较低置信度
+                        'category': '辅助关键词',
+                        'source': '系统默认'
+                    })
+                    
+                # 保存到数据库
+                self.metadata_extractor.save_business_keywords(self.db_name, keywords_to_save)
+                logger.info(f"已将内置关键词保存到数据库，强业务关键词: {len(strong_business_keywords)}个，辅助关键词: {len(auxiliary_keywords)}个")
+            else:
+                logger.info("数据库中已存在足够的内置关键词，跳过保存步骤")
+        except Exception as e:
+            logger.error(f"检查或保存内置关键词到数据库时出错: {str(e)}")
     
     def process(self, query: str) -> Dict[str, Any]:
         """
@@ -222,6 +272,7 @@ class NL2SQLProcessor:
                 }
                 log_data["result"] = result
                 log_query_process(log_data, "non_business_query")
+                # 直接返回错误信息，不继续执行后续步骤
                 return result
             
             # 步骤2：查找相似示例
@@ -313,14 +364,73 @@ class NL2SQLProcessor:
         Returns:
             Tuple[bool, float]: 是否是业务查询及置信度
         """
-        # 首先进行关键词匹配（快速路径）
-        keywords = self._extract_business_keywords()
-        for keyword in keywords:
-            if keyword in query:
-                logger.info(f"通过关键词'{keyword}'判断查询'{query}'为业务查询")
-                return True, 0.7  # 关键词匹配有一定置信度，但低于LLM判断
+        # 1. 首先尝试从数据库获取业务关键词并进行匹配
+        try:
+            # 获取数据库中存储的业务关键词及其置信度
+            db_keywords = self.metadata_extractor.get_business_keywords_from_database(self.db_name)
 
-        # 如果关键词没有匹配成功，再尝试使用LLM判断（慢速路径）
+            # 如果数据库中已有关键词，则进行匹配
+            if db_keywords:
+                for keyword, confidence in db_keywords.items():
+                    # 跳过辅助关键词（时间维度、分析维度等非直接业务相关词）
+                    if len(keyword) <= 2 or keyword in self._get_auxiliary_keywords():
+                        continue
+                        
+                    if keyword in query:
+                        logger.info(f"通过数据库业务关键词'{keyword}'判断查询'{query}'为业务查询，置信度: {confidence}")
+                        return True, confidence
+                
+                logger.info("数据库中的业务关键词匹配失败，使用内置关键词继续匹配")
+            else:
+                logger.info("数据库中未找到业务关键词，使用内置关键词进行匹配")
+        except Exception as e:
+            logger.error(f"从数据库获取业务关键词出错: {str(e)}，使用内置关键词进行匹配")
+
+        # 2. 如果数据库匹配失败，使用内置的业务关键词直接进行匹配（不再尝试保存到数据库）
+        # 将关键词分为强业务关键词和辅助关键词
+        strong_business_keywords = self._get_strong_business_keywords()
+        auxiliary_keywords = self._get_auxiliary_keywords()
+            
+        # 检查查询中是否包含强业务关键词
+        for keyword in strong_business_keywords:
+            if keyword in query:
+                logger.info(f"通过强业务关键词'{keyword}'判断查询'{query}'为业务查询")
+                return True, 0.9  # 强业务关键词匹配给予更高的置信度
+        
+        # 3. 如果强业务关键词没匹配到，再通过表名和列名等元数据提取的关键词匹配
+        business_keywords = self._extract_business_keywords()
+        
+        # 尝试将元数据关键词保存到数据库
+        try:
+            keywords_to_save = []
+            for keyword in business_keywords:
+                if keyword and isinstance(keyword, str) and len(keyword) > 2 and keyword not in self._get_auxiliary_keywords():
+                    keywords_to_save.append({
+                        'keyword': keyword,
+                        'confidence': 0.8,
+                        'category': '元数据关键词',
+                        'source': '数据库元数据'
+                    })
+            if keywords_to_save:
+                self.metadata_extractor.save_business_keywords(self.db_name, keywords_to_save)
+                logger.info(f"已将{len(keywords_to_save)}个元数据关键词保存到数据库")
+        except Exception as e:
+            logger.error(f"保存元数据关键词到数据库出错: {str(e)}")
+            
+        for keyword in business_keywords:
+            # 只匹配长度大于2的关键词，且不在辅助关键词列表中
+            if len(keyword) > 2 and keyword not in self._get_auxiliary_keywords() and keyword in query:
+                logger.info(f"通过元数据关键词'{keyword}'判断查询'{query}'为业务查询")
+                return True, 0.8  # 元数据关键词匹配给予较高置信度
+        
+        # 4. 如果同时出现多个辅助关键词，也可能是业务查询
+        auxiliary_matches = [kw for kw in auxiliary_keywords if kw in query]
+        if len(auxiliary_matches) >= 2:
+            logger.info(f"通过多个辅助关键词{auxiliary_matches}组合判断查询'{query}'为业务查询")
+            return True, 0.7  # 多个辅助关键词组合给予中等置信度
+                
+        # 5. 如果关键词都没有匹配成功，再尝试使用LLM判断（慢速路径）
+        logger.info(f"本地关键词匹配未成功，尝试使用LLM判断查询: '{query}'")
         try:
             llm_result = self._check_business_query_with_llm(query)
             llm_is_business = llm_result.get("is_business_query", False) 
@@ -332,6 +442,58 @@ class NL2SQLProcessor:
             logger.error(f"LLM判断业务查询出错: {str(e)}")
             # 如果LLM调用失败，使用保守策略，假设是业务查询并赋予较低置信度
             return True, 0.51
+    
+    def _get_strong_business_keywords(self) -> List[str]:
+        """
+        获取强业务关键词列表（直接与业务相关的词）
+        
+        Returns:
+            List[str]: 强业务关键词列表
+        """
+        return [
+            # 销售相关
+            "销量", "销售额", "销售量", "营收", "营业额", "交易量", "交易额", "成交量", "订单量", "订单数",
+            # 财务相关
+            "利润", "利润率", "毛利", "毛利率", "净利", "净利润", "收入", "成本", "费用", "支出", "预算", "投资回报率", "ROI",
+            # 库存相关
+            "库存", "库存周转", "库存量", "周转率", "存货", "产量",
+            # 客户相关
+            "客户", "客户数", "用户", "会员", "消费者", "买家", "潜在客户", "新客户", "老客户", "流失", "留存",
+            # 市场相关
+            "市场份额", "市占率", "竞争力", "品牌", "市场定位", "市场规模", "品牌影响力", "曝光度", "渗透率",
+            # 效率相关
+            "转化率", "点击率", "购买率", "参与度", "留存率", "流失率", "回购率", "满意度", "复购率", "活跃度", "活跃率",
+            # 增长相关
+            "增长率", "同比", "环比", "增长", "下降", "上升", "提高", "降低", "波动",
+            # 营销相关
+            "营销", "促销", "广告", "投放", "宣传", "推广", "引流", "获客成本", "转化效果",
+            # 供应链相关
+            "供应链", "供应商", "采购", "物流", "配送", "运输", "交货", "原材料", "产能",
+            # 生产相关
+            "生产", "制造", "加工", "质量", "良品率", "不良率", "生产效率", "产能", "产量", "输出",
+            # 人力相关
+            "人效", "绩效", "薪资", "薪酬", "培训", "考核",
+            # 具体业务类型
+            "零售", "批发", "电商", "制造", "服务", "金融", "保险", "银行", "教育", "医疗", "餐饮", "旅游", "房地产",
+            # 具体指标
+            "GMV", "PV", "UV", "DAU", "MAU", "ARPU", "CPC", "CPM", "CPA", "KPI", "OKR"
+        ]
+    
+    def _get_auxiliary_keywords(self) -> List[str]:
+        """
+        获取辅助关键词列表（非直接业务相关，但与分析相关的词）
+        
+        Returns:
+            List[str]: 辅助关键词列表
+        """
+        return [
+            # 分析维度相关
+            "汇总", "统计", "对比", "分析", "比较", "排名", "排序", "分区", "分组", "分类",
+            # 时间维度相关
+            "年度", "季度", "月度", "周", "日", "小时", "实时", "历史", "今天", "昨天", "近期", "长期", "趋势", "预测", 
+            # 通用词
+            "数据", "指标", "情况", "结果", "报表", "图表", "用户数", "人员", "员工", "效率"
+        ]
     
     def _extract_business_keywords(self) -> List[str]:
         """
@@ -358,7 +520,7 @@ class NL2SQLProcessor:
                 
                 # 从列注释中提取关键词
                 comment = column.get("comment", "")
-                if comment:
+                if comment and isinstance(comment, str):
                     # 简单分词（针对中文和英文）
                     words = re.findall(r'[\w\u4e00-\u9fff]+', comment)
                     keywords.update(words)
@@ -369,185 +531,160 @@ class NL2SQLProcessor:
             
             # 提取业务领域关键词
             domain = business_metadata.get("business_domain", "")
-            if domain:
+            if domain and isinstance(domain, str):
                 words = re.findall(r'[\w\u4e00-\u9fff]+', domain)
                 keywords.update(words)
             
             # 提取核心实体名称
             core_entities = business_metadata.get("core_entities", [])
-            for entity in core_entities:
-                keywords.add(entity.get("name", ""))
-                
-                # 从描述中提取
-                description = entity.get("description", "")
-                if description:
-                    words = re.findall(r'[\w\u4e00-\u9fff]+', description)
-                    keywords.update(words)
+            if isinstance(core_entities, list):
+                for entity in core_entities:
+                    if isinstance(entity, dict):
+                        entity_name = entity.get("name", "")
+                        if entity_name and isinstance(entity_name, str):
+                            keywords.add(entity_name)
+                        
+                        # 从描述中提取
+                        description = entity.get("description", "")
+                        if description and isinstance(description, str):
+                            words = re.findall(r'[\w\u4e00-\u9fff]+', description)
+                            keywords.update(words)
         except Exception as e:
             logger.warning(f"提取业务元数据关键词时出错: {str(e)}")
         
         # 过滤出长度大于1的关键词
-        filtered_keywords = [k for k in keywords if k and len(k) > 1]
+        filtered_keywords = [k for k in keywords if k and isinstance(k, str) and len(k) > 1]
         return filtered_keywords
     
     def _check_business_query_with_llm(self, query: str) -> Dict:
         """
-        使用LLM判断查询是否属于商业查询
-
+        使用LLM判断是否是业务查询
+        
         Args:
-            query: 用户查询字符串
-
+            query: 自然语言查询
+            
         Returns:
-            Dict: 包含判断结果的字典，格式为{'is_business_query': bool, 'confidence': float, 'reasoning': str}
+            Dict: 包含判断结果和置信度的字典
         """
-        # 获取业务查询检查阶段特定的LLM客户端
-        try:
-            llm_client = get_llm_client(stage="business_check")
-        except Exception as e:
-            logger.warning(f"获取业务查询检查LLM客户端失败: {str(e)}，使用关键词匹配")
-            business_keywords = ["销量", "利润", "收入", "成本", "库存", "客户数", "转化率", 
-                                "点击率", "营销", "销售", "市场", "增长率", "业绩"]
-            
-            is_business = any(keyword in query for keyword in business_keywords)
-            return {
-                "is_business_query": is_business,
-                "confidence": 0.7 if is_business else 0.6,
-                "reasoning": "通过关键词匹配判断" + ("为商业查询" if is_business else "为非商业查询")
-            }
-            
-        system_prompt = """你的任务是判断用户的查询是否是一个商业指标相关的查询。
-如果是商业指标相关的查询，返回JSON格式：{"is_business_query": true, "confidence": 浮点数0-1, "reasoning": "你的推理过程"}
-如果不是商业指标相关的查询，返回JSON格式：{"is_business_query": false, "confidence": 浮点数0-1, "reasoning": "你的推理过程"}
-
-以下是一些商业指标的例子:
-- 销量
-- 利润
-- 收入
-- 成本
-- 库存
-- 客户数
-- 转化率
-- 点击率
-- 营销效果
-- 销售渠道
-- 市场份额
-- 增长率
-
-首先想一步步分析用户的输入是否与上述或类似的商业指标相关，然后给出你的结论。
-"""
-        user_prompt = f"用户查询: {query}"
-        
-        # 记录原始查询内容和判断过程
-        log_data = {
-            "query": query,
-            "function_call": "_check_business_query_with_llm"
-        }
-        
-        retry_count = 0
-        # 设置一个严格的最大重试次数，避免无限循环
-        max_retries = 2
-        simplified_system_prompt = """判断查询是否是商业指标相关。
-如果是，返回: {"is_business_query": true, "confidence": 0.8, "reasoning": "原因"}
-如果不是，返回: {"is_business_query": false, "confidence": 0.8, "reasoning": "原因"}
-
-商业指标例子: 销量, 利润, 收入, 成本, 库存, 客户数, 转化率, 点击率, 营销效果, 销售渠道, 市场份额, 增长率
-"""
-        
-        # 设置尝试最大次数的硬限制，无论如何不超过这个次数
-        hard_limit = 3
-        
-        while retry_count < hard_limit:
-            try:
-                # 根据重试次数使用不同的提示词
-                current_system_prompt = system_prompt if retry_count == 0 else simplified_system_prompt
-                
-                logger.info(f"[尝试 {retry_count+1}] 检查查询是否为商业查询: '{query}'")
-                
-                # 创建消息列表
-                messages = [
-                    Message.system(current_system_prompt),
-                    Message.user(user_prompt)
-                ]
-                
-                # 调用LLM
-                response = llm_client.chat(messages)
-                
-                # 检查响应是否为None或为空
-                if not response or not hasattr(response, 'content') or not response.content:
-                    logger.warning(f"LLM返回了空响应，尝试重试")
-                    retry_count += 1
-                    if retry_count >= hard_limit:
-                        break
-                    continue
-                    
-                # 检查响应是否只包含<think>标签但没有</think>闭合标签（截断响应的迹象）
-                if "<think>" in response.content and "</think>" not in response.content:
-                    logger.warning(f"检测到未闭合的<think>标签，响应可能被截断: {response.content}")
-                    retry_count += 1
-                    if retry_count >= hard_limit:
-                        break
-                    continue
-                
-                # 处理响应中只有<think>标签的情况，添加缺失的闭合标签并尝试提取内容
-                if response.content.strip() == "<think>" or response.content.strip() == "\\<think\\>":
-                    logger.warning("响应只包含<think>标签，尝试使用简化提示词重试")
-                    retry_count += 1
-                    if retry_count >= hard_limit:
-                        break
-                    continue
-                
-                # 记录LLM的完整响应
-                log_data["llm_response"] = response.content
-                
-                # 解析LLM响应获取JSON
-                result = self._parse_llm_json_response(response.content)
-                
-                # 检查解析结果是否有效
-                if "error" in result:
-                    logger.warning(f"JSON解析错误: {result.get('error')}")
-                    retry_count += 1
-                    if retry_count >= hard_limit:
-                        break
-                    continue
-                else:
-                    # 解析成功，返回结果
-                    # 记录最终结果
-                    log_data["result"] = result
-                    logger.info(f"判断结果: {query} -> is_business_query={result.get('is_business_query')}, confidence={result.get('confidence', 0)}")
-                    
-                    # 记录查询日志
-                    log_query_process(log_data, "business_query_check")
-                    
-                    return result
-            
-            except Exception as e:
-                logger.error(f"检查商业查询时出错: {str(e)}")
-                retry_count += 1
-                if retry_count >= hard_limit:
-                    break
-                logger.info(f"正在进行第 {retry_count+1} 次尝试...")
-                continue
-            
-        # 如果所有尝试都失败，使用关键词匹配作为备选方案
-        logger.warning(f"经过 {retry_count} 次尝试，无法获取有效LLM判断结果，使用关键词匹配")
-        business_keywords = ["销量", "利润", "收入", "成本", "库存", "客户数", "转化率", 
-                            "点击率", "营销", "销售", "市场", "增长率", "业绩"]
-        
-        is_business = any(keyword in query for keyword in business_keywords)
+        # 初始化默认结果
         result = {
-            "is_business_query": is_business,
-            "confidence": 0.7 if is_business else 0.6,
-            "reasoning": f"尝试LLM判断失败，通过关键词匹配判定为{'商业' if is_business else '非商业'}查询。"
+            "is_business_query": False,
+            "confidence": 0.5,
+            "reasoning": "",
+            "keywords": []
         }
         
-        # 记录最终结果
-        log_data["result"] = result
-        log_data["fallback"] = "keyword_matching"
-        logger.info(f"判断结果(关键词匹配): {query} -> is_business_query={result.get('is_business_query')}, confidence={result.get('confidence', 0)}")
-        
-        # 记录查询日志
-        log_query_process(log_data, "business_query_check")
-        
+        try:
+            # 为这个步骤创建单独的LLM客户端
+            llm_client = get_llm_client(stage="business_check")
+            
+            if not llm_client:
+                return result
+            
+            # 准备LLM请求
+            system_prompt = """你是一个专业的业务数据分析师，负责判断用户查询是否是业务查询。
+            
+业务查询是指与公司运营、销售、财务、库存、客户、市场、产品等业务指标相关的查询。
+以下是业务查询的一些例子：
+- "上个月的销售额是多少"
+- "最畅销的商品有哪些"
+- "客户满意度趋势如何"
+- "库存周转率是多少"
+- "近期的营收情况"
+- "各区域销售业绩对比"
+- "产品退货率分析"
+
+非业务查询的例子：
+- "今天天气怎么样"
+- "月球上的重力是多少"
+- "世界上最高的山是什么"
+- "如何烹饪意大利面"
+- "明天是星期几"
+
+请根据提供的查询内容仔细分析是否为业务查询，并提供你的判断、置信度和推理过程。
+如果是业务查询，请同时提取出查询中的具体业务关键词（不要包括"今天"、"统计"、"对比"等非业务明确含义的词）。
+
+回答格式应为JSON，包含以下字段：
+{
+    "is_business_query": true/false,
+    "confidence": 0.0-1.0之间的值,
+    "reasoning": "你的推理过程",
+    "keywords": ["关键词1", "关键词2", ...]
+}
+"""
+
+            # 用户查询的提示
+            user_prompt = f"请判断以下查询是否是业务查询：\n\n{query}"
+            
+            # 记录LLM请求
+            provider = os.getenv("LLM_PROVIDER", "默认")
+            logger.info(f"请求LLM提供商 '{provider}' 判断：{query}")
+            
+            # 创建消息列表
+            from src.utils.llm_client import Message
+            messages = [
+                Message.system(system_prompt),
+                Message.user(user_prompt)
+            ]
+            
+            # 向LLM请求判断结果
+            response = llm_client.chat(messages)
+            llm_response = response.content if response and hasattr(response, 'content') else ""
+            logger.debug(f"LLM响应内容: {llm_response}")
+            
+            # 解析LLM响应
+            if llm_response:
+                # 使用处理多行JSON的函数解析内容
+                parsed = self._parse_llm_json_response(llm_response)
+                if parsed:
+                    # 更新结果
+                    result["is_business_query"] = bool(parsed.get("is_business_query", False))
+                    result["confidence"] = float(parsed.get("confidence", 0.5))
+                    result["reasoning"] = str(parsed.get("reasoning", ""))
+                    
+                    # 处理从LLM中获取的关键词，仅保留业务关键词（排除辅助关键词）
+                    raw_keywords = parsed.get("keywords", [])
+                    auxiliary_keywords = self._get_auxiliary_keywords()
+                    result["keywords"] = [kw for kw in raw_keywords if kw and len(kw) > 1 and kw not in auxiliary_keywords]
+                    
+                    # 如果LLM判断为业务查询并给出了业务关键词，将其保存到数据库
+                    try:
+                        if result["is_business_query"] and result["keywords"]:
+                            keywords_to_save = []
+                            # 只保存业务关键词
+                            for keyword in result["keywords"]:
+                                # 再次确认过滤辅助关键词
+                                if keyword not in auxiliary_keywords and len(keyword) > 1:
+                                    keywords_to_save.append({
+                                        'keyword': keyword,
+                                        'confidence': result["confidence"],
+                                        'category': 'LLM识别',
+                                        'source': 'LLM生成'
+                                    })
+                            if keywords_to_save:
+                                self.metadata_extractor.save_business_keywords(self.db_name, keywords_to_save)
+                                logger.info(f"已将LLM识别的{len(keywords_to_save)}个业务关键词保存到数据库")
+                    except Exception as e:
+                        logger.error(f"保存LLM识别的业务关键词到数据库出错: {str(e)}")
+                    
+            # 保存查询日志
+            query_id = str(uuid.uuid4())[:8]
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_data = {
+                "timestamp": datetime.now().isoformat(),
+                "query": query,
+                "is_business_query": result["is_business_query"],
+                "confidence": result["confidence"],
+                "reasoning": result["reasoning"],
+                "keywords": result["keywords"],
+                "query_id": query_id
+            }
+            log_path = log_query_process(log_data, log_type="business_query_check")
+            logger.info(f"业务查询判断日志已保存至: {log_path}")
+            
+        except Exception as e:
+            logger.error(f"LLM判断业务查询失败: {str(e)}")
+            
         return result
     
     def _find_similar_example(self, query: str) -> Optional[Dict[str, Any]]:

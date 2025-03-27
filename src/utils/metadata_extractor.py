@@ -652,7 +652,7 @@ class MetadataExtractor:
     
     def summarize_business_metadata(self, db_name: Optional[str] = None) -> Dict[str, Any]:
         """
-        通过LLM总结业务元数据
+        获取业务元数据摘要，优先从元数据库获取，若不存在则通过LLM生成
         
         Args:
             db_name: 数据库名称，如果为None则使用初始化时指定的数据库
@@ -670,6 +670,22 @@ class MetadataExtractor:
             return self.metadata_cache[cache_key]
         
         try:
+            # 首先尝试从元数据库获取业务元数据
+            logger.info(f"尝试从元数据库获取 {db_name} 的业务元数据")
+            db_metadata = self.get_business_metadata_from_database(db_name)
+            
+            # 如果从元数据库成功获取业务元数据，则直接返回
+            if db_metadata and isinstance(db_metadata, dict) and len(db_metadata) > 0:
+                logger.info(f"成功从元数据库获取 {db_name} 的业务元数据")
+                
+                # 更新缓存
+                self.metadata_cache[cache_key] = db_metadata
+                self.metadata_cache_time[cache_key] = datetime.now()
+                
+                return db_metadata
+            
+            logger.info(f"元数据库中没有找到 {db_name} 的业务元数据，将通过LLM生成")
+            
             # 获取数据库所有表
             tables = self.get_database_tables(db_name)
             logger.info(f"为 {db_name} 总结业务元数据，发现 {len(tables)} 个表")
@@ -815,6 +831,19 @@ class MetadataExtractor:
             # 更新缓存
             self.metadata_cache[cache_key] = result
             self.metadata_cache_time[cache_key] = datetime.now()
+            
+            # 考虑将LLM生成的结果保存到元数据库
+            try:
+                # 构建要保存的元数据
+                metadata_to_save = {
+                    "summary": result
+                }
+                
+                # 将结果保存到元数据库
+                self._save_business_metadata(db_name, "business_summary", json.dumps(metadata_to_save, ensure_ascii=False))
+                logger.info(f"已将LLM生成的业务元数据保存到元数据库")
+            except Exception as e:
+                logger.error(f"保存LLM生成的业务元数据到元数据库时出错: {str(e)}")
             
             logger.info(f"成功生成业务元数据摘要，包含 {len(result.get('tables_summary', []))} 个表摘要")
             return result
@@ -2066,8 +2095,236 @@ class MetadataExtractor:
             except json.JSONDecodeError as e:
                 logger.error(f"解析业务元数据JSON时出错: {str(e)}")
                 return {}
-                return {}
                 
         except Exception as e:
             logger.error(f"从元数据库获取业务元数据时出错: {str(e)}")
             return {}
+
+    # 在get_business_metadata_from_database方法后面添加
+    def _save_business_metadata(self, db_name: str, metadata_key: str, metadata_value: str) -> bool:
+        """
+        将业务元数据保存到元数据库
+        
+        Args:
+            db_name: 数据库名称
+            metadata_key: 元数据键
+            metadata_value: 元数据值（JSON字符串）
+            
+        Returns:
+            bool: 保存是否成功
+        """
+        # 使用统一的元数据库名称
+        metadata_db = "doris_metadata"
+        
+        try:
+            # 确保元数据库存在
+            create_db_query = f"CREATE DATABASE IF NOT EXISTS `{metadata_db}`"
+            execute_query(create_db_query)
+            
+            # 确保元数据表存在
+            create_table_query = f"""
+            CREATE TABLE IF NOT EXISTS `{metadata_db}`.`business_metadata` (
+                `database_name` VARCHAR(100) COMMENT '数据库名称',
+                `metadata_key` VARCHAR(100) COMMENT '元数据键',
+                `metadata_value` TEXT COMMENT '元数据值（JSON格式）',
+                `create_time` DATETIME COMMENT '创建时间',
+                `update_time` DATETIME COMMENT '更新时间'
+            ) ENGINE=OLAP
+            UNIQUE KEY(`database_name`, `metadata_key`)
+            COMMENT '业务元数据表'
+            DISTRIBUTED BY HASH(`database_name`) BUCKETS 3
+            PROPERTIES (
+                "replication_allocation" = "tag.location.default: 1"
+            )
+            """
+            execute_query(create_table_query)
+            
+            # 检查元数据是否已存在
+            check_query = f"""
+            SELECT COUNT(*) as cnt FROM `{metadata_db}`.`business_metadata`
+            WHERE database_name = '{db_name}' AND metadata_key = '{metadata_key}'
+            """
+            result = execute_query(check_query)
+            exists = result[0]['cnt'] > 0 if result else False
+            
+            if exists:
+                # 更新现有元数据
+                update_query = f"""
+                UPDATE `{metadata_db}`.`business_metadata` SET
+                    metadata_value = '{metadata_value.replace("'", "''")}',
+                    update_time = NOW()
+                WHERE database_name = '{db_name}' AND metadata_key = '{metadata_key}'
+                """
+                execute_query(update_query)
+                logger.info(f"已更新数据库 {db_name} 的业务元数据，键: {metadata_key}")
+            else:
+                # 插入新元数据
+                insert_query = f"""
+                INSERT INTO `{metadata_db}`.`business_metadata`
+                (database_name, metadata_key, metadata_value, create_time, update_time)
+                VALUES
+                ('{db_name}', '{metadata_key}', '{metadata_value.replace("'", "''")}', NOW(), NOW())
+                """
+                execute_query(insert_query)
+                logger.info(f"已保存数据库 {db_name} 的业务元数据，键: {metadata_key}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"保存业务元数据时出错: {str(e)}")
+            return False
+
+    # 在_save_business_metadata方法后面添加
+    def get_business_keywords_from_database(self, db_name: Optional[str] = None) -> Dict[str, float]:
+        """
+        从元数据库获取业务关键词及其置信度
+
+        Args:
+            db_name: 数据库名称，如果为None则使用初始化时指定的数据库
+
+        Returns:
+            Dict[str, float]: 业务关键词及其置信度，如果不存在则返回空字典
+        """
+        db_name = db_name or self.db_name
+        if not db_name:
+            logger.error("未指定数据库名称")
+            return {}
+
+        # 使用统一的元数据库名称
+        metadata_db = "doris_metadata"
+
+        try:
+            # 确保元数据库和关键词表存在
+            self._ensure_business_keywords_table_exists()
+
+            # 查询业务关键词
+            query = f"""
+            SELECT keyword, confidence, category 
+            FROM `{metadata_db}`.`business_keywords` 
+            WHERE database_name = '{db_name}' OR database_name = 'global'
+            """
+
+            result = execute_query(query)
+
+            if not result or len(result) == 0:
+                logger.info(f"数据库 {db_name} 的业务关键词不存在")
+                return {}
+
+            # 构建关键词字典
+            keywords_dict = {}
+            for item in result:
+                keyword = item.get('keyword', '')
+                confidence = item.get('confidence', 1.0)
+                if keyword:
+                    keywords_dict[keyword] = float(confidence)
+
+            return keywords_dict
+        except Exception as e:
+            logger.error(f"获取业务关键词时出错: {str(e)}")
+            return {}
+
+    def save_business_keywords(self, db_name: str, keywords: List[Dict[str, Any]]) -> bool:
+        """
+        保存业务关键词到元数据库
+
+        Args:
+            db_name: 数据库名称
+            keywords: 关键词列表，每项包含keyword, confidence, category, source等字段
+
+        Returns:
+            bool: 保存是否成功
+        """
+        if not db_name:
+            logger.error("未指定数据库名称")
+            return False
+
+        # 使用统一的元数据库名称
+        metadata_db = "doris_metadata"
+
+        try:
+            # 确保元数据库和关键词表存在
+            self._ensure_business_keywords_table_exists()
+
+            # 当前时间
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            # 批量插入所有关键词
+            for keyword_item in keywords:
+                keyword = keyword_item.get('keyword', '')
+                confidence = keyword_item.get('confidence', 1.0)
+                category = keyword_item.get('category', '其他')
+                source = keyword_item.get('source', 'LLM生成')
+
+                if not keyword:
+                    continue
+
+                # 检查关键词是否已存在
+                check_query = f"""
+                SELECT COUNT(*) as cnt FROM `{metadata_db}`.`business_keywords`
+                WHERE database_name = '{db_name}' AND keyword = '{keyword}'
+                """
+                result = execute_query(check_query)
+                exists = result[0]['cnt'] > 0 if result else False
+
+                if exists:
+                    # 如果关键词已存在，只有当新置信度更高时才更新
+                    update_query = f"""
+                    UPDATE `{metadata_db}`.`business_keywords` SET
+                        confidence = CASE WHEN confidence < {confidence} THEN {confidence} ELSE confidence END,
+                        update_time = '{current_time}'
+                    WHERE database_name = '{db_name}' AND keyword = '{keyword}'
+                    """
+                    execute_query(update_query)
+                else:
+                    # 插入新关键词
+                    insert_query = f"""
+                    INSERT INTO `{metadata_db}`.`business_keywords`
+                    (database_name, keyword, confidence, category, source, create_time, update_time)
+                    VALUES
+                    ('{db_name}', '{keyword}', {confidence}, '{category}', '{source}', '{current_time}', '{current_time}')
+                    """
+                    execute_query(insert_query)
+
+            logger.info(f"已保存数据库 {db_name} 的业务关键词，共 {len(keywords)} 个")
+            return True
+        except Exception as e:
+            logger.error(f"保存业务关键词时出错: {str(e)}")
+            return False
+
+    def _ensure_business_keywords_table_exists(self) -> bool:
+        """
+        确保业务关键词表存在
+
+        Returns:
+            bool: 操作是否成功
+        """
+        # 使用统一的元数据库名称
+        metadata_db = "doris_metadata"
+
+        try:
+            # 确保元数据库存在
+            create_db_query = f"CREATE DATABASE IF NOT EXISTS `{metadata_db}`"
+            execute_query(create_db_query)
+
+            # 确保关键词表存在
+            create_table_query = f"""
+            CREATE TABLE IF NOT EXISTS `{metadata_db}`.`business_keywords` (
+                `database_name` VARCHAR(100) COMMENT '数据库名称',
+                `keyword` VARCHAR(255) COMMENT '业务关键词',
+                `confidence` FLOAT COMMENT '置信度',
+                `category` VARCHAR(100) COMMENT '类别',
+                `source` VARCHAR(100) COMMENT '来源',
+                `create_time` DATETIME COMMENT '创建时间',
+                `update_time` DATETIME COMMENT '更新时间'
+            ) ENGINE=OLAP
+            UNIQUE KEY(`database_name`, `keyword`)
+            COMMENT '业务关键词表'
+            DISTRIBUTED BY HASH(`database_name`) BUCKETS 3
+            PROPERTIES (
+                "replication_allocation" = "tag.location.default: 1"
+            )
+            """
+            execute_query(create_table_query)
+            return True
+        except Exception as e:
+            logger.error(f"创建业务关键词表时出错: {str(e)}")
+            return False

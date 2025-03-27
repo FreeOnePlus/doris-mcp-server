@@ -6,6 +6,9 @@ Doris MCP (Model Control Panel) Server是一个基于Python的服务框架，用
 
 - 支持多种LLM服务商：OpenAI, DeepSeek, Sijiliu, Volcengine, Qwen, Ollama以及Apple MLX
 - 自然语言到SQL (NL2SQL) 转换功能
+- SQL自动优化（未完成）
+- 集群巡检运维（未完成）
+- 数据指定格式导出（CSV、JSON）（未完成）
 - 元数据提取与管理
 - 数据库连接与查询执行
 - 灵活的配置系统
