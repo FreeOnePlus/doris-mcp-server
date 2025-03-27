@@ -176,59 +176,9 @@ class NL2SQLProcessor:
         try:
             from src.utils.metadata_extractor import MetadataExtractor
             self.metadata_extractor = MetadataExtractor()
-            
-            # 在初始化阶段检查并保存内置关键词
-            self._ensure_built_in_keywords_saved()
         except Exception as e:
             logger.error(f"创建元数据提取器出错: {str(e)}")
             self.metadata_extractor = None
-            
-    def _ensure_built_in_keywords_saved(self):
-        """
-        确保内置关键词已保存到数据库中
-        只在初始化时执行一次，避免每次查询都重复保存
-        """
-        if not self.metadata_extractor:
-            return
-            
-        try:
-            # 检查数据库中是否已有内置关键词
-            db_keywords = self.metadata_extractor.get_business_keywords_from_database(self.db_name)
-            
-            # 获取内置关键词
-            strong_business_keywords = self._get_strong_business_keywords()
-            auxiliary_keywords = self._get_auxiliary_keywords()
-            
-            # 如果关键词数量不足，或者数据库中没有足够的内置关键词，执行保存操作
-            # 这里使用简单的数量比较作为判断标准，可以根据需要改进判断逻辑
-            if len(db_keywords) < (len(strong_business_keywords) + len(auxiliary_keywords)) * 0.9:
-                logger.info("数据库中内置关键词不完整，执行保存操作")
-                
-                # 准备关键词数据
-                keywords_to_save = []
-                for keyword in strong_business_keywords:
-                    keywords_to_save.append({
-                        'keyword': keyword,
-                        'confidence': 0.9,  # 强业务关键词给予更高置信度
-                        'category': '强业务关键词',
-                        'source': '系统默认'
-                    })
-                
-                for keyword in auxiliary_keywords:
-                    keywords_to_save.append({
-                        'keyword': keyword,
-                        'confidence': 0.5,  # 辅助关键词给予较低置信度
-                        'category': '辅助关键词',
-                        'source': '系统默认'
-                    })
-                    
-                # 保存到数据库
-                self.metadata_extractor.save_business_keywords(self.db_name, keywords_to_save)
-                logger.info(f"已将内置关键词保存到数据库，强业务关键词: {len(strong_business_keywords)}个，辅助关键词: {len(auxiliary_keywords)}个")
-            else:
-                logger.info("数据库中已存在足够的内置关键词，跳过保存步骤")
-        except Exception as e:
-            logger.error(f"检查或保存内置关键词到数据库时出错: {str(e)}")
     
     def process(self, query: str) -> Dict[str, Any]:
         """
@@ -383,10 +333,43 @@ class NL2SQLProcessor:
                 logger.info("数据库中的业务关键词匹配失败，使用内置关键词继续匹配")
             else:
                 logger.info("数据库中未找到业务关键词，使用内置关键词进行匹配")
+                
+                # 数据库中没有关键词，需要进行初始化保存
+                # 将关键词分为强业务关键词和辅助关键词
+                strong_business_keywords = self._get_strong_business_keywords()
+                auxiliary_keywords = self._get_auxiliary_keywords()
+                
+                # 保存内置关键词到数据库（仅当数据库中没有关键词时执行）
+                try:
+                    # 准备所有内置关键词
+                    keywords_to_save = []
+                    # 保存强业务关键词（高置信度）
+                    for keyword in strong_business_keywords:
+                        keywords_to_save.append({
+                            'keyword': keyword,
+                            'confidence': 0.9,  # 强业务关键词给予更高置信度
+                            'category': '强业务关键词',
+                            'source': '系统默认'
+                        })
+                    
+                    # 保存辅助关键词（低置信度）
+                    for keyword in auxiliary_keywords:
+                        keywords_to_save.append({
+                            'keyword': keyword,
+                            'confidence': 0.5,  # 辅助关键词给予较低置信度
+                            'category': '辅助关键词',
+                            'source': '系统默认'
+                        })
+                        
+                    # 批量保存内置关键词
+                    self.metadata_extractor.save_business_keywords(self.db_name, keywords_to_save)
+                    logger.info(f"已将内置关键词保存到数据库，强业务关键词: {len(strong_business_keywords)}个，辅助关键词: {len(auxiliary_keywords)}个")
+                except Exception as e:
+                    logger.error(f"保存内置关键词到数据库出错: {str(e)}")
         except Exception as e:
             logger.error(f"从数据库获取业务关键词出错: {str(e)}，使用内置关键词进行匹配")
 
-        # 2. 如果数据库匹配失败，使用内置的业务关键词直接进行匹配（不再尝试保存到数据库）
+        # 2. 无论是否数据库匹配失败，都使用内置的业务关键词进行内存匹配
         # 将关键词分为强业务关键词和辅助关键词
         strong_business_keywords = self._get_strong_business_keywords()
         auxiliary_keywords = self._get_auxiliary_keywords()
@@ -398,24 +381,37 @@ class NL2SQLProcessor:
                 return True, 0.9  # 强业务关键词匹配给予更高的置信度
         
         # 3. 如果强业务关键词没匹配到，再通过表名和列名等元数据提取的关键词匹配
-        business_keywords = self._extract_business_keywords()
-        
-        # 尝试将元数据关键词保存到数据库
-        try:
-            keywords_to_save = []
-            for keyword in business_keywords:
-                if keyword and isinstance(keyword, str) and len(keyword) > 2 and keyword not in self._get_auxiliary_keywords():
-                    keywords_to_save.append({
-                        'keyword': keyword,
-                        'confidence': 0.8,
-                        'category': '元数据关键词',
-                        'source': '数据库元数据'
-                    })
-            if keywords_to_save:
-                self.metadata_extractor.save_business_keywords(self.db_name, keywords_to_save)
-                logger.info(f"已将{len(keywords_to_save)}个元数据关键词保存到数据库")
-        except Exception as e:
-            logger.error(f"保存元数据关键词到数据库出错: {str(e)}")
+        # 使用静态变量记录是否已经提取过元数据关键词
+        if not hasattr(self, '_extracted_metadata_keywords'):
+            business_keywords = self._extract_business_keywords()
+            self._extracted_metadata_keywords = True  # 标记已提取过
+            
+            # 尝试将元数据关键词保存到数据库（仅执行一次）
+            try:
+                # 先获取已有的关键词
+                existing_keywords = set(self.metadata_extractor.get_business_keywords_from_database(self.db_name).keys())
+                
+                # 只保存新的关键词
+                keywords_to_save = []
+                for keyword in business_keywords:
+                    if (keyword and isinstance(keyword, str) and len(keyword) > 2 
+                        and keyword not in self._get_auxiliary_keywords()
+                        and keyword not in existing_keywords):  # 只保存不存在的关键词
+                        keywords_to_save.append({
+                            'keyword': keyword,
+                            'confidence': 0.8,
+                            'category': '元数据关键词',
+                            'source': '数据库元数据'
+                        })
+                
+                if keywords_to_save:
+                    self.metadata_extractor.save_business_keywords(self.db_name, keywords_to_save)
+                    logger.info(f"已将{len(keywords_to_save)}个新的元数据关键词保存到数据库")
+            except Exception as e:
+                logger.error(f"保存元数据关键词到数据库出错: {str(e)}")
+        else:
+            # 已经提取过，直接使用数据库中的关键词
+            business_keywords = [k for k, v in self.metadata_extractor.get_business_keywords_from_database(self.db_name).items()]
             
         for keyword in business_keywords:
             # 只匹配长度大于2的关键词，且不在辅助关键词列表中
@@ -650,11 +646,17 @@ class NL2SQLProcessor:
                     # 如果LLM判断为业务查询并给出了业务关键词，将其保存到数据库
                     try:
                         if result["is_business_query"] and result["keywords"]:
+                            # 先获取已有的关键词
+                            existing_keywords = set(self.metadata_extractor.get_business_keywords_from_database(self.db_name).keys())
+                            
+                            # 只保存新的关键词
                             keywords_to_save = []
                             # 只保存业务关键词
                             for keyword in result["keywords"]:
-                                # 再次确认过滤辅助关键词
-                                if keyword not in auxiliary_keywords and len(keyword) > 1:
+                                # 再次确认过滤辅助关键词，并且避免重复保存
+                                if (keyword not in auxiliary_keywords and 
+                                    len(keyword) > 1 and 
+                                    keyword not in existing_keywords):
                                     keywords_to_save.append({
                                         'keyword': keyword,
                                         'confidence': result["confidence"],
@@ -663,7 +665,7 @@ class NL2SQLProcessor:
                                     })
                             if keywords_to_save:
                                 self.metadata_extractor.save_business_keywords(self.db_name, keywords_to_save)
-                                logger.info(f"已将LLM识别的{len(keywords_to_save)}个业务关键词保存到数据库")
+                                logger.info(f"已将LLM识别的{len(keywords_to_save)}个新业务关键词保存到数据库")
                     except Exception as e:
                         logger.error(f"保存LLM识别的业务关键词到数据库出错: {str(e)}")
                     
