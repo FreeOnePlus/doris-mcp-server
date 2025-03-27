@@ -1,7 +1,7 @@
 """
 Apache Doris NL2SQL处理器
 
-实现自然语言到SQL的转换逻辑，包括：
+实现自然语言到SQL的转换逻辑,包括：
 1. 自然语言拆解和关键词匹配
 2. 业务问题判断
 3. SQL生成
@@ -21,6 +21,7 @@ import uuid
 import pathlib
 import traceback
 import hashlib
+import socket
 
 # 获取项目根目录
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
@@ -30,7 +31,7 @@ import sys
 sys.path.insert(0, PROJECT_ROOT)
 
 # 导入相关模块
-from src.utils.db import execute_query, execute_query_df, get_db_connection, get_db_name
+from src.utils.db import execute_query, execute_query_df, get_db_connection, get_db_name, ENABLE_MULTI_DATABASE
 from src.utils.llm_client import get_llm_client, Message
 from src.utils.metadata_extractor import MetadataExtractor
 from src.prompts.prompts import NL2SQL_PROMPTS, SQL_FIX_PROMPTS, BUSINESS_REASONING_PROMPTS
@@ -42,102 +43,83 @@ logger = logging.getLogger(__name__)
 # 加载环境变量
 load_dotenv()
 
-# 日志保存目录，默认为项目根目录下的log/queries目录
+# 日志保存目录,默认为项目根目录下的log/queries目录
 LOG_BASE_DIR = os.path.join(PROJECT_ROOT, "log")
 QUERY_LOG_DIR = os.getenv("QUERY_LOG_DIR", os.path.join(LOG_BASE_DIR, "queries"))
 
 def log_query_process(log_data: Dict[str, Any], log_type: str = "query"):
     """
-    持久化记录查询过程和结果
+    统一记录查询处理过程日志到audit日志
     
     Args:
-        log_data: 需要记录的数据
-        log_type: 日志类型，默认为"query"
+        log_data: 日志数据
+        log_type: 日志类型
     """
     try:
-        # 创建日志目录
-        log_dir = pathlib.Path(QUERY_LOG_DIR)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 生成日志文件名
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_id = str(uuid.uuid4())[:8]
-        filename = f"{timestamp}_{log_type}_{log_id}.json"
-        log_path = log_dir / filename
-        
+        # 确保日志数据是一个字典
+        if not isinstance(log_data, dict):
+            log_data = {"data": log_data}
+            
         # 添加时间戳
-        log_data["timestamp"] = datetime.now().isoformat()
-        log_data["log_id"] = log_id
-        
-        # 处理特殊字符，确保安全保存到JSON
-        safe_log_data = log_data.copy()
-        for key, value in log_data.items():
-            if isinstance(value, str):
-                # 对字符串类型的字段进行特殊处理，尤其是可能包含标签和特殊字符的字段
-                if "<" in value or ">" in value:
-                    # 转义特殊字符，保留完整内容
-                    safe_content = value.replace("\\", "\\\\").replace("\"", "\\\"")
-                    # 对于标签类内容，进行转义，避免被截断
-                    safe_content = safe_content.replace("<", "\\<").replace(">", "\\>")
-                    safe_log_data[key] = safe_content
-        
-        # 写入日志文件
-        try:
-            with open(log_path, 'w', encoding='utf-8') as f:
-                json.dump(safe_log_data, f, ensure_ascii=False, indent=2)
-                
-            logger.info(f"查询日志已保存: {log_path}")
-            return str(log_path)
-        except Exception as json_err:
-            logger.error(f"保存JSON日志文件时出错: {str(json_err)}，尝试文本备份")
+        if "timestamp" not in log_data:
+            log_data["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             
-            # 如果JSON保存失败，尝试以文本格式保存
-            text_log_path = str(log_path).replace(".json", ".txt")
-            with open(text_log_path, 'w', encoding='utf-8') as f:
-                f.write(f"时间戳: {datetime.now().isoformat()}\n")
-                f.write(f"日志ID: {log_id}\n")
-                f.write(f"日志类型: {log_type}\n")
-                f.write("==================\n")
-                for key, value in log_data.items():
-                    f.write(f"{key}: {value}\n")
-                    f.write("------------------\n")
+        # 添加日志类型
+        log_data["log_type"] = log_type
+        
+        # 添加主机名
+        if "hostname" not in log_data:
+            log_data["hostname"] = socket.gethostname()
             
-            logger.info(f"查询日志已保存为文本文件: {text_log_path}")
-            return text_log_path
+        # 添加进程ID
+        if "pid" not in log_data:
+            log_data["pid"] = os.getpid()
+            
+        # 生成查询ID (如果不存在)
+        if "query_id" not in log_data and "query" in log_data:
+            query_hash = hashlib.md5(log_data["query"].encode()).hexdigest()[:8]
+            time_hash = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_data["query_id"] = f"{time_hash}_{query_hash}"
+            
+        # 将日志数据转换为JSON字符串
+        json_data = json.dumps(log_data, ensure_ascii=False, default=str)
+        
+        # 记录到日志系统
+        audit_logger = logging.getLogger("audit")
+        audit_logger.info(json_data)
     except Exception as e:
-        logger.error(f"保存查询日志时出错: {str(e)}")
-        return None
+        logger.error(f"记录查询处理日志时出错: {str(e)}")
 
 class NL2SQLProcessor:
     """
     NL2SQL处理器
-    
-    负责将自然语言转换为SQL查询，并处理执行和错误修正
+
+    负责将自然语言转换为SQL查询,并处理执行和错误修正
     """
-    
+
     def __init__(self, qa_examples_path: Optional[str] = None):
         """
         初始化
 
         Args:
-            qa_examples_path: QA示例路径，默认使用项目内置示例
+            qa_examples_path: QA示例路径,默认使用项目内置示例
         """
         # 初始化LLM客户端
         try:
-            # 不再初始化单一的llm_client，而是在每个阶段按需创建
+            # 不再初始化单一的llm_client,而是在每个阶段按需创建
             logger.info("LLM客户端初始化成功")
-            
+
             # 配置热身和缓存
             self.cache_dir = os.path.join(PROJECT_ROOT, "cache", "nl2sql")
             self.cache_ttl = int(os.getenv("CACHE_TTL", "86400"))  # 默认缓存24小时
             os.makedirs(self.cache_dir, exist_ok=True)
-            
+
             # 初始化查询缓存
             self.query_cache = {}
-            
+
             # 设置SQL执行重试次数
-            self.max_retries = int(os.getenv("SQL_MAX_RETRIES", "3"))
-            
+            self.max_retries = int(os.getenv("MAX_SQL_RETRIES", "3"))
+
             # 模型参数配置
             self.model_config = {
                 "temperature": float(os.getenv("LLM_TEMPERATURE", "0.7")),
@@ -145,16 +127,16 @@ class NL2SQLProcessor:
                 "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "2048"))
             }
         except Exception as e:
-            logger.warning(f"LLM客户端初始化失败: {str(e)}，将使用关键词匹配作为备选")
+            logger.warning(f"LLM客户端初始化失败: {str(e)},将使用关键词匹配作为备选")
             # 确保query_cache和max_retries即使在异常时也被初始化
             self.query_cache = {}
             self.max_retries = 3
-        
+
         # 加载QA示例
         try:
             if not qa_examples_path:
                 qa_examples_path = os.path.join(PROJECT_ROOT, "data", "qa_examples.json")
-                
+
             if os.path.exists(qa_examples_path):
                 with open(qa_examples_path, "r", encoding="utf-8") as f:
                     self.qa_examples = json.load(f)
@@ -165,13 +147,17 @@ class NL2SQLProcessor:
         except Exception as e:
             logger.error(f"加载问答示例出错: {str(e)}")
             self.qa_examples = []
-            
+
         # 相似示例阈值
         self.similar_examples_threshold = float(os.getenv("SIMILAR_EXAMPLES_THRESHOLD", "0.65"))
-        
+
         # 数据库连接
-        self.db_name = os.getenv("DB_NAME", "ssb")
-        
+        self.db_name = os.getenv("DB_DATABASE", "")
+
+        # 多数据库支持配置
+        from src.utils.db import ENABLE_MULTI_DATABASE
+        self.enable_multi_database = ENABLE_MULTI_DATABASE
+
         # 获取业务元数据提取器
         try:
             from src.utils.metadata_extractor import MetadataExtractor
@@ -179,138 +165,467 @@ class NL2SQLProcessor:
         except Exception as e:
             logger.error(f"创建元数据提取器出错: {str(e)}")
             self.metadata_extractor = None
-    
+
     def process(self, query: str) -> Dict[str, Any]:
         """
-        处理自然语言查询
-        
+        处理自然语言转SQL查询
+
+        按照以下流程处理:
+        1. 检查是否为业务查询
+        2. 查找相似示例
+        3. 获取业务元数据
+        4. 生成SQL
+        5. 执行SQL
+        6. 处理结果
+
         Args:
             query: 自然语言查询
-        
+
         Returns:
-            Dict[str, Any]: 包含SQL、执行结果和元数据的字典
+            Dict: 包含SQL、执行结果和元数据的字典
         """
-        # 初始化日志数据
-        log_data = {
+        start_time = time.time()
+
+        # 准备响应结构
+        response = {
             "query": query,
-            "steps": []
+            "is_business_query": False,
+            "sql": "",
+            "result": None,
+            "error": None,
+            "execution_time": 0,
+            "message": "",
+            "similar_example": None,
+            "cached": False,
+            "log_id": str(uuid.uuid4())
         }
-        
-        # 检查缓存
-        if query in self.query_cache:
-            cache_entry = self.query_cache[query]
-            cache_age = time.time() - cache_entry.get('timestamp', 0)
-            if cache_age < self.cache_ttl:
-                log_data["from_cache"] = True
-                log_data["cache_age_seconds"] = cache_age
-                log_query_process(log_data, "query_cache_hit")
-                return cache_entry['result']
-        
+
+        # 尝试从缓存中获取结果
+        cache_key = hashlib.md5(query.encode('utf-8')).hexdigest()
+        cache_file = os.path.join(self.cache_dir, f"{cache_key}.json")
+
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    cached_response = json.load(f)
+
+                # 检查缓存是否过期
+                cache_time = cached_response.get("cache_time", 0)
+                if time.time() - cache_time < self.cache_ttl:
+                    logger.info(f"缓存命中: {query}")
+                    cached_response["cached"] = True
+                    cached_response["log_id"] = response["log_id"]
+
+                    # 记录查询过程
+                    log_data = {
+                        "query": query,
+                        "cached": True,
+                        "log_id": response["log_id"],
+                        "execution_time": time.time() - start_time
+                    }
+                    log_query_process(log_data)
+
+                    return cached_response
+            except Exception as e:
+                logger.warning(f"读取缓存时出错: {str(e)}")
+
         try:
-            # 步骤1：判断是否是业务查询
-            log_data["steps"].append({"step": "check_business_query", "time": datetime.now().isoformat()})
+            # 步骤1: 检查是否为业务查询（使用三级匹配策略）
+            # 1.1 首先使用本地关键词匹配
             is_business_query, confidence = self._check_if_business_query(query)
-            log_data["is_business_query"] = is_business_query
-            log_data["business_confidence"] = confidence
-            
+
+            response["is_business_query"] = is_business_query
+
+            # 记录查询过程第一步
+            log_data = {
+                "query": query,
+                "step": "check_business_query",
+                "is_business_query": is_business_query,
+                "confidence": confidence,
+                "log_id": response["log_id"]
+            }
+            log_query_process(log_data)
+
+            # 如果本地匹配未通过且置信度很低,尝试元数据库中的关键词匹配
+            if not is_business_query and confidence < 0.3:
+                logger.info("本地关键词匹配未通过,尝试元数据库中的关键词匹配")
+
+                try:
+                    # 1.2 从元数据库中获取业务关键词并进行匹配
+                    from src.utils.metadata_extractor import MetadataExtractor
+                    extractor = MetadataExtractor()
+
+                    # 获取所有数据库的业务关键词
+                    all_keywords = {}
+                    for db_name in extractor.get_all_target_databases():
+                        keywords = extractor.get_business_keywords_from_database(db_name)
+                        if keywords:
+                            all_keywords.update(keywords)
+
+                    # 如果有关键词,进行匹配
+                    if all_keywords:
+                        # 计算查询与关键词的相似度
+                        max_similarity = 0
+                        for keyword, weight in all_keywords.items():
+                            similarity = calculate_similarity(query, keyword) * weight
+                            if similarity > max_similarity:
+                                max_similarity = similarity
+
+                        # 如果相似度超过阈值,则认为是业务查询
+                        if max_similarity > 0.5:
+                            is_business_query = True
+                            confidence = max_similarity
+                            response["is_business_query"] = True
+                            logger.info(f"元数据库关键词匹配成功,相似度: {max_similarity}")
+                except Exception as e:
+                    logger.warning(f"从元数据库获取关键词时出错: {str(e)}")
+
+            # 如果前两级匹配都未通过且置信度仍然很低,尝试使用LLM进行验证
+            if not is_business_query and confidence < 0.4:
+                logger.info("本地和元数据库匹配未通过,尝试使用LLM验证")
+
+                # 1.3 使用LLM验证
+                llm_check_result = self._check_business_query_with_llm(query)
+
+                # 更新业务查询判断结果
+                is_business_query = llm_check_result.get("is_business_query", False)
+                response["is_business_query"] = is_business_query
+
+                # 如果LLM确认是业务查询,将关键词保存到元数据库
+                if is_business_query and "keywords" in llm_check_result:
+                    try:
+                        from src.utils.metadata_extractor import MetadataExtractor
+                        extractor = MetadataExtractor()
+
+                        # 保存识别出的关键词
+                        for db_name in extractor.get_all_target_databases():
+                            success = extractor.save_business_keywords(db_name, llm_check_result["keywords"])
+                            if success:
+                                logger.info(f"成功将业务关键词保存到数据库 {db_name}")
+                                break
+                    except Exception as e:
+                        logger.warning(f"保存业务关键词时出错: {str(e)}")
+
+            # 更新日志数据
+            log_data.update({
+                "is_business_query_final": is_business_query,
+                "confidence_final": confidence
+            })
+            log_query_process(log_data)
+
+            # 如果不是业务查询,返回错误信息
             if not is_business_query:
-                result = {
-                    'success': False,
-                    'message': '这不是一个业务查询问题。请提出与数据库业务相关的问题，例如数据分析、统计或报表查询。',
-                    'query': query,
-                    'confidence': confidence
+                response["error"] = {
+                    "type": "not_business_query",
+                    "message": "该问题不是数据库业务查询,请提供与数据分析相关的问题"
                 }
-                log_data["result"] = result
-                log_query_process(log_data, "non_business_query")
-                # 直接返回错误信息，不继续执行后续步骤
-                return result
-            
-            # 步骤2：查找相似示例
-            log_data["steps"].append({"step": "find_similar_example", "time": datetime.now().isoformat()})
+                response["message"] = "该问题不是数据库业务查询,请提供与数据分析相关的问题"
+                response["execution_time"] = time.time() - start_time
+
+                # 记录查询过程
+                log_data = {
+                    "query": query,
+                    "step": "final",
+                    "error": response["error"],
+                    "log_id": response["log_id"],
+                    "execution_time": time.time() - start_time
+                }
+                log_query_process(log_data)
+
+                return response
+
+            # 步骤2: 查找相似示例
             similar_example = self._find_similar_example(query)
-            if similar_example:
-                log_data["similar_example"] = {
-                    "question": similar_example.get("question", ""),
-                    "sql": similar_example.get("sql", "")
-                }
-            
-            # 步骤3：获取业务元数据
-            log_data["steps"].append({"step": "get_business_metadata", "time": datetime.now().isoformat()})
-            business_metadata = self.metadata_extractor.summarize_business_metadata(self.db_name)
-            
-            # 步骤4：生成SQL
-            log_data["steps"].append({"step": "generate_sql", "time": datetime.now().isoformat()})
-            sql_result = self._generate_sql(
-                query, 
-                similar_example=similar_example, 
-                business_metadata=business_metadata
-            )
-            
-            # 记录SQL生成结果
-            log_data["sql_generation"] = {
-                "success": sql_result.get("success", False),
-                "sql": sql_result.get("sql", ""),
-                "explanation": sql_result.get("explanation", "")
+            response["similar_example"] = similar_example
+
+            # 记录查询过程第二步
+            log_data = {
+                "query": query,
+                "step": "find_similar_example",
+                "has_similar_example": similar_example is not None,
+                "log_id": response["log_id"]
             }
-            
-            # 步骤5：执行SQL并处理错误
-            if sql_result['success']:
-                log_data["steps"].append({"step": "execute_sql", "time": datetime.now().isoformat()})
-                execution_result = self._execute_sql_with_retry(sql_result['sql'], query)
-                
-                # 记录执行结果
-                log_data["sql_execution"] = {
-                    "success": execution_result.get("success", False),
-                    "row_count": execution_result.get("row_count", 0),
-                    "execution_time": execution_result.get("execution_time", 0),
-                    "retries": execution_result.get("retries", 0),
-                    "errors": execution_result.get("errors", [])
-                }
-                
-                # 合并结果
-                result = {**sql_result, **execution_result}
-                
-                # 更新缓存
-                self.query_cache[query] = {
-                    'result': result,
-                    'timestamp': time.time()
-                }
-                
-                # 记录完整日志
-                log_data["result"] = result
-                log_data["success"] = result.get("success", False)
-                log_query_process(log_data, "query_complete")
-                
-                return result
+            log_query_process(log_data)
+
+            # 步骤3: 获取业务元数据
+            business_metadata = {}
+
+            # 如果找到了相似示例,直接使用示例中的表信息
+            if similar_example and "tables" in similar_example:
+                from src.utils.metadata_extractor import MetadataExtractor
+                extractor = MetadataExtractor()
+
+                # 获取示例中涉及的表的元数据
+                for table_info in similar_example["tables"]:
+                    db_name = table_info.get("database", "")
+                    table_name = table_info.get("table", "")
+
+                    if db_name and table_name:
+                        # 获取表级业务元数据
+                        table_metadata = extractor.get_business_metadata_for_table(db_name, table_name)
+                        if table_metadata:
+                            if "tables" not in business_metadata:
+                                business_metadata["tables"] = {}
+
+                            if db_name not in business_metadata["tables"]:
+                                business_metadata["tables"][db_name] = {}
+
+                            business_metadata["tables"][db_name][table_name] = table_metadata
             else:
-                # 记录SQL生成失败日志
-                log_data["result"] = sql_result
-                log_data["success"] = False
-                log_query_process(log_data, "sql_generation_failed")
-                return sql_result
-        except Exception as e:
-            error_message = str(e)
-            logger.error(f"处理查询时出错: {error_message}")
-            
-            # 记录错误日志
-            log_data["error"] = error_message
-            log_data["error_type"] = type(e).__name__
-            log_data["success"] = False
-            log_query_process(log_data, "query_error")
-            
-            return {
-                'success': False,
-                'message': f'处理查询时出错: {error_message}',
-                'query': query
+                # 如果没有找到相似示例,获取所有数据库级别的元数据
+                logger.info("没有找到相似示例,获取所有数据库级别的元数据")
+
+                from src.utils.metadata_extractor import MetadataExtractor
+                extractor = MetadataExtractor()
+
+                # 获取所有数据库的业务元数据
+                business_metadata["databases"] = {}
+                for db_name in extractor.get_all_target_databases():
+                    db_metadata = extractor.get_business_metadata_from_database(db_name)
+                    if db_metadata:
+                        business_metadata["databases"][db_name] = db_metadata
+
+                # 获取表层级模式
+                business_metadata["table_hierarchy"] = extractor._load_table_hierarchy_patterns()
+
+            # 记录查询过程第三步
+            log_data = {
+                "query": query,
+                "step": "get_business_metadata",
+                "has_business_metadata": bool(business_metadata),
+                "log_id": response["log_id"]
             }
-    
+            log_query_process(log_data)
+
+            # 步骤4: 生成SQL
+            sql_generation = self._generate_sql(query, similar_example, business_metadata)
+
+            # 更新响应
+            response["sql"] = sql_generation.get("sql", "")
+            response["message"] = sql_generation.get("explanation", "")
+            response["tables"] = sql_generation.get("tables", [])
+            response["sql_generation"] = sql_generation
+
+            # 记录查询过程第四步
+            log_data = {
+                "query": query,
+                "step": "generate_sql",
+                "sql": response["sql"],
+                "tables": response["tables"],
+                "log_id": response["log_id"]
+            }
+            log_query_process(log_data)
+
+            # 如果没有生成SQL,返回错误
+            if not response["sql"]:
+                response["error"] = {
+                    "type": "sql_generation_failed",
+                    "message": "无法为该问题生成SQL查询"
+                }
+                response["execution_time"] = time.time() - start_time
+
+                # 记录查询过程
+                log_data = {
+                    "query": query,
+                    "step": "final",
+                    "error": response["error"],
+                    "log_id": response["log_id"],
+                    "execution_time": time.time() - start_time
+                }
+                log_query_process(log_data)
+
+                return response
+
+            # 步骤5: 执行SQL
+            execution_result = self._execute_sql_with_retry(response["sql"], query)
+
+            # 更新响应
+            response["result"] = execution_result.get("result", None)
+            response["error"] = execution_result.get("error", None)
+
+            # 记录查询过程第五步
+            log_data = {
+                "query": query,
+                "step": "execute_sql",
+                "success": response["error"] is None,
+                "result_preview": str(response["result"])[:200] if response["result"] else None,
+                "error": response["error"],
+                "log_id": response["log_id"]
+            }
+            log_query_process(log_data)
+
+            # 如果SQL执行失败且之前有相似的示例,说明可能是示例不匹配当前问题
+            # 所以尝试重新生成SQL,但这次不使用相似示例
+            retry_count = 0
+            max_retries = 3
+
+            while response["error"] and retry_count < max_retries:
+                retry_count += 1
+                logger.info(f"SQL执行失败,第 {retry_count} 次尝试修复")
+
+                # 收集错误信息用于修复
+                previous_error = {
+                    "sql": response["sql"],
+                    "error_message": response["error"].get("message", ""),
+                    "error_type": response["error"].get("type", "")
+                }
+
+                # 重新生成SQL,但不使用之前的相似示例
+                sql_generation = self._generate_sql(
+                    query, 
+                    None if retry_count > 1 else similar_example, 
+                    business_metadata,
+                    previous_error
+                )
+
+                # 更新响应中的SQL
+                response["sql"] = sql_generation.get("sql", "")
+                response["message"] = sql_generation.get("explanation", "")
+                response["tables"] = sql_generation.get("tables", [])
+                response["sql_generation"] = sql_generation
+
+                # 如果没有生成新的SQL,跳出循环
+                if not response["sql"]:
+                    break
+
+                # 执行修复后的SQL
+                execution_result = self._execute_sql_with_retry(response["sql"], query)
+
+                # 更新响应
+                response["result"] = execution_result.get("result", None)
+                response["error"] = execution_result.get("error", None)
+
+                # 如果成功执行,跳出循环
+                if not response["error"]:
+                    break
+
+                # 记录重试信息
+                log_data = {
+                    "query": query,
+                    "step": f"retry_{retry_count}",
+                    "sql": response["sql"],
+                    "success": response["error"] is None,
+                    "error": response["error"],
+                    "log_id": response["log_id"]
+                }
+                log_query_process(log_data)
+
+            # 步骤6: 如果三次重试后仍然失败,返回友好的错误信息
+            if response["error"]:
+                message = f"无法执行SQL查询。我尝试了{retry_count + 1}次,但是仍然遇到错误: {response['error']['message']}"
+                response["message"] = message
+
+            # 步骤7: 如果SQL执行成功,将结果保存到元数据库中
+            if not response["error"]:
+                try:
+                    # 准备保存的数据
+                    qa_example = {
+                        "question": query,
+                        "sql": response["sql"],
+                        "tables": response["tables"],
+                        "explanation": response["message"],
+                        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }
+
+                    # 连接到元数据库
+                    from src.utils.db import execute_query
+
+                    # 确保QA示例表存在
+                    create_table_query = """
+                    CREATE TABLE IF NOT EXISTS `doris_metadata`.`qa_examples` (
+                        `id` BIGINT NOT NULL AUTO_INCREMENT,
+                        `question` TEXT NOT NULL,
+                        `sql` TEXT NOT NULL,
+                        `tables` TEXT,
+                        `explanation` TEXT,
+                        `created_at` DATETIME NOT NULL
+                    )
+                    ENGINE=OLAP
+                    UNIQUE KEY(`id`)
+                    COMMENT "NL2SQL问答示例"
+                    DISTRIBUTED BY HASH(`id`) BUCKETS 1
+                    PROPERTIES (
+                        "replication_num" = "1"
+                    )
+                    """
+                    execute_query(create_table_query)
+
+                    # 保存QA示例
+                    tables_json = json.dumps(response["tables"], ensure_ascii=False).replace("'", "''")
+                    insert_query = f"""
+                    INSERT INTO `doris_metadata`.`qa_examples`
+                    (`question`, `sql`, `tables`, `explanation`, `created_at`)
+                    VALUES
+                    ('{query.replace("'", "''")}', '{response["sql"].replace("'", "''")}', 
+                     '{tables_json}', '{response["message"].replace("'", "''")}', '{qa_example["created_at"]}')
+                    """
+                    execute_query(insert_query)
+
+                    logger.info("成功保存QA示例到元数据库")
+                except Exception as e:
+                    logger.warning(f"保存QA示例到元数据库时出错: {str(e)}")
+
+            # 计算执行时间
+            response["execution_time"] = time.time() - start_time
+
+            # 记录最终查询过程
+            log_data = {
+                "query": query,
+                "step": "final",
+                "sql": response["sql"],
+                "success": response["error"] is None,
+                "result_preview": str(response["result"])[:200] if response["result"] else None,
+                "error": response["error"],
+                "log_id": response["log_id"],
+                "execution_time": response["execution_time"]
+            }
+            log_query_process(log_data)
+
+            # 缓存结果
+            try:
+                response_to_cache = response.copy()
+                response_to_cache["cache_time"] = time.time()
+
+                with open(cache_file, 'w', encoding='utf-8') as f:
+                    json.dump(response_to_cache, f, ensure_ascii=False, indent=2)
+
+                logger.info(f"已缓存查询结果: {query}")
+            except Exception as e:
+                logger.warning(f"缓存查询结果时出错: {str(e)}")
+
+            return response
+
+        except Exception as e:
+            # 处理意外异常
+            logger.error(f"处理查询时出错: {str(e)}")
+            logger.error(traceback.format_exc())
+
+            response["error"] = {
+                "type": "processing_error",
+                "message": f"处理查询时出错: {str(e)}"
+            }
+            response["execution_time"] = time.time() - start_time
+
+            # 记录错误
+            log_data = {
+                "query": query,
+                "step": "error",
+                "error": response["error"],
+                "traceback": traceback.format_exc(),
+                "log_id": response["log_id"],
+                "execution_time": response["execution_time"]
+            }
+            log_query_process(log_data)
+
+            return response
+
     def _check_if_business_query(self, query: str) -> Tuple[bool, float]:
         """
         判断是否是业务查询
-        
+
         Args:
             query: 自然语言查询
-            
+
         Returns:
             Tuple[bool, float]: 是否是业务查询及置信度
         """
@@ -319,26 +634,26 @@ class NL2SQLProcessor:
             # 获取数据库中存储的业务关键词及其置信度
             db_keywords = self.metadata_extractor.get_business_keywords_from_database(self.db_name)
 
-            # 如果数据库中已有关键词，则进行匹配
+            # 如果数据库中已有关键词,则进行匹配
             if db_keywords:
                 for keyword, confidence in db_keywords.items():
                     # 跳过辅助关键词（时间维度、分析维度等非直接业务相关词）
                     if len(keyword) <= 2 or keyword in self._get_auxiliary_keywords():
                         continue
-                        
+
                     if keyword in query:
-                        logger.info(f"通过数据库业务关键词'{keyword}'判断查询'{query}'为业务查询，置信度: {confidence}")
+                        logger.info(f"通过数据库业务关键词'{keyword}'判断查询'{query}'为业务查询,置信度: {confidence}")
                         return True, confidence
-                
-                logger.info("数据库中的业务关键词匹配失败，使用内置关键词继续匹配")
+
+                logger.info("数据库中的业务关键词匹配失败,使用内置关键词继续匹配")
             else:
-                logger.info("数据库中未找到业务关键词，使用内置关键词进行匹配")
-                
-                # 数据库中没有关键词，需要进行初始化保存
+                logger.info("数据库中未找到业务关键词,使用内置关键词进行匹配")
+
+                # 数据库中没有关键词,需要进行初始化保存
                 # 将关键词分为强业务关键词和辅助关键词
                 strong_business_keywords = self._get_strong_business_keywords()
                 auxiliary_keywords = self._get_auxiliary_keywords()
-                
+
                 # 保存内置关键词到数据库（仅当数据库中没有关键词时执行）
                 try:
                     # 准备所有内置关键词
@@ -351,7 +666,7 @@ class NL2SQLProcessor:
                             'category': '强业务关键词',
                             'source': '系统默认'
                         })
-                    
+
                     # 保存辅助关键词（低置信度）
                     for keyword in auxiliary_keywords:
                         keywords_to_save.append({
@@ -360,37 +675,37 @@ class NL2SQLProcessor:
                             'category': '辅助关键词',
                             'source': '系统默认'
                         })
-                        
+
                     # 批量保存内置关键词
                     self.metadata_extractor.save_business_keywords(self.db_name, keywords_to_save)
-                    logger.info(f"已将内置关键词保存到数据库，强业务关键词: {len(strong_business_keywords)}个，辅助关键词: {len(auxiliary_keywords)}个")
+                    logger.info(f"已将内置关键词保存到数据库,强业务关键词: {len(strong_business_keywords)}个,辅助关键词: {len(auxiliary_keywords)}个")
                 except Exception as e:
                     logger.error(f"保存内置关键词到数据库出错: {str(e)}")
         except Exception as e:
-            logger.error(f"从数据库获取业务关键词出错: {str(e)}，使用内置关键词进行匹配")
+            logger.error(f"从数据库获取业务关键词出错: {str(e)},使用内置关键词进行匹配")
 
-        # 2. 无论是否数据库匹配失败，都使用内置的业务关键词进行内存匹配
+        # 2. 无论是否数据库匹配失败,都使用内置的业务关键词进行内存匹配
         # 将关键词分为强业务关键词和辅助关键词
         strong_business_keywords = self._get_strong_business_keywords()
         auxiliary_keywords = self._get_auxiliary_keywords()
-            
+
         # 检查查询中是否包含强业务关键词
         for keyword in strong_business_keywords:
             if keyword in query:
                 logger.info(f"通过强业务关键词'{keyword}'判断查询'{query}'为业务查询")
                 return True, 0.9  # 强业务关键词匹配给予更高的置信度
-        
-        # 3. 如果强业务关键词没匹配到，再通过表名和列名等元数据提取的关键词匹配
+
+        # 3. 如果强业务关键词没匹配到,再通过表名和列名等元数据提取的关键词匹配
         # 使用静态变量记录是否已经提取过元数据关键词
         if not hasattr(self, '_extracted_metadata_keywords'):
             business_keywords = self._extract_business_keywords()
             self._extracted_metadata_keywords = True  # 标记已提取过
-            
+
             # 尝试将元数据关键词保存到数据库（仅执行一次）
             try:
                 # 先获取已有的关键词
                 existing_keywords = set(self.metadata_extractor.get_business_keywords_from_database(self.db_name).keys())
-                
+
                 # 只保存新的关键词
                 keywords_to_save = []
                 for keyword in business_keywords:
@@ -403,46 +718,46 @@ class NL2SQLProcessor:
                             'category': '元数据关键词',
                             'source': '数据库元数据'
                         })
-                
+
                 if keywords_to_save:
                     self.metadata_extractor.save_business_keywords(self.db_name, keywords_to_save)
                     logger.info(f"已将{len(keywords_to_save)}个新的元数据关键词保存到数据库")
             except Exception as e:
                 logger.error(f"保存元数据关键词到数据库出错: {str(e)}")
         else:
-            # 已经提取过，直接使用数据库中的关键词
+            # 已经提取过,直接使用数据库中的关键词
             business_keywords = [k for k, v in self.metadata_extractor.get_business_keywords_from_database(self.db_name).items()]
-            
+
         for keyword in business_keywords:
-            # 只匹配长度大于2的关键词，且不在辅助关键词列表中
+            # 只匹配长度大于2的关键词,且不在辅助关键词列表中
             if len(keyword) > 2 and keyword not in self._get_auxiliary_keywords() and keyword in query:
                 logger.info(f"通过元数据关键词'{keyword}'判断查询'{query}'为业务查询")
                 return True, 0.8  # 元数据关键词匹配给予较高置信度
-        
-        # 4. 如果同时出现多个辅助关键词，也可能是业务查询
+
+        # 4. 如果同时出现多个辅助关键词,也可能是业务查询
         auxiliary_matches = [kw for kw in auxiliary_keywords if kw in query]
         if len(auxiliary_matches) >= 2:
             logger.info(f"通过多个辅助关键词{auxiliary_matches}组合判断查询'{query}'为业务查询")
             return True, 0.7  # 多个辅助关键词组合给予中等置信度
-                
-        # 5. 如果关键词都没有匹配成功，再尝试使用LLM判断（慢速路径）
-        logger.info(f"本地关键词匹配未成功，尝试使用LLM判断查询: '{query}'")
+
+        # 5. 如果关键词都没有匹配成功,再尝试使用LLM判断（慢速路径）
+        logger.info(f"本地关键词匹配未成功,尝试使用LLM判断查询: '{query}'")
         try:
             llm_result = self._check_business_query_with_llm(query)
             llm_is_business = llm_result.get("is_business_query", False) 
             llm_confidence = llm_result.get("confidence", 0.5)
-            
+
             logger.info(f"LLM判断结果: {query} -> is_business_query={llm_is_business}, confidence={llm_confidence}")
             return llm_is_business, llm_confidence
         except Exception as e:
             logger.error(f"LLM判断业务查询出错: {str(e)}")
-            # 如果LLM调用失败，使用保守策略，假设是业务查询并赋予较低置信度
+            # 如果LLM调用失败,使用保守策略,假设是业务查询并赋予较低置信度
             return True, 0.51
-    
+
     def _get_strong_business_keywords(self) -> List[str]:
         """
         获取强业务关键词列表（直接与业务相关的词）
-        
+
         Returns:
             List[str]: 强业务关键词列表
         """
@@ -474,11 +789,11 @@ class NL2SQLProcessor:
             # 具体指标
             "GMV", "PV", "UV", "DAU", "MAU", "ARPU", "CPC", "CPM", "CPA", "KPI", "OKR"
         ]
-    
+
     def _get_auxiliary_keywords(self) -> List[str]:
         """
-        获取辅助关键词列表（非直接业务相关，但与分析相关的词）
-        
+        获取辅助关键词列表（非直接业务相关,但与分析相关的词）
+
         Returns:
             List[str]: 辅助关键词列表
         """
@@ -490,47 +805,47 @@ class NL2SQLProcessor:
             # 通用词
             "数据", "指标", "情况", "结果", "报表", "图表", "用户数", "人员", "员工", "效率"
         ]
-    
+
     def _extract_business_keywords(self) -> List[str]:
         """
         提取业务关键词
-        
+
         Returns:
             List[str]: 业务关键词列表
         """
         keywords = set()
-        
+
         # 从表名和列名中提取
         tables = self.metadata_extractor.get_database_tables(self.db_name)
         for table in tables:
             # 添加表名
             keywords.add(table)
-            
+
             # 获取表结构
             schema = self.metadata_extractor.get_table_schema(table, self.db_name)
             columns = schema.get("columns", [])
-            
+
             # 添加列名
             for column in columns:
                 keywords.add(column.get("name", ""))
-                
+
                 # 从列注释中提取关键词
                 comment = column.get("comment", "")
                 if comment and isinstance(comment, str):
                     # 简单分词（针对中文和英文）
                     words = re.findall(r'[\w\u4e00-\u9fff]+', comment)
                     keywords.update(words)
-        
+
         # 从业务元数据中提取
         try:
-            business_metadata = self.metadata_extractor.summarize_business_metadata(self.db_name)
-            
+            business_metadata = self.metadata_extractor.get_business_metadata_from_database(self.db_name)
+
             # 提取业务领域关键词
             domain = business_metadata.get("business_domain", "")
             if domain and isinstance(domain, str):
                 words = re.findall(r'[\w\u4e00-\u9fff]+', domain)
                 keywords.update(words)
-            
+
             # 提取核心实体名称
             core_entities = business_metadata.get("core_entities", [])
             if isinstance(core_entities, list):
@@ -539,7 +854,7 @@ class NL2SQLProcessor:
                         entity_name = entity.get("name", "")
                         if entity_name and isinstance(entity_name, str):
                             keywords.add(entity_name)
-                        
+
                         # 从描述中提取
                         description = entity.get("description", "")
                         if description and isinstance(description, str):
@@ -547,18 +862,18 @@ class NL2SQLProcessor:
                             keywords.update(words)
         except Exception as e:
             logger.warning(f"提取业务元数据关键词时出错: {str(e)}")
-        
+
         # 过滤出长度大于1的关键词
         filtered_keywords = [k for k in keywords if k and isinstance(k, str) and len(k) > 1]
         return filtered_keywords
-    
+
     def _check_business_query_with_llm(self, query: str) -> Dict:
         """
         使用LLM判断是否是业务查询
-        
+
         Args:
             query: 自然语言查询
-            
+
         Returns:
             Dict: 包含判断结果和置信度的字典
         """
@@ -569,16 +884,16 @@ class NL2SQLProcessor:
             "reasoning": "",
             "keywords": []
         }
-        
+
         try:
             # 为这个步骤创建单独的LLM客户端
             llm_client = get_llm_client(stage="business_check")
-            
+
             if not llm_client:
                 return result
-            
+
             # 准备LLM请求
-            system_prompt = """你是一个专业的业务数据分析师，负责判断用户查询是否是业务查询。
+            system_prompt = """你是一个专业的业务数据分析师,负责判断用户查询是否是业务查询。
             
 业务查询是指与公司运营、销售、财务、库存、客户、市场、产品等业务指标相关的查询。
 以下是业务查询的一些例子：
@@ -597,10 +912,10 @@ class NL2SQLProcessor:
 - "如何烹饪意大利面"
 - "明天是星期几"
 
-请根据提供的查询内容仔细分析是否为业务查询，并提供你的判断、置信度和推理过程。
-如果是业务查询，请同时提取出查询中的具体业务关键词（不要包括"今天"、"统计"、"对比"等非业务明确含义的词）。
+请根据提供的查询内容仔细分析是否为业务查询,并提供你的判断、置信度和推理过程。
+如果是业务查询,请同时提取出查询中的具体业务关键词（不要包括"今天"、"统计"、"对比"等非业务明确含义的词）。
 
-回答格式应为JSON，包含以下字段：
+回答格式应为JSON,包含以下字段：
 {
     "is_business_query": true/false,
     "confidence": 0.0-1.0之间的值,
@@ -611,23 +926,23 @@ class NL2SQLProcessor:
 
             # 用户查询的提示
             user_prompt = f"请判断以下查询是否是业务查询：\n\n{query}"
-            
+
             # 记录LLM请求
             provider = os.getenv("LLM_PROVIDER", "默认")
             logger.info(f"请求LLM提供商 '{provider}' 判断：{query}")
-            
+
             # 创建消息列表
             from src.utils.llm_client import Message
             messages = [
                 Message.system(system_prompt),
                 Message.user(user_prompt)
             ]
-            
+
             # 向LLM请求判断结果
             response = llm_client.chat(messages)
             llm_response = response.content if response and hasattr(response, 'content') else ""
             logger.debug(f"LLM响应内容: {llm_response}")
-            
+
             # 解析LLM响应
             if llm_response:
                 # 使用处理多行JSON的函数解析内容
@@ -637,13 +952,13 @@ class NL2SQLProcessor:
                     result["is_business_query"] = bool(parsed.get("is_business_query", False))
                     result["confidence"] = float(parsed.get("confidence", 0.5))
                     result["reasoning"] = str(parsed.get("reasoning", ""))
-                    
-                    # 处理从LLM中获取的关键词，仅保留业务关键词（排除辅助关键词）
+
+                    # 处理从LLM中获取的关键词,仅保留业务关键词（排除辅助关键词）
                     raw_keywords = parsed.get("keywords", [])
                     auxiliary_keywords = self._get_auxiliary_keywords()
                     result["keywords"] = [kw for kw in raw_keywords if kw and len(kw) > 1 and kw not in auxiliary_keywords]
-                    
-                    # 如果LLM判断为业务查询并给出了业务关键词，将其保存到数据库
+
+                    # 如果LLM判断为业务查询并给出了业务关键词,将其保存到数据库
                     try:
                         if result["is_business_query"] and result["keywords"]:
                             # 先获取已有的关键词
@@ -653,7 +968,7 @@ class NL2SQLProcessor:
                             keywords_to_save = []
                             # 只保存业务关键词
                             for keyword in result["keywords"]:
-                                # 再次确认过滤辅助关键词，并且避免重复保存
+                                # 再次确认过滤辅助关键词,并且避免重复保存
                                 if (keyword not in auxiliary_keywords and 
                                     len(keyword) > 1 and 
                                     keyword not in existing_keywords):
@@ -668,7 +983,7 @@ class NL2SQLProcessor:
                                 logger.info(f"已将LLM识别的{len(keywords_to_save)}个新业务关键词保存到数据库")
                     except Exception as e:
                         logger.error(f"保存LLM识别的业务关键词到数据库出错: {str(e)}")
-                    
+
             # 保存查询日志
             query_id = str(uuid.uuid4())[:8]
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -681,27 +996,55 @@ class NL2SQLProcessor:
                 "keywords": result["keywords"],
                 "query_id": query_id
             }
-            log_path = log_query_process(log_data, log_type="business_query_check")
-            logger.info(f"业务查询判断日志已保存至: {log_path}")
+            log_query_process(log_data, log_type="business_query_check")
             
+            # ... existing code ...
+            
+            # 使用审计日志记录查找相似示例的请求
+            llm_request_log = {
+                "function": "_find_similar_example",
+                "query": query,
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "batch_index": i,
+                "batch_size": len(batch),
+                "timestamp": datetime.now().isoformat()
+            }
+            log_query_process(llm_request_log, log_type="find_similar_request")
+            
+            # ... existing code ...
+            
+            # 使用审计日志记录LLM响应
+            llm_response_log = {
+                "function": "_find_similar_example",
+                "query": query,
+                "response_content": response.content,
+                "batch_index": i,
+                "batch_size": len(batch),
+                "timestamp": datetime.now().isoformat()
+            }
+            log_query_process(llm_response_log, log_type="find_similar_response")
+            
+            logger.info(f"LLM响应内容前100个字符: {response.content[:100]}...")
+
         except Exception as e:
             logger.error(f"LLM判断业务查询失败: {str(e)}")
-            
+
         return result
-    
+
     def _find_similar_example(self, query: str) -> Optional[Dict[str, Any]]:
         """
         查找相似的示例问题
-        
+
         Args:
             query: 自然语言查询
-            
+
         Returns:
-            Optional[Dict[str, Any]]: 相似的示例问题，如果没有则返回None
+            Optional[Dict[str, Any]]: 相似的示例问题,如果没有则返回None
         """
         if not self.qa_examples:
             return None
-        
+
         try:
             # 初始化日志数据
             find_log = {
@@ -709,41 +1052,34 @@ class NL2SQLProcessor:
                 "function": "_find_similar_example",
                 "examples_count": len(self.qa_examples)
             }
-            
+
             # 准备系统提示
-            system_prompt = """你是一个语义比较专家，负责评估两个问题的相似度。
-请根据提供的问题和示例，计算它们的语义相似度，并确定它们是否在询问相同或非常相似的内容。
+            system_prompt = """你是一个语义比较专家,负责评估两个问题的相似度。
+请根据提供的问题和示例,计算它们的语义相似度,并确定它们是否在询问相同或非常相似的内容。
 
-请以JSON格式返回结果，包含以下字段:
-- similarity: 0到1之间的数字，表示相似度
-- is_similar: 如果相似度大于0.7，则为true，否则为false
-- explanation: 简短的解释，说明为什么认为它们相似或不相似
+请以JSON格式返回结果,包含以下字段:
+- similarity: 0到1之间的数字,表示相似度
+- is_similar: 如果相似度大于0.7,则为true,否则为false
+- explanation: 简短的解释,说明为什么认为它们相似或不相似
 
-直接返回JSON，不要加任何额外解释。"""
+直接返回JSON,不要加任何额外解释。"""
 
             best_match = None
             best_similarity = 0
-            
-            # 创建日志目录
-            log_dir = pathlib.Path(PROJECT_ROOT) / "log" / "llm_calls"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            
+
             # 批量处理以提高效率
             batch_size = min(5, len(self.qa_examples))
             for i in range(0, len(self.qa_examples), batch_size):
                 batch = self.qa_examples[i:i+batch_size]
-                
+
                 # 构建用户提示
                 user_prompt = f"当前问题: {query}\n\n示例问题:\n"
                 for j, example in enumerate(batch):
                     user_prompt += f"{j+1}. {example['question']}\n"
-                
+
                 user_prompt += "\n请逐一评估当前问题与每个示例问题的相似度。"
-                
-                # 记录LLM请求
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                request_log_path = log_dir / f"{timestamp}_find_similar_request_{i}.json"
-                
+
+                # 使用审计日志记录LLM请求
                 llm_request_log = {
                     "function": "_find_similar_example",
                     "query": query,
@@ -753,12 +1089,8 @@ class NL2SQLProcessor:
                     "batch_size": len(batch),
                     "timestamp": datetime.now().isoformat()
                 }
-                
-                with open(request_log_path, 'w', encoding='utf-8') as f:
-                    json.dump(llm_request_log, f, ensure_ascii=False, indent=2)
-                    
-                logger.info(f"相似示例查找请求日志已保存: {request_log_path}")
-            
+                log_query_process(llm_request_log, log_type="find_similar_request")
+
                 # 使用特定于相似示例查找的LLM客户端
                 llm_client = get_llm_client(stage="similar_example")
                 messages = [
@@ -766,29 +1098,29 @@ class NL2SQLProcessor:
                     Message.user(user_prompt)
                 ]
                 response = llm_client.chat(messages)
-                
+
                 # 检查响应是否为None或为空
                 if not response or not hasattr(response, 'content') or not response.content:
-                    logger.warning(f"LLM返回了空响应，跳过此批次")
+                    logger.warning(f"LLM返回了空响应,跳过此批次")
                     continue
-                
+
                 # 检查响应是否只包含<think>标签
                 if response.content.strip() == "<think>" or response.content.strip() == "\\<think\\>":
-                    logger.warning(f"LLM返回只包含<think>标签，使用简化提示重试")
-                    # 简化提示，使用更直接的方式请求相似度评估
+                    logger.warning(f"LLM返回只包含<think>标签,使用简化提示重试")
+                    # 简化提示,使用更直接的方式请求相似度评估
                     simplified_prompt = f"当前问题: {query}\n\n示例问题:\n"
                     for j, example in enumerate(batch):
                         simplified_prompt += f"{j+1}. {example['question']}\n"
-                    simplified_prompt += "\n请直接计算当前问题与每个示例问题的相似度，返回0-1之间的数值。格式为：\n1. 相似度: 0.X\n2. 相似度: 0.X\n以此类推。"
-                    
+                    simplified_prompt += "\n请直接计算当前问题与每个示例问题的相似度,返回0-1之间的数值。格式为：\n1. 相似度: 0.X\n2. 相似度: 0.X\n以此类推。"
+
                     # 尝试使用简化提示重试
                     try:
                         simple_messages = [
-                            Message.system("你是一个语义比较专家，负责计算问题的相似度。请直接返回相似度数值，不要添加其他内容。"),
+                            Message.system("你是一个语义比较专家,负责计算问题的相似度。请直接返回相似度数值,不要添加其他内容。"),
                             Message.user(simplified_prompt)
                         ]
                         simple_response = llm_client.chat(simple_messages)
-                        
+
                         if simple_response and hasattr(simple_response, 'content') and simple_response.content:
                             logger.info(f"简化提示获得响应: {simple_response.content[:100]}...")
                             # 尝试从简化响应中提取相似度数值
@@ -806,73 +1138,42 @@ class NL2SQLProcessor:
                                     except ValueError:
                                         pass
                         else:
-                            logger.warning("简化提示也返回了空响应，跳过此批次")
+                            logger.warning("简化提示也返回了空响应,跳过此批次")
                             continue
                     except Exception as simple_error:
                         logger.error(f"尝试简化提示时出错: {str(simple_error)}")
-                    
-                    # 记录LLM响应
-                    response_log_path = log_dir / f"{timestamp}_find_similar_response_{i}.json"
-                    llm_response_log = {
-                        "function": "_find_similar_example",
-                        "query": query,
-                        "response_content": response.content,
-                        "batch_index": i,
-                        "batch_size": len(batch),
-                        "timestamp": datetime.now().isoformat()
-                    }
-                    
-                    try:
-                        with open(response_log_path, 'w', encoding='utf-8') as f:
-                            # 处理特殊字符，保留完整内容
-                            safe_log = llm_response_log.copy()
-                            for key, value in llm_response_log.items():
-                                if isinstance(value, str) and ("<" in value or ">" in value):
-                                    # 转义特殊字符
-                                    safe_content = value.replace("\\", "\\\\").replace("\"", "\\\"")
-                                    # 对于标签类内容，进行转义，避免被截断
-                                    safe_content = safe_content.replace("<", "\\<").replace(">", "\\>")
-                                    safe_log[key] = safe_content
-                                    
-                            json.dump(safe_log, f, ensure_ascii=False, indent=2)
-                            
-                        logger.info(f"相似示例查找响应日志已保存: {response_log_path}")
-                    except Exception as log_err:
-                        logger.error(f"保存响应日志时出错: {str(log_err)}")
-                        # 尝试备份保存为文本文件
-                        try:
-                            text_log_path = str(response_log_path).replace(".json", ".txt")
-                            with open(text_log_path, 'w', encoding='utf-8') as f:
-                                f.write(f"Function: {llm_response_log['function']}\n")
-                                f.write(f"Query: {llm_response_log['query']}\n")
-                                f.write(f"Batch: {i+1}/{len(batch)}\n")
-                                f.write(f"Timestamp: {llm_response_log['timestamp']}\n")
-                                f.write("=== Response Content ===\n")
-                                f.write(response.content)
-                            logger.info(f"响应日志已保存为文本文件: {text_log_path}")
-                        except Exception as text_err:
-                            logger.error(f"保存文本日志也失败: {str(text_err)}")
-                    
-                    logger.info(f"LLM响应内容前100个字符: {response.content[:100]}...")
-                    
-                    # 解析结果
+
+                # 使用审计日志记录LLM响应
+                llm_response_log = {
+                    "function": "_find_similar_example",
+                    "query": query,
+                    "response_content": response.content,
+                    "batch_index": i,
+                    "batch_size": len(batch),
+                    "timestamp": datetime.now().isoformat()
+                }
+                log_query_process(llm_response_log, log_type="find_similar_response")
+
+                logger.info(f"LLM响应内容前100个字符: {response.content[:100]}...")
+
+                # 解析结果
                 try:
                     # 方法1: 检查是否是代码块格式 ```json {...} ```
                     json_block_pattern = r'```(?:json)?\s*([\s\S]*?)\s*```'
                     json_block_match = re.search(json_block_pattern, response.content)
-                    
+
                     if json_block_match:
-                        # 如果找到了代码块，尝试解析代码块内的内容
+                        # 如果找到了代码块,尝试解析代码块内的内容
                         json_content = json_block_match.group(1).strip()
                         logger.info(f"从代码块中提取到JSON内容: {json_content[:100]}...")
-                        
+
                         try:
                             parsed_result = json.loads(json_content)
                             logger.info(f"成功解析代码块中的JSON")
-                            
+
                             # 处理解析结果
                             if isinstance(parsed_result, list):
-                                # 如果是数组，处理每个结果
+                                # 如果是数组,处理每个结果
                                 for j, item in enumerate(parsed_result):
                                     similarity = item.get("similarity", 0)
                                     if similarity > best_similarity and similarity > self.similar_examples_threshold:
@@ -880,7 +1181,7 @@ class NL2SQLProcessor:
                                         best_match = batch[j]
                                         logger.info(f"找到更好的匹配: 示例 {j+1}, 相似度 {similarity}")
                             elif isinstance(parsed_result, dict):
-                                # 如果是单个对象，可能只有一个示例
+                                # 如果是单个对象,可能只有一个示例
                                 similarity = parsed_result.get("similarity", 0)
                                 if similarity > best_similarity and similarity > self.similar_examples_threshold:
                                     best_similarity = similarity
@@ -890,11 +1191,12 @@ class NL2SQLProcessor:
                             logger.warning(f"代码块中的JSON解析失败: {str(e)}")
                             # 继续尝试其他解析方法
                     else:
-                        # 方法2: 尝试直接解析
+                        # 继续使用其他解析方法
                         try:
+                            # 尝试直接解析
                             parsed_result = json.loads(response.content)
                             if isinstance(parsed_result, list):
-                                # 如果是数组，处理每个结果
+                                # 如果是数组,处理每个结果
                                 for j, item in enumerate(parsed_result):
                                     similarity = item.get("similarity", 0)
                                     if similarity > best_similarity and similarity > self.similar_examples_threshold:
@@ -902,7 +1204,7 @@ class NL2SQLProcessor:
                                         best_match = batch[j]
                                         logger.info(f"直接解析JSON：找到更好的匹配: 示例 {j+1}, 相似度 {similarity}")
                             elif isinstance(parsed_result, dict):
-                                # 如果是单个对象，可能只有一个示例
+                                # 如果是单个对象,可能只有一个示例
                                 similarity = parsed_result.get("similarity", 0)
                                 if similarity > best_similarity and similarity > self.similar_examples_threshold:
                                     best_similarity = similarity
@@ -910,206 +1212,134 @@ class NL2SQLProcessor:
                                     logger.info(f"直接解析JSON：找到更好的匹配(单个结果): 相似度 {similarity}")
                         except json.JSONDecodeError as e:
                             logger.warning(f"直接JSON解析失败: {str(e)}")
-                            
-                            # 方法3: 尝试从文本中提取JSON块
-                        try:
-                            # 尝试找到最外层的JSON块
-                            cleaned_content = re.sub(r'[\r\n\t]', ' ', response.content)
-                            json_start = cleaned_content.find('{')
-                            json_end = cleaned_content.rfind('}') + 1
-                            
-                            if json_start >= 0 and json_end > json_start:
-                                json_str = cleaned_content[json_start:json_end]
-                                logger.info(f"找到JSON块: {json_str[:100]}...")
-                                
-                                try:
-                                    parsed_result = json.loads(json_str)
-                                    if isinstance(parsed_result, list):
-                                        # 如果是数组，处理每个结果
-                                        for j, item in enumerate(parsed_result):
-                                            similarity = item.get("similarity", 0)
-                                            if similarity > best_similarity and similarity > self.similar_examples_threshold:
-                                                best_similarity = similarity
-                                                best_match = batch[j]
-                                                logger.info(f"JSON块解析：找到更好的匹配: 示例 {j+1}, 相似度 {similarity}")
-                                    elif isinstance(parsed_result, dict):
-                                        # 如果是单个对象，可能只有一个示例
-                                        similarity = parsed_result.get("similarity", 0)
-                                        if similarity > best_similarity and similarity > self.similar_examples_threshold:
-                                            best_similarity = similarity
-                                            best_match = batch[0]
-                                            logger.info(f"JSON块解析：找到更好的匹配(单个结果): 相似度 {similarity}")
-                                except json.JSONDecodeError:
-                                    logger.warning("提取的JSON块解析失败")
-                        except Exception as e:
-                            logger.warning(f"尝试提取JSON块时出错: {str(e)}")
-                        
-                        # 方法4: 从文本中提取相似度信息
-                        logger.info(f"尝试从文本中提取相似度信息")
-                        for j, example in enumerate(batch):
-                            # 尝试多种模式匹配相似度
-                            patterns = [
-                                rf"{j+1}[.)].*?相似度[：:]\s*(\d+(\.\d+)?)",
-                                rf"示例\s*{j+1}.*?相似度[：:]\s*(\d+(\.\d+)?)",
-                                rf"问题\s*{j+1}.*?相似度[：:]\s*(\d+(\.\d+)?)"
-                            ]
-                            
-                            for pattern in patterns:
-                                matches = re.search(pattern, response.content, re.DOTALL)
-                                if matches:
-                                    try:
-                                        similarity = float(matches.group(1))
-                                        logger.info(f"从文本中提取到示例 {j+1} 的相似度: {similarity}")
-                                        if similarity > best_similarity and similarity > self.similar_examples_threshold:
-                                            best_similarity = similarity
-                                            best_match = example
-                                            logger.info(f"文本提取：找到更好的匹配: 示例 {j+1}, 相似度 {similarity}")
-                                        break  # 找到一个匹配就跳出内层循环
-                                    except ValueError:
-                                        pass
                 except Exception as e:
-                    logger.error(f"处理相似度结果时出错: {str(e)}")
-                except Exception as llm_error:
-                    error_message = str(llm_error)
-                    # 检查是否是连接错误
-                    if "connection error" in error_message.lower():
-                        logger.error(f"LLM服务连接失败: {error_message}")
-                        # 记录错误但继续处理下一批，不中断整个过程
-                        error_log = {
-                            "query": query,
-                            "function": "_find_similar_example",
-                            "error": "LLM服务连接失败",
-                            "error_details": error_message,
-                            "batch_index": i,
-                            "error_type": type(llm_error).__name__
-                        }
-                        log_query_process(error_log, "find_similar_connection_error")
-                    else:
-                        logger.error(f"LLM调用出错: {error_message}")
-                        error_log = {
-                            "query": query,
-                            "function": "_find_similar_example",
-                            "error": error_message,
-                            "batch_index": i,
-                            "error_type": type(llm_error).__name__
-                        }
-                        log_query_process(error_log, "find_similar_llm_error")
-            
-                # 记录最终结果
-                if best_match:
-                    find_log["found_match"] = True
-                    find_log["best_similarity"] = best_similarity
-                    find_log["best_match"] = {
-                        "question": best_match.get("question", ""),
-                        "sql": best_match.get("sql", "")
-                    }
-                    logger.info(f"找到最佳匹配示例，相似度: {best_similarity}")
-                    log_query_process(find_log, "find_similar_example")
-                else:
-                    find_log["found_match"] = False
-                    logger.info("未找到相似度超过阈值的示例")
-                    log_query_process(find_log, "find_similar_example_none")
-                    
-                return best_match
+                    logger.warning(f"解析LLM响应时出错: {str(e)}")
+
+            # 记录最终的匹配结果
+            if best_match:
+                find_log["found_match"] = True
+                find_log["similarity"] = best_similarity
+                find_log["matched_example"] = best_match.get("question", "")
+                logger.info(f"找到相似示例,相似度: {best_similarity}")
+            else:
+                find_log["found_match"] = False
+                logger.info("没有找到足够相似的示例")
+
+            # 记录整个查找过程
+            log_query_process(find_log, "find_similar_result")
+
+            return best_match
         except Exception as e:
             logger.error(f"查找相似示例时出错: {str(e)}")
-            error_log = {
-                "query": query,
-                "function": "_find_similar_example",
-                "error": str(e),
-                "error_type": type(e).__name__
-            }
-            log_query_process(error_log, "find_similar_example_error")
             return None
-    
-    def _generate_sql(self, query: str, similar_example: Optional[Dict[str, Any]] = None, business_metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+
+    def _generate_sql(self, query: str, similar_example: Optional[Dict[str, Any]] = None, 
+                      business_metadata: Optional[Dict[str, Any]] = None, 
+                      previous_error: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        生成SQL查询
+        使用LLM生成SQL
         
         Args:
             query: 自然语言查询
-            similar_example: 相似的示例问题
-            business_metadata: 业务元数据
+            similar_example: 相似示例（可选）
+            business_metadata: 业务元数据（可选）
+            previous_error: 之前的错误信息（可选）
             
         Returns:
-            Dict[str, Any]: 生成的SQL和相关信息
+            Dict: 包含SQL和相关信息的字典
         """
+        provider = os.getenv("LLM_PROVIDER_SQL_GENERATION", os.getenv("LLM_PROVIDER", "openai"))
+        model = os.getenv(f"LLM_MODEL_SQL_GENERATION", os.getenv(f"{provider.upper()}_MODEL", None))
+
         try:
-            # 初始化日志数据
+            # 获取LLM客户端
+            llm_client = get_llm_client(provider, model)
+
+            # 获取数据库表和列信息
+            tables_info = self._get_tables_info()
+
+            if not tables_info:
+                logger.warning("无法获取表结构信息,SQL生成可能不准确")
+
+            # 准备查询上下文
+            system_prompt = f"""你是一个专业的SQL查询生成助手,擅长将自然语言转换为精确的SQL查询。
+
+根据用户的问题和提供的数据库结构信息,生成准确的SQL查询。请遵循以下指导：
+
+1. 尽可能使用复杂的SQL查询来满足用户需求,包括多表JOIN、子查询、分组、聚合等。
+2. 确保SQL语法准确,使用正确的字段名和表名。
+3. 根据问题确定合适的表和字段,即使用户没有明确指定。
+4. 考虑表之间的关系,使用适当的JOIN条件。
+5. 注意日期和数值类型的正确处理。
+6. 返回格式为JSON,包含生成的SQL和详细说明。
+7. 按需添加SQL注释说明查询目的或关键步骤。
+8. 返回的JSON格式为：
+{{
+  "sql": "你的SQL语句",
+  "explanation": "SQL的详细解释,包括表选择理由、字段用途等"
+}}
+
+{f"除非必要,优先查询精细层（如ads、dim）而非粗粒度层（如dwd、ods）。" if self.metadata_extractor.enable_table_hierarchy else ""}
+{f"支持跨数据库查询。在涉及多个数据库的表时,使用完整的 database_name.table_name 格式。" if self.enable_multi_database else ""}"""
+
+            # 如果有之前执行的SQL错误信息,添加到系统提示中
+            if previous_error:
+                previous_sql = previous_error.get('sql', '')
+                error_message = previous_error.get('error', '')
+                system_prompt += f"""
+
+注意：之前生成的SQL执行失败,请生成修复后的SQL。
+之前的SQL: {previous_sql}
+错误信息: {error_message}
+分析错误原因并生成正确的SQL,避免重复之前的错误。特别注意表名、字段名、语法以及表关联条件是否正确。"""
+
+            messages = [Message("system", system_prompt)]
+
+            # 构建用户请求内容,避免连续的用户消息
+            user_content = query
+
+            # 如果有业务元数据,添加到用户请求中
+            if business_metadata:
+                user_content = f"业务元数据: {business_metadata}\n\n查询: {query}"
+
+            # 添加示例信息（确保用户和助手消息交替）
+            if similar_example:
+                messages.append(Message("user", similar_example['question']))
+                messages.append(Message("assistant", similar_example['sql']))
+
+            # 添加表结构信息到用户请求
+            if tables_info:
+                user_content += f"\n\n数据库表结构:\n{tables_info}"
+
+            # 添加用户查询（确保不会有连续的用户消息）
+            messages.append(Message("user", user_content))
+
+            # 记录提示信息
             llm_log = {
                 "query": query,
                 "function": "_generate_sql",
-                "has_similar_example": similar_example is not None
+                "has_similar_example": similar_example is not None,
+                "business_metadata": business_metadata is not None,
+                "has_previous_error": previous_error is not None
             }
-            
-            # 获取数据库表和列信息
-            tables_info = self._get_tables_info()
-            logger.info(f"为查询 '{query}' 生成SQL")
-            
-            # 选择合适的提示词
-            if similar_example:
-                # 使用带有示例的用户提示
-                system_prompt = NL2SQL_PROMPTS["system_with_schema"].format(
-                    tables_info=tables_info
-                )
-                user_prompt = NL2SQL_PROMPTS["user_with_example"].format(
-                    query=query,
-                    example_query=similar_example['question'],
-                    example_sql=similar_example['sql']
-                )
-                logger.info("使用带有示例的提示模板")
-                
-                # 记录示例信息
-                llm_log["example"] = {
-                    "question": similar_example['question'],
-                    "sql": similar_example['sql']
-                }
-            else:
-                # 使用标准提示
-                system_prompt = NL2SQL_PROMPTS["system_with_schema"].format(
-                    tables_info=tables_info
-                )
-                user_prompt = NL2SQL_PROMPTS["user"].format(query=query)
-                logger.info("使用标准提示模板")
-            
-            # 记录提示信息
-            llm_log["system_prompt"] = system_prompt
-            llm_log["user_prompt"] = user_prompt
-            llm_log["tables_info_length"] = len(tables_info)
-            
+
             # 调用LLM
             start_time = time.time()
-            
-            # 使用SQL生成阶段特定的LLM客户端
-            try:
-                llm_client = get_llm_client(stage="sql_generation")
-            except Exception as e:
-                logger.error(f"获取SQL生成LLM客户端失败: {str(e)}")
-                return {
-                    "success": False,
-                    "message": f"无法获取LLM客户端: {str(e)}",
-                    "query": query
-                }
-                
-            messages = [
-                Message.system(system_prompt),
-                Message.user(user_prompt)
-            ]
-            
+
             try:
                 response = llm_client.chat(messages)
                 execution_time = time.time() - start_time
-                
+
                 # 检查响应是否为None或为空
                 if not response or not hasattr(response, 'content') or not response.content:
                     raise ValueError("LLM返回了空响应")
-                
+
                 # 检查响应是否只包含<think>标签
                 if response.content.strip() == "<think>" or response.content.strip() == "\\<think\\>":
-                    logger.warning(f"LLM返回只包含<think>标签，使用简化提示重新生成SQL")
-                    
+                    logger.warning(f"LLM返回只包含<think>标签,使用简化提示重新生成SQL")
+
                     # 构建更简单直接的提示
-                    retry_system_prompt = """你是SQL生成专家。请直接生成Apache Doris SQL代码，不要包含思考过程。
+                    retry_system_prompt = """你是SQL生成专家。请直接生成Apache Doris SQL代码,不要包含思考过程。
 请严格按以下格式输出:
 ```sql
 -- 你的SQL查询代码
@@ -1123,7 +1353,7 @@ class NL2SQLProcessor:
 数据库表结构:
 {tables_info}
 
-直接返回SQL代码，不需要解释或分析。"""
+直接返回SQL代码,不需要解释或分析。"""
 
                     # 重试
                     try:
@@ -1131,77 +1361,50 @@ class NL2SQLProcessor:
                             Message.system(retry_system_prompt),
                             Message.user(retry_user_prompt)
                         ]
-                        
+
                         retry_response = llm_client.chat(retry_messages)
                         if retry_response and hasattr(retry_response, 'content') and retry_response.content:
-                            logger.info(f"重试生成SQL成功，获得响应: {retry_response.content[:100]}...")
-                            
+                            logger.info(f"重试生成SQL成功,获得响应: {retry_response.content[:100]}...")
+
                             # 使用重试结果替换原始响应
                             response = retry_response
                             # 更新日志
                             llm_log["retry_used"] = True
                         else:
-                            logger.error("重试生成SQL失败，仍无法获得有效响应")
+                            logger.error("重试生成SQL失败,仍无法获得有效响应")
                     except Exception as e:
                         logger.error(f"重试生成SQL时出错: {str(e)}")
-                
+
                 # 记录LLM响应
                 llm_log["llm_response"] = response.content
                 llm_log["execution_time"] = execution_time
                 llm_log["llm_provider"] = os.getenv("LLM_PROVIDER", "unknown")
-                
-                # 创建日志目录并保存LLM响应日志
-                log_dir = pathlib.Path(PROJECT_ROOT) / "log" / "llm_calls"
-                log_dir.mkdir(parents=True, exist_ok=True)
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                
-                response_log_path = log_dir / f"{timestamp}_generate_sql_response.json"
+                llm_log["model"] = model  # 使用上面定义的model变量，而不是self.model
+
+                # 使用审计日志记录LLM响应而不是写入文件
                 llm_response_log = {
                     "function": "_generate_sql",
+                    "model": model,  # 使用上面定义的model变量
                     "query": query,
+                    "timestamp": datetime.now().isoformat(),
                     "response_content": response.content,
-                    "timestamp": datetime.now().isoformat()
+                    "generation_params": {
+                        "similar_example": similar_example,
+                        "business_metadata": business_metadata,
+                        "previous_error": previous_error
+                    }
                 }
-                
-                try:
-                    with open(response_log_path, 'w', encoding='utf-8') as f:
-                        # 处理特殊字符，保留完整内容
-                        safe_log = llm_response_log.copy()
-                        for key, value in llm_response_log.items():
-                            if isinstance(value, str) and ("<" in value or ">" in value):
-                                # 转义特殊字符
-                                safe_content = value.replace("\\", "\\\\").replace("\"", "\\\"")
-                                # 对于标签类内容，进行转义，避免被截断
-                                safe_content = safe_content.replace("<", "\\<").replace(">", "\\>")
-                                safe_log[key] = safe_content
-                                
-                        json.dump(safe_log, f, ensure_ascii=False, indent=2)
-                    
-                    logger.info(f"SQL生成响应日志已保存: {response_log_path}")
-                except Exception as log_err:
-                    logger.error(f"保存响应日志时出错: {str(log_err)}")
-                    # 尝试备份保存为文本文件
-                    try:
-                        text_log_path = str(response_log_path).replace(".json", ".txt")
-                        with open(text_log_path, 'w', encoding='utf-8') as f:
-                            f.write(f"Function: {llm_response_log['function']}\n")
-                            f.write(f"Query: {llm_response_log['query']}\n")
-                            f.write(f"Timestamp: {llm_response_log['timestamp']}\n")
-                            f.write("=== Response Content ===\n")
-                            f.write(response.content)
-                        logger.info(f"响应日志已保存为文本文件: {text_log_path}")
-                    except Exception as text_err:
-                        logger.error(f"保存文本日志也失败: {str(text_err)}")
+                log_query_process(llm_response_log, log_type="generate_sql_response")
                 
                 logger.info(f"LLM响应内容前100个字符: {response.content[:100]}...")
-                
+
                 # 提取SQL
                 sql = self._extract_sql(response.content)
                 llm_log["extracted_sql"] = sql
-                
+
                 # 保存LLM调用日志
                 log_query_process(llm_log, "llm_generate_sql")
-                
+
                 if sql:
                     logger.info(f"成功生成SQL: {sql[:100]}...")
                     return {
@@ -1221,24 +1424,24 @@ class NL2SQLProcessor:
             except Exception as llm_error:
                 error_message = str(llm_error)
                 logger.error(f"LLM调用或处理响应时出错: {error_message}")
-                
+
                 # 检查是否是连接错误
                 if "connection error" in error_message.lower():
                     error_log = {
                         "query": query,
                         "function": "_generate_sql",
-                        "error": "LLM服务连接失败，请稍后重试",
+                        "error": "LLM服务连接失败,请稍后重试",
                         "error_details": error_message,
                         "error_type": type(llm_error).__name__
                     }
                     log_query_process(error_log, "llm_connection_error")
-                    
+
                     return {
                         'success': False,
-                        'message': 'LLM服务连接失败，请稍后重试。',
+                        'message': 'LLM服务连接失败,请稍后重试。',
                         'query': query
                     }
-                
+
                 # 记录其他类型的错误
                 error_log = {
                     "query": query,
@@ -1247,7 +1450,7 @@ class NL2SQLProcessor:
                     "error_type": type(llm_error).__name__
                 }
                 log_query_process(error_log, "llm_error")
-                
+
                 return {
                     'success': False,
                     'message': f'LLM处理出错: {error_message}',
@@ -1256,7 +1459,7 @@ class NL2SQLProcessor:
         except Exception as e:
             error_message = str(e)
             logger.error(f"生成SQL时出错: {error_message}")
-            
+
             # 记录错误
             error_log = {
                 "query": query,
@@ -1265,447 +1468,349 @@ class NL2SQLProcessor:
                 "error_type": type(e).__name__
             }
             log_query_process(error_log, "llm_error")
-            
+
             return {
                 'success': False,
                 'message': f'生成SQL时出错: {error_message}',
                 'query': query
             }
-    
+
     def _get_tables_info(self) -> str:
         """
         获取数据库表和列信息的文本表示
-        
+
         Returns:
             str: 表和列信息的文本表示
         """
         tables_info = ""
-        
+
         try:
-            tables = self.metadata_extractor.get_database_tables(self.db_name)
-            
-            for table in tables:
-                # 获取表结构
-                schema = self.metadata_extractor.get_table_schema(table, self.db_name)
-                table_comment = schema.get("table_comment", "")
-                columns = schema.get("columns", [])
-                
-                # 添加表信息
-                tables_info += f"表名: {table}" + (f" (说明: {table_comment})" if table_comment else "") + "\n"
-                tables_info += "列:\n"
-                
-                # 添加列信息
-                for column in columns:
-                    name = column.get("name", "")
-                    type = column.get("type", "")
-                    comment = column.get("comment", "")
+            # 使用新的方法一次性获取所有数据库的表和列信息
+            all_metadata = self.metadata_extractor.get_all_tables_and_columns()
+
+            if not all_metadata:
+                logger.warning("未能获取到任何数据库元数据")
+                return ""
+
+            # 遍历所有数据库
+            for db_name, db_data in all_metadata.items():
+                tables_info += f"数据库: {db_name}\n"
+                tables_info += "=" * 50 + "\n"
+
+                # 获取该数据库中的所有表
+                tables = db_data.get("tables", {})
+
+                # 遍历所有表
+                for table_name, table_info in tables.items():
+                    # 添加表信息,使用database.table格式
+                    table_comment = table_info.get("comment", "")
+                    tables_info += f"表名: {db_name}.{table_name}" + (f" (说明: {table_comment})" if table_comment else "") + "\n"
                     
-                    tables_info += f"  - {name} ({type})" + (f" # {comment}" if comment else "") + "\n"
-                
-                tables_info += "\n"
+                    # 添加列信息 - 这里应该在每个表的内部添加该表的列
+                    tables_info += "列:\n"
+                    for column in table_info.get("columns", []):
+                        name = column.get("name", "")
+                        type = column.get("type", "")
+                        comment = column.get("comment", "")
+                        
+                        tables_info += f"  - {name} ({type})" + (f" # {comment}" if comment else "") + "\n"
+
+                    tables_info += "\n"
+
         except Exception as e:
             logger.error(f"获取表信息时出错: {str(e)}")
-        
+
         return tables_info
-    
+
     def _extract_sql(self, text: str) -> Optional[str]:
         """
-        从文本中提取SQL语句，支持多种格式
+        从LLM生成的文本中提取SQL语句
         
         Args:
-            text: 包含SQL的文本
+            text: LLM生成的文本
             
         Returns:
-            Optional[str]: 提取的SQL语句，如果没有则返回None
+            str: 提取出的SQL语句，如果未提取到则返回None
         """
         if not text:
             return None
-        
-        # 记录原始文本前100个字符，用于调试
-        logger.info(f"尝试提取SQL，原始文本: {text[:100]}...")
             
-        # 尝试从JSON格式中提取
+        logger.info(f"尝试提取SQL,原始文本: {text[:100]}...")
+            
+        # 情况1: 直接从JSON响应中提取SQL (如果已正确解析)
+        if isinstance(text, dict) and "sql" in text:
+            sql = text["sql"]
+            if isinstance(sql, str) and sql.strip():
+                return sql.strip()
+                
+        # 情况2: 从JSON字符串中提取
         try:
-            # 方法1: 检查是否是代码块格式 ```json {...} ```
-            json_block_pattern = r'```(?:json)?\s*([\s\S]*?)\s*```'
-            json_block_match = re.search(json_block_pattern, text)
-            
-            if json_block_match:
-                # 如果找到了代码块，尝试解析代码块内的内容
-                json_content = json_block_match.group(1).strip()
-                logger.info(f"从代码块中提取到JSON内容: {json_content[:100]}...")
-                
-                try:
-                    json_data = json.loads(json_content)
-                    if isinstance(json_data, dict) and 'sql' in json_data:
-                        sql = json_data.get('sql')
-                        if sql and isinstance(sql, str):
-                            logger.info(f"从JSON代码块中提取到SQL: {sql[:100]}...")
-                            return sql.strip()
-                except json.JSONDecodeError as e:
-                    logger.warning(f"代码块中的JSON解析失败: {str(e)}")
-            
-            # 方法2: 尝试直接解析JSON
-            try:
-                json_data = json.loads(text)
-                if isinstance(json_data, dict) and 'sql' in json_data:
-                    sql = json_data.get('sql')
-                    if sql and isinstance(sql, str):
-                        logger.info(f"从JSON中提取到SQL: {sql[:100]}...")
+            # 尝试解析JSON
+            if isinstance(text, str) and "{" in text and "}" in text:
+                json_data = self._parse_llm_json_response(text)
+                if isinstance(json_data, dict) and "sql" in json_data:
+                    sql = json_data["sql"]
+                    if isinstance(sql, str) and sql.strip():
+                        logger.info(f"从JSON代码块中提取到SQL: {sql[:100]}...")
                         return sql.strip()
-            except json.JSONDecodeError as e:
-                logger.warning(f"直接JSON解析失败: {str(e)}")
-                
-                # 方法3: 检查是否缺少大括号的情况
-                if ('"sql"' in text or "'sql'" in text) and '{' not in text:
-                    logger.info("检测到特殊格式: 包含sql字段但缺少大括号，尝试修复")
-                    # 为内容添加大括号
-                    fixed_content = '{' + text + '}'
-                    try:
-                        json_data = json.loads(fixed_content)
-                        if isinstance(json_data, dict) and 'sql' in json_data:
-                            sql = json_data.get('sql')
-                            if sql and isinstance(sql, str):
-                                logger.info(f"修复后从JSON中提取到SQL: {sql[:100]}...")
-                                return sql.strip()
-                    except json.JSONDecodeError:
-                        logger.warning("添加大括号后仍然无法解析JSON")
-                
-                # 方法4: 尝试从文本中提取JSON块
-                try:
-                    # 尝试找到最外层的JSON块
-                    cleaned_content = re.sub(r'[\r\n\t]', ' ', text)
-                    json_start = cleaned_content.find('{')
-                    json_end = cleaned_content.rfind('}') + 1
-                    
-                    if json_start >= 0 and json_end > json_start:
-                        json_str = cleaned_content[json_start:json_end]
-                        logger.info(f"找到JSON块: {json_str[:100]}...")
-                        
-                        try:
-                            json_data = json.loads(json_str)
-                            if isinstance(json_data, list):
-                                # 如果是数组，处理每个结果
-                                for j, item in enumerate(json_data):
-                                    similarity = item.get("similarity", 0)
-                                    if similarity > best_similarity and similarity > self.similar_examples_threshold:
-                                        best_similarity = similarity
-                                        best_match = item
-                                        logger.info(f"直接解析JSON：找到更好的匹配: 示例 {j+1}, 相似度 {similarity}")
-                            elif isinstance(json_data, dict):
-                                # 如果是单个对象，可能只有一个示例
-                                similarity = json_data.get("similarity", 0)
-                                if similarity > best_similarity and similarity > self.similar_examples_threshold:
-                                    best_similarity = similarity
-                                    best_match = json_data
-                                    logger.info(f"直接解析JSON：找到更好的匹配(单个结果): 相似度 {similarity}")
-                        except json.JSONDecodeError:
-                            logger.warning("提取的JSON块解析失败")
-                except Exception as e:
-                    logger.warning(f"尝试提取JSON块时出错: {str(e)}")
-                
-                # 方法5: 直接使用正则表达式提取sql字段
-                try:
-                    sql_pattern = r'["\']sql["\']\s*:\s*["\'](.*?)["\']'
-                    sql_match = re.search(sql_pattern, text, re.DOTALL)
-                    if sql_match:
-                        sql_value = sql_match.group(1)
-                        logger.info(f"使用正则表达式直接提取到SQL值: {sql_value[:100]}...")
-                        return sql_value.strip()
-                except Exception as e:
-                    logger.warning(f"使用正则表达式提取SQL时出错: {str(e)}")
         except Exception as e:
-            logger.warning(f"从JSON提取SQL时出错: {str(e)}")
-
-        # 方法6: 从```sql```块中提取
-        sql_pattern = r"```sql\s*(.*?)\s*```"
-        matches = re.search(sql_pattern, text, re.DOTALL)
-        
-        if matches:
-            sql = matches.group(1).strip()
-            logger.info(f"从SQL代码块中提取到SQL: {sql[:100]}...")
-            return sql
-        
-        # 方法7: 从任何代码块中提取
-        code_pattern = r"```(?:sql)?\s*(.*?)\s*```"
-        matches = re.search(code_pattern, text, re.DOTALL)
-        if matches:
-            sql = matches.group(1).strip()
-            # 检查这是否看起来像SQL语句
-            if re.search(r'\b(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|SHOW|DESCRIBE)\b', sql, re.IGNORECASE):
-                logger.info(f"从任意代码块中提取到SQL: {sql[:100]}...")
-                return sql
-        
-        # 方法8: 如果没有找到```sql```块，尝试其他格式
-        patterns = [
-            # SQL标记
-            r"SQL:\s*(SELECT.*?)(\n\n|\Z)",         # SQL: 标记后的SELECT语句
-            r"查询语句:\s*(SELECT.*?)(\n\n|\Z)",    # 查询语句: 标记后的SELECT语句
-            r"SQL语句:\s*(SELECT.*?)(\n\n|\Z)",     # SQL语句: 标记后的SELECT语句
-            r"Query:\s*(SELECT.*?)(\n\n|\Z)",       # Query: 标记后的SELECT语句
-            r"最终SQL:\s*(SELECT.*?)(\n\n|\Z)",     # 最终SQL: 标记后的语句
-            r"生成的SQL:\s*(SELECT.*?)(\n\n|\Z)",   # 生成的SQL: 标记后的语句
+            logger.warning(f"从JSON中提取SQL失败: {str(e)}")
             
-            # 其他SQL类型
-            r"SQL:\s*(INSERT.*?)(\n\n|\Z)",         # INSERT语句
-            r"SQL:\s*(UPDATE.*?)(\n\n|\Z)",         # UPDATE语句
-            r"SQL:\s*(DELETE.*?)(\n\n|\Z)",         # DELETE语句
-            r"SQL:\s*(CREATE.*?)(\n\n|\Z)",         # CREATE语句
-            r"SQL:\s*(DROP.*?)(\n\n|\Z)",           # DROP语句
-            r"SQL:\s*(ALTER.*?)(\n\n|\Z)",          # ALTER语句
-            r"SQL:\s*(SHOW.*?)(\n\n|\Z)",           # SHOW语句
-            r"SQL:\s*(DESCRIBE.*?)(\n\n|\Z)",       # DESCRIBE语句
+        # 情况3: 从SQL代码块中提取
+        try:
+            sql_block_pattern = r'```(?:sql)?\s*([\s\S]*?)\s*```'
+            sql_blocks = re.findall(sql_block_pattern, text)
             
-            # 独立行的SQL语句
-            r"(\n|^)(SELECT.*?)(;\s*\n|\Z)",        # 独立行的SELECT语句
-            r"(\n|^)(INSERT.*?)(;\s*\n|\Z)",        # 独立行的INSERT语句
-            r"(\n|^)(UPDATE.*?)(;\s*\n|\Z)",        # 独立行的UPDATE语句
-            r"(\n|^)(DELETE.*?)(;\s*\n|\Z)",        # 独立行的DELETE语句
-            r"(\n|^)(CREATE.*?)(;\s*\n|\Z)",        # 独立行的CREATE语句
-            r"(\n|^)(DROP.*?)(;\s*\n|\Z)",          # 独立行的DROP语句
-            r"(\n|^)(ALTER.*?)(;\s*\n|\Z)",         # 独立行的ALTER语句
-            r"(\n|^)(SHOW.*?)(;\s*\n|\Z)",          # 独立行的SHOW语句
-            r"(\n|^)(DESCRIBE.*?)(;\s*\n|\Z)"       # 独立行的DESCRIBE语句
-        ]
-        
-        for pattern in patterns:
-            matches = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-            if matches:
-                group_index = 1
-                if "(\n|^)" in pattern:  # 对于带有前缀的模式，SQL在第2个组
-                    group_index = 2
-                sql = matches.group(group_index).strip()
-                logger.info(f"从模式 '{pattern[:20]}...' 中提取到SQL: {sql[:100]}...")
-                return sql
-        
-        # 方法9: 最后的尝试：查找任何看起来像SQL的文本
-        sql_keywords = r"\b(SELECT|FROM|WHERE|GROUP BY|ORDER BY|HAVING|JOIN|INNER JOIN|LEFT JOIN|RIGHT JOIN|FULL JOIN|LIMIT)\b"
-        parts = re.split(r"\n\s*\n", text)  # 按空行分割文本
-        
-        for part in parts:
-            # 如果一个段落包含多个SQL关键字，可能是SQL语句
-            if len(re.findall(sql_keywords, part, re.IGNORECASE)) >= 3:
-                # 尝试提取一个完整的SQL语句
-                sql_match = re.search(r"(SELECT.*?)(;\s*$|\Z)", part, re.DOTALL | re.IGNORECASE)
-                if sql_match:
-                    sql = sql_match.group(1).strip()
-                    logger.info(f"从文本中提取到SQL语句: {sql[:100]}...")
+            if sql_blocks:
+                # 选择最长的SQL块，通常是最完整的
+                sql = max(sql_blocks, key=len).strip()
+                if sql:
+                    logger.info(f"从SQL代码块中提取到SQL: {sql[:100]}...")
                     return sql
-        
-        # 如果无法提取SQL语句，记录警告并返回None
-        logger.warning(f"无法从LLM响应中提取SQL: {text[:100]}...")
+        except Exception as e:
+            logger.warning(f"从SQL代码块中提取SQL失败: {str(e)}")
+            
+        # 情况4: 直接从文本中提取具有SQL关键字的部分
+        try:
+            # 查找常见SQL前缀
+            sql_prefixes = ["SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP"]
+            lines = text.split('\n')
+            
+            for i, line in enumerate(lines):
+                line_upper = line.strip().upper()
+                if any(line_upper.startswith(prefix) for prefix in sql_prefixes):
+                    # 提取从这行开始的所有内容作为SQL
+                    sql = '\n'.join(lines[i:]).strip()
+                    if sql:
+                        logger.info(f"从文本中直接提取到SQL: {sql[:100]}...")
+                        return sql
+        except Exception as e:
+            logger.warning(f"直接从文本中提取SQL失败: {str(e)}")
+            
+        # 情况5: 使用正则表达式直接匹配SQL模式
+        try:
+            # 匹配SQL语句模式
+            sql_pattern = r'(?:SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)[\s\S]*?(?:;|$)'
+            sql_matches = re.findall(sql_pattern, text, re.IGNORECASE)
+            
+            if sql_matches:
+                # 选择最长的匹配
+                sql = max(sql_matches, key=len).strip()
+                if sql:
+                    logger.info(f"通过SQL模式匹配提取到SQL: {sql[:100]}...")
+                    return sql
+        except Exception as e:
+            logger.warning(f"SQL模式匹配提取失败: {str(e)}")
+            
+        logger.warning("所有SQL提取方法均失败")
         return None
-    
-    def _execute_sql_with_retry(self, sql: str, query: str) -> Dict[str, Any]:
+
+    def _execute_sql_with_retry(self, sql: str, query: Optional[str] = None) -> Dict[str, Any]:
         """
-        执行SQL查询，并在失败时尝试修正
+        执行SQL语句并在出错时尝试重试或重新生成
         
         Args:
-            sql: SQL查询
-            query: 原始自然语言查询
+            sql: 要执行的SQL语句
+            query: 原始的自然语言查询
             
         Returns:
-            Dict[str, Any]: 执行结果
+            Dict: 包含执行结果或错误信息的字典
         """
-        # 执行查询
-        retry_count = 0
-        sql_query = sql
-        errors = []
+        if not sql:
+            return {"error": "SQL语句为空", "status": "failed"}
+            
+        # 最大尝试次数
+        max_retries = 4
+        original_sql = sql  # 保存原始SQL以便需要时完全重新生成
         
-        while retry_count < self.max_retries:
+        # 遍历重试次数
+        for attempt in range(1, max_retries + 1):
             try:
-                # 执行SQL
-                start_time = time.time()
-                result_df = execute_query_df(sql_query)
-                execution_time = time.time() - start_time
+                logger.info(f"执行SQL查询 (尝试 {attempt}/{max_retries}): {sql[:500]}")
                 
-                # 处理结果
-                result = {
-                    'success': True,
-                    'data': result_df.to_dict(orient='records'),
-                    'columns': result_df.columns.tolist(),
-                    'row_count': len(result_df),
-                    'execution_time': execution_time,
-                    'sql': sql_query,
-                    'retries': retry_count,
-                    'errors': errors,
-                    'query': query
-                }
+                # 执行SQL查询 - execute_sql返回的是结果列表，不是游标
+                results = execute_sql(sql)
                 
-                return result
+                if results is not None:
+                    # 结果是一个字典列表，直接使用列名
+                    if results:
+                        column_names = list(results[0].keys())
+                    else:
+                        column_names = []
+                    
+                    logger.info(f"SQL执行成功，获取到 {len(results)} 条记录")
+                    
+                    # 返回成功结果（添加result字段用于保持兼容性）
+                    return {
+                        "status": "success",
+                        "sql": sql,
+                        "data": results,
+                        "result": results,  # 添加此字段，使result_preview可以正常工作
+                        "column_names": column_names
+                    }
+                else:
+                    # 没有结果但执行成功
+                    return {
+                        "status": "success",
+                        "sql": sql,
+                        "data": [],
+                        "result": [],  # 添加此字段，使result_preview可以正常工作
+                        "column_names": []
+                    }
             except Exception as e:
-                # 记录错误
-                error_msg = str(e)
-                errors.append(error_msg)
-                logger.warning(f"SQL执行错误 (尝试 {retry_count+1}/{self.max_retries}): {error_msg}")
+                error_str = str(e)
+                logger.error(f"执行SQL时出错 (尝试 {attempt}/{max_retries}): {error_str}")
                 
-                # 尝试修正SQL
-                sql_query = self._fix_sql(sql_query, error_msg, query)
+                if query is None:
+                    logger.error("无法修复SQL：原始查询为空")
+                    continue
                 
-                # 如果无法修正，则退出循环
-                if not sql_query:
-                    break
-                
-                retry_count += 1
+                # 对于每次错误，都尝试使用LLM修复SQL
+                if attempt < max_retries:
+                    # 尝试修复SQL
+                    fixed_sql = self._fix_sql(sql, error_str, query)
+                    if fixed_sql and fixed_sql != sql:
+                        sql = fixed_sql
+                        logger.info(f"SQL已修复，将使用修复后的SQL重试")
+                    else:
+                        logger.warning(f"SQL修复失败或返回相同SQL")
+                else:
+                    # 最后一次尝试，使用LLM重新生成完整的SQL
+                    logger.info(f"所有修复尝试都失败，尝试重新生成SQL，错误信息: {error_str}")
+                    
+                    # 获取表信息
+                    table_info = ""
+                    try:
+                        table_info = self._get_tables_info()
+                    except Exception as table_err:
+                        logger.error(f"获取表信息时出错: {str(table_err)}")
+                    
+                    # 重新生成SQL
+                    return self._generate_sql(
+                        query=query, 
+                        previous_error={
+                            "sql": original_sql,  # 使用原始SQL而不是可能已修改的SQL
+                            "error": error_str
+                        }
+                    )
         
-        # 如果所有尝试都失败
+        # 所有尝试均失败
         return {
-            'success': False,
-            'message': f'SQL执行失败 ({retry_count} 次尝试后)',
-            'errors': errors,
-            'sql': sql,
-            'query': query
+            "status": "failed",
+            "sql": sql,
+            "error": f"执行SQL失败，已尝试 {max_retries} 次",
+            "data": []
         }
-    
+
     def _fix_sql(self, sql: str, error_msg: str, query: str) -> Optional[str]:
         """
-        修正SQL查询
+        使用LLM修复SQL错误
         
         Args:
-            sql: 原始SQL查询
+            sql: 原始SQL
             error_msg: 错误信息
-            query: 原始自然语言查询
+            query: 原始查询
             
         Returns:
-            Optional[str]: 修正后的SQL查询，如果无法修正则返回None
+            str: 修复后的SQL，如果无法修复则返回None
         """
+        if not sql or not error_msg:
+            logger.warning("修复SQL时缺少必要参数: SQL或错误信息为空")
+            return None
+            
+        # 记录尝试修复的信息
+        logger.info(f"尝试修复SQL错误,类型: {error_analysis(error_msg)}")
+
         try:
-            # 初始化日志数据
-            fix_log = {
-                "query": query,
-                "function": "_fix_sql",
-                "original_sql": sql,
-                "error_message": error_msg
-            }
-            
-            # 获取表结构信息
-            tables_info = self._get_tables_info()
-            
-            # 分析错误类型
-            error_type = "未知错误"
-            if "syntax error" in error_msg.lower():
-                error_type = "语法错误"
-            elif "table not found" in error_msg.lower() or "table doesn't exist" in error_msg.lower():
-                error_type = "表不存在"
-            elif "field not found" in error_msg.lower() or "column not found" in error_msg.lower():
-                error_type = "字段不存在"
-            elif "ambiguous" in error_msg.lower():
-                error_type = "字段名称冲突"
-            
-            logger.info(f"尝试修复SQL错误，类型: {error_type}")
-            fix_log["error_type"] = error_type
-            
-            # 使用提示词模板
-            system_prompt = SQL_FIX_PROMPTS["system"].format(
-                error_type=error_type,
-                error_message=error_msg
+            # 获取表信息
+            table_info = ""
+            try:
+                table_info = self._get_tables_info()
+            except Exception as e:
+                logger.error(f"获取表信息时出错: {str(e)}")
+                
+            # 准备修复提示
+            fix_sql_prompt = self.get_fix_sql_prompt(
+                sql=sql,
+                error_message=error_msg,
+                query=query,
+                table_info=table_info
             )
             
-            # 拼接用户提示
-            user_prompt = SQL_FIX_PROMPTS["user"].format(sql=sql)
-            # 添加表结构信息
-            user_prompt += f"\n\n数据库表结构:\n{tables_info}"
-            # 添加原始查询
-            user_prompt += f"\n\n原始问题: {query}"
-            
-            # 记录提示信息
-            fix_log["system_prompt"] = system_prompt
-            fix_log["user_prompt"] = user_prompt
-            fix_log["tables_info_length"] = len(tables_info)
-            
-            # 调用LLM
-            start_time = time.time()
+            # 调用LLM修复SQL
             llm_client = get_llm_client()
+            system_prompt = fix_sql_prompt.get("system", "")
+            user_prompt = fix_sql_prompt.get("user", "")
+            
+            # 创建消息对象
             messages = [
-                Message.system(system_prompt),
-                Message.user(user_prompt)
+                Message("system", system_prompt),
+                Message("user", user_prompt)
             ]
             
             response = llm_client.chat(messages)
-            execution_time = time.time() - start_time
+            response_content = response.content if hasattr(response, "content") else ""
             
-            # 记录LLM响应
-            fix_log["llm_response"] = response.content
-            fix_log["execution_time"] = execution_time
-            fix_log["llm_provider"] = os.getenv("LLM_PROVIDER", "unknown")
+            # 解析响应并提取修复后的SQL
+            fixed_sql = self._extract_sql(response_content)
             
-            # 提取SQL
-            fixed_sql = self._extract_sql(response.content)
+            # 记录响应
+            log_query_process({
+                "original_sql": sql,
+                "error": error_msg,
+                "fix_prompt": fix_sql_prompt,
+                "llm_response": response_content,
+                "fixed_sql": fixed_sql
+            }, log_type="sql_fix_error")
             
-            # 如果没有找到```sql```块，尝试直接使用内容
-            if not fixed_sql and response.content.strip().startswith('SELECT'):
-                fixed_sql = response.content.strip()
-            
-            fix_log["fixed_sql"] = fixed_sql
-            
-            # 保存SQL修复日志
-            log_query_process(fix_log, "llm_fix_sql")
-            
-            if fixed_sql:
-                logger.info(f"SQL修复成功: {fixed_sql[:100]}...")
-            else:
-                logger.warning("无法从LLM响应中提取修复后的SQL")
-                
             return fixed_sql
         except Exception as e:
-            error_message = str(e)
-            logger.error(f"修复SQL时出错: {error_message}")
-            
-            # 记录错误
-            error_log = {
-                "query": query,
-                "function": "_fix_sql",
-                "original_sql": sql,
-                "error": error_message,
-                "error_type": type(e).__name__
-            }
-            log_query_process(error_log, "sql_fix_error")
-            
-            return None 
-    
+            logger.error(f"修复SQL时出错: {str(e)}")
+            return None
+
     def _handle_multiline_json(self, content: str) -> Dict:
         """
-        处理可能包含多行JSON的内容，提取第一个有效的JSON对象
-        采用提取而非删除策略，保留原始响应的完整性
-        
+        处理可能包含多行JSON的内容,提取第一个有效的JSON对象
+        采用提取而非删除策略,保留原始响应的完整性
+
         Args:
             content: 可能包含多行JSON的文本内容
-            
+
         Returns:
-            Dict: 提取的JSON对象，如果没有则返回空字典
+            Dict: 提取的JSON对象,如果没有则返回空字典
         """
-        # 如果内容为空，直接返回空字典
+        # 如果内容为空,直接返回空字典
         if not content or not content.strip():
             return {}
-        
+
         # 1. 优先提取```json块中的内容
         json_block_pattern = r'```(?:json)?\s*([\s\S]*?)\s*```'
         json_block_match = re.search(json_block_pattern, content)
-        
+
         if json_block_match:
-            # 如果找到了代码块，尝试解析代码块内的内容
+            # 如果找到了代码块,尝试解析代码块内的内容
             json_content = json_block_match.group(1).strip()
             try:
                 # 尝试解析JSON内容
                 json_data = json.loads(json_content)
-                # 如果成功解析，返回结果
+                # 如果成功解析,返回结果
                 return json_data
             except json.JSONDecodeError:
-                # 如果解析失败，继续尝试其他方法
+                # 如果解析失败,继续尝试其他方法
                 pass
-        
-        # 2. 检查是否存在<think>标签，如果有则优先处理标签后的内容
+
+        # 2. 检查是否存在<think>标签,如果有则优先处理标签后的内容
         if "<think>" in content and "</think>" in content:
             # 提取</think>后的内容
             post_think_content = content.split("</think>", 1)[1].strip()
-            
+
             # 先尝试对</think>后的内容直接解析
             try:
                 return json.loads(post_think_content)
             except json.JSONDecodeError:
-                # 如果直接解析失败，尝试其他方法
+                # 如果直接解析失败,尝试其他方法
                 pass
-                
+
             # 在</think>后内容中查找可能的JSON块
             try:
                 json_start = post_think_content.find('{')
@@ -1714,35 +1819,35 @@ class NL2SQLProcessor:
                     json_part = post_think_content[json_start:json_end]
                     # 先处理可能的转义字符
                     json_part = json_part.replace('\\\\', '\\').replace('\\"', '"')
-                    # 如果有转义的尖括号，还原它们
+                    # 如果有转义的尖括号,还原它们
                     json_part = json_part.replace('\\<', '<').replace('\\>', '>')
                     return json.loads(json_part)
             except json.JSONDecodeError:
                 # 继续尝试其他方法
                 pass
-                
+
         # 3. 尝试从全文提取第一个完整的JSON对象
         try:
             # 简单情况：整个内容就是一个JSON对象
             return json.loads(content)
         except json.JSONDecodeError:
-            # 如果不是完整JSON，尝试提取第一个可能的JSON对象
+            # 如果不是完整JSON,尝试提取第一个可能的JSON对象
             json_start = content.find('{')
             json_end = content.rfind('}') + 1
-            
+
             if json_start >= 0 and json_end > json_start:
                 try:
                     json_part = content[json_start:json_end]
                     # 处理可能的转义问题
                     json_part = json_part.replace('\\\\', '\\').replace('\\"', '"')
-                    # 如果有转义的尖括号，还原它们
+                    # 如果有转义的尖括号,还原它们
                     json_part = json_part.replace('\\<', '<').replace('\\>', '>')
                     return json.loads(json_part)
                 except json.JSONDecodeError:
                     # 继续尝试
                     pass
-        
-        # 如果以上方法都失败，尝试按行解析
+
+        # 如果以上方法都失败,尝试按行解析
         lines = content.strip().split('\n')
         for line in lines:
             line = line.strip()
@@ -1751,144 +1856,379 @@ class NL2SQLProcessor:
                     # 尝试解析当前行
                     return json.loads(line)
                 except json.JSONDecodeError:
-                    # 如果解析失败，继续下一行
+                    # 如果解析失败,继续下一行
                     continue
-        
-        # 所有方法都失败，返回空字典
+
+        # 所有方法都失败,返回空字典
         return {}
-        
+
     def _parse_llm_json_response(self, content: str) -> Dict:
         """
-        解析LLM生成的JSON内容，处理各种格式问题
-        采用提取而非删除策略，保留原始内容完整性
+        解析LLM生成的JSON内容, 处理各种格式问题
+        采用提取而非删除策略, 保留原始内容完整性
         
         Args:
             content: LLM生成的可能包含JSON的文本
             
         Returns:
-            Dict: 解析后的结果，如果解析失败则包含error字段
+            Dict: 解析后的结果, 如果解析失败则包含error字段
         """
         if not content or not content.strip():
             logger.error("LLM返回内容为空或只包含空白字符")
             return {"error": "Empty or whitespace-only content", "content": content}
-        
+
         # 记录原始内容的前100个字符，用于调试
         logger.info(f"原始LLM响应(前100字符): {content[:100]}")
-        
-        # 方法0: 尝试使用专门的多行JSON处理函数
-        try:
-            json_data = self._handle_multiline_json(content)
-            if json_data:
-                return json_data
-        except Exception as e:
-            logger.warning(f"多行JSON处理时出错: {str(e)}")
-        
+
         # 方法1: 尝试提取```json代码块
         try:
             json_block_pattern = r'```(?:json)?\s*([\s\S]*?)\s*```'
             json_block_matches = re.findall(json_block_pattern, content)
-            
+
             for json_block in json_block_matches:
                 try:
-                    return json.loads(json_block.strip())
-                except json.JSONDecodeError:
+                    # 清理可能导致解析失败的控制字符
+                    cleaned_block = self._clean_json_content(json_block.strip())
+                    return json.loads(cleaned_block)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"代码块中的JSON解析失败: {str(e)}")
                     continue
         except Exception as e:
             logger.warning(f"提取JSON代码块时出错: {str(e)}")
-        
+
         # 方法2: 尝试直接解析整个内容
         try:
-            # 处理转义字符问题，使用字符串替代直接解析
-            processed_content = content
-            # 处理常见的转义问题
-            processed_content = processed_content.replace('\\\\', '\\').replace('\\"', '"')
-            # 如果有转义的尖括号，还原它们
-            processed_content = processed_content.replace('\\<', '<').replace('\\>', '>')
-            
-            return json.loads(processed_content)
+            cleaned_content = self._clean_json_content(content)
+            return json.loads(cleaned_content)
         except json.JSONDecodeError as e:
-            logger.warning(f"直接解析JSON时出错: {str(e)}")
-        
-        # 方法3: 尝试清理内容后解析
+            logger.warning(f"直接JSON解析失败: {str(e)}")
+
+        # 方法3: 尝试查找和提取JSON块
         try:
-            # 去除<think>标签及其内容
-            if "<think>" in content and "</think>" in content:
-                cleaned_content = content.split("</think>", 1)[1].strip()
-            else:
-                cleaned_content = content
-                
             # 清理特殊字符和换行
-            cleaned_content = re.sub(r'[\r\n\t]', ' ', cleaned_content)
+            cleaned_content = re.sub(r'[\r\n\t]', ' ', content)
             
             # 查找JSON块
             json_start = cleaned_content.find('{')
             json_end = cleaned_content.rfind('}') + 1
             
             if json_start >= 0 and json_end > json_start:
-                json_text = cleaned_content[json_start:json_end]
-                # 处理转义问题
-                json_text = json_text.replace('\\\\', '\\').replace('\\"', '"')
-                # 如果有转义的尖括号，还原它们
-                json_text = json_text.replace('\\<', '<').replace('\\>', '>')
-                
-                return json.loads(json_text)
-        except (json.JSONDecodeError, IndexError) as e:
-            logger.warning(f"清理后解析JSON时出错: {str(e)}")
-        
-        # 方法4: 处理可能的SQL字段内容，但缺少大括号的情况
+                json_part = cleaned_content[json_start:json_end]
+                # 清理JSON内容
+                json_part = self._clean_json_content(json_part)
+                try:
+                    return json.loads(json_part)
+                except json.JSONDecodeError:
+                    logger.warning(f"提取的JSON块解析失败")
+        except Exception as e:
+            logger.warning(f"尝试提取JSON块时出错: {str(e)}")
+
+        # 方法4: 使用正则表达式提取SQL字段
         try:
-            if ("fields" in content or "field_names" in content) and "{" not in content:
-                # 包装内容到大括号中
-                wrapped_content = "{" + content + "}"
-                return json.loads(wrapped_content)
-        except json.JSONDecodeError as e:
-            logger.warning(f"处理SQL字段内容时出错: {str(e)}")
-        
-        # 方法5: 尝试修复常见的JSON格式错误
-        try:
-            # 替换单引号为双引号
-            fixed_content = content.replace("'", "\"")
-            # 修复没有引号的键
-            fixed_content = re.sub(r'(\s*)(\w+)(\s*):', r'\1"\2"\3:', fixed_content)
-            # 处理末尾可能的多余逗号
-            fixed_content = re.sub(r',\s*}', '}', fixed_content)
-            # 处理转义问题
-            fixed_content = fixed_content.replace('\\\\', '\\').replace('\\"', '"')
-            # 如果有转义的尖括号，还原它们
-            fixed_content = fixed_content.replace('\\<', '<').replace('\\>', '>')
-            
-            # 提取JSON块
-            json_start = fixed_content.find('{')
-            json_end = fixed_content.rfind('}') + 1
-            
-            if json_start >= 0 and json_end > json_start:
-                return json.loads(fixed_content[json_start:json_end])
-        except json.JSONDecodeError as e:
-            logger.warning(f"修复JSON格式错误时出错: {str(e)}")
-        
-        # 所有JSON解析方法都失败，尝试提取SQL值
-        if "field_names" in content or "fields" in content:
-            try:
-                # 尝试提取字段名
-                field_names_match = re.search(r'field_names["\']?\s*:\s*\[(.*?)\]', content, re.DOTALL)
-                fields_match = re.search(r'fields["\']?\s*:\s*\[(.*?)\]', content, re.DOTALL)
-                
-                field_names = []
-                if field_names_match:
-                    field_names_text = field_names_match.group(1).strip()
-                    field_names = [name.strip(' \'"') for name in field_names_text.split(',')]
-                elif fields_match:
-                    fields_text = fields_match.group(1).strip()
-                    # 处理可能的复杂字段定义
-                    field_pattern = r'["\'](.*?)["\']'
-                    field_matches = re.findall(field_pattern, fields_text)
-                    field_names = field_matches
-                
-                if field_names:
-                    return {"field_names": field_names}
-            except Exception as e:
-                logger.warning(f"提取SQL值时出错: {str(e)}")
-        
+            sql_pattern = r'["\']sql["\']\s*:\s*["\'](.*?)["\']'
+            sql_match = re.search(sql_pattern, content, re.DOTALL)
+            if sql_match:
+                sql_value = sql_match.group(1).strip()
+                logger.info(f"使用正则表达式直接提取到SQL值: {sql_value[:100]}...")
+                return {"sql": sql_value}
+        except Exception as e:
+            logger.warning(f"使用正则表达式提取SQL时出错: {str(e)}")
+
         # 所有方法都失败
         logger.error(f"所有方法都无法提取有效JSON: {content[:100]}")
         return {"error": "Failed to parse JSON response", "content": content}
+        
+    def _clean_json_content(self, content: str) -> str:
+        """
+        清理JSON内容，移除控制字符和处理转义问题
+        
+        Args:
+            content: 原始JSON内容
+            
+        Returns:
+            str: 清理后的JSON内容
+        """
+        if not content:
+            return ""
+            
+        # 移除不可打印字符和控制字符
+        cleaned = ''.join(c for c in content if c >= ' ' or c in ['\n', '\r', '\t'])
+        
+        # 处理常见的转义问题
+        cleaned = cleaned.replace('\\\\', '\\').replace('\\"', '"')
+        
+        # 如果有转义的尖括号，还原它们
+        cleaned = cleaned.replace('\\<', '<').replace('\\>', '>')
+        
+        return cleaned
+
+    def _ensure_database_prefix(self, sql: str) -> str:
+        """
+        确保SQL中的所有表引用都有数据库前缀
+
+        Args:
+            sql: 原始SQL语句
+
+        Returns:
+            str: 转换后的SQL语句
+        """
+        if not sql:
+            return sql
+
+        try:
+            # 记录转换前的SQL
+            original_sql = sql
+
+            # 如果未启用多数据库模式,在所有没有前缀的表名前添加当前数据库名
+            if not self.enable_multi_database:
+                sql = self._add_database_prefix_to_sql(sql, self.db_name)
+            else:
+                # 多数据库逻辑（保持不变）
+                # 获取所有数据库和表的映射关系
+                try:
+                    all_metadata = self.metadata_extractor.get_all_tables_and_columns()
+
+                    # 创建表名到数据库的映射,用于查找未指定数据库的表应该属于哪个数据库
+                    table_to_db_map = {}
+                    for db_name, db_data in all_metadata.items():
+                        tables = db_data.get("tables", {})
+                        for table_name in tables.keys():
+                            # 如果表名已经在映射中,且当前数据库是主数据库,则优先使用主数据库
+                            if table_name not in table_to_db_map or db_name == self.db_name:
+                                table_to_db_map[table_name] = db_name
+
+                    # 分割SQL以保留字符串和注释（保持不变）
+                    sql_parts = []
+                    i = 0
+                    in_string = False
+                    string_delimiter = None
+                    start = 0
+
+                    while i < len(sql):
+                        char = sql[i]
+
+                        # 处理字符串
+                        if char in ['"', "'"]:
+                            if not in_string:
+                                in_string = True
+                                string_delimiter = char
+                            elif string_delimiter == char:
+                                if i > 0 and sql[i-1] != '\\':  # 不是转义字符
+                                    in_string = False
+
+                        # 只在不在字符串内时处理关键词
+                        if not in_string:
+                            # 检查是否找到可能包含表名的关键词
+                            for keyword in ['FROM', 'JOIN', 'UPDATE', 'INTO']:
+                                if i + len(keyword) <= len(sql) and sql[i:i+len(keyword)].upper() == keyword:
+                                    # 找到了关键词,提交到这里
+                                    if i > start:
+                                        sql_parts.append(sql[start:i])
+
+                                    # 添加关键词和后面的内容
+                                    j = i + len(keyword)
+                                    while j < len(sql) and sql[j].isspace():
+                                        j += 1
+
+                                    # 寻找表名
+                                    if j < len(sql):
+                                        table_start = j
+                                        # 读取可能的表名
+                                        while j < len(sql) and (sql[j].isalnum() or sql[j] == '_'):
+                                            j += 1
+
+                                        if j > table_start:
+                                            table_name = sql[table_start:j]
+                                            # 检查这是否是一个表名而不是带有数据库前缀的表名
+                                            if '.' not in table_name and table_name in table_to_db_map:
+                                                # 添加关键词
+                                                sql_parts.append(sql[i:table_start])
+                                                # 添加带数据库前缀的表名
+                                                sql_parts.append(f"{table_to_db_map[table_name]}.{table_name}")
+                                                start = j
+                                                i = j - 1  # -1是因为循环会+1
+                                                break
+
+                        i += 1
+
+                    # 添加剩余部分
+                    if start < len(sql):
+                        sql_parts.append(sql[start:])
+
+                    sql = ''.join(sql_parts)
+
+                except Exception as e:
+                    logger.error(f"处理多数据库表映射时出错: {str(e)}")
+                    # 错误时回退到简单的添加前缀
+                    sql = self._add_database_prefix_to_sql(sql, self.db_name)
+
+            # 防止重复添加SELECT语句
+            if sql.count("SELECT") > original_sql.count("SELECT"):
+                logger.warning("检测到SQL转换导致SELECT语句重复,将恢复使用原始SQL")
+                sql = original_sql
+
+            # 记录转换结果
+            logger.info(f"SQL转换: {'已添加数据库前缀' if sql != original_sql else '无变化'}")
+            if sql != original_sql:
+                logger.info(f"原始SQL: {original_sql}")
+                logger.info(f"转换后SQL: {sql}")
+
+            # 检测是否是跨数据库查询
+            if any(db + "." in sql for db in self.metadata_extractor.get_all_target_databases()):
+                logger.info("检测到跨数据库查询")
+
+            return sql
+
+        except Exception as e:
+            logger.error(f"添加数据库前缀时出错: {str(e)}")
+            return sql
+
+    def _add_database_prefix_to_sql(self, sql: str, db_name: str) -> str:
+        """
+        为SQL中不含数据库前缀的表名添加指定的数据库前缀
+
+        Args:
+            sql: 原始SQL语句
+            db_name: 数据库名
+
+        Returns:
+            str: 带有数据库前缀的SQL语句
+        """
+        if not sql or not db_name:
+            return sql
+
+        # 复杂SQL解析需要专业的SQL解析器
+        # 这里使用一个简化的方法,可能不适用于所有复杂SQL
+        keyword_patterns = [
+            (r'\bFROM\s+([a-zA-Z0-9_]+)\b', r'FROM ' + db_name + r'.\1'),
+            (r'\bJOIN\s+([a-zA-Z0-9_]+)\b', r'JOIN ' + db_name + r'.\1'),
+            (r'\bUPDATE\s+([a-zA-Z0-9_]+)\b', r'UPDATE ' + db_name + r'.\1'),
+            (r'\bINTO\s+([a-zA-Z0-9_]+)\b', r'INTO ' + db_name + r'.\1')
+        ]
+
+        result = sql
+        for pattern, replacement in keyword_patterns:
+            # 不替换已经有数据库前缀的表名
+            result = re.sub(pattern + r'(?!\.[a-zA-Z0-9_])', replacement, result, flags=re.IGNORECASE)
+
+        return result
+
+    def get_fix_sql_prompt(self, sql: str, error_message: str, query: str, table_info: str) -> Dict[str, str]:
+        """
+        生成用于修复SQL的提示
+        
+        Args:
+            sql: 原始SQL
+            error_message: 错误信息
+            query: 原始查询
+            table_info: 表信息
+            
+        Returns:
+            Dict: 包含system和user提示的字典
+        """
+        # 错误类型分析
+        error_type = error_analysis(error_message)
+        
+        # 系统提示
+        system_prompt = f"""你是SQL专家，专门修复SQL错误。你需要解决以下类型的SQL错误：{error_type}。
+具体错误信息: {error_message}
+
+你的任务是:
+1. 分析错误原因
+2. 修改SQL以解决错误
+3. 确保修改后的SQL正确且完整
+4. 保持原始SQL的意图和功能不变
+
+请只返回修复后的SQL语句，不要包含任何解释或额外信息。确保返回的SQL语句格式正确，可以直接执行。"""
+
+        # 用户提示
+        user_prompt = f"""需要修复的SQL:
+```sql
+{sql}
+```
+
+原始问题: {query}
+
+数据库表结构信息:
+{table_info}
+
+请修复此SQL并只返回修复后的SQL语句。不要包含解释，只返回可执行的SQL代码。"""
+
+        return {
+            "system": system_prompt,
+            "user": user_prompt
+        }
+
+def calculate_similarity(text1: str, text2: str) -> float:
+    """
+    计算两段文本的相似度
+
+    Args:
+        text1: 第一段文本
+        text2: 第二段文本
+
+    Returns:
+        float: 相似度得分 (0-1)
+    """
+    # 使用简单的字符级别匹配
+    text1 = text1.lower()
+    text2 = text2.lower()
+
+    # 如果有一方为空,返回0
+    if not text1 or not text2:
+        return 0
+
+    # 计算字符级别的匹配
+    char_match = sum(1 for c in text1 if c in text2) / max(len(text1), 1)
+
+    # 检查关键词是否完全包含在文本中
+    keyword_match = 1.0 if text2 in text1 else 0.0
+
+    # 简单的词级别匹配
+    words1 = set(text1.split())
+    words2 = set(text2.split())
+
+    word_match = 0
+    if words1 and words2:
+        word_match = len(words1.intersection(words2)) / max(len(words1.union(words2)), 1)
+
+    # 加权平均
+    return 0.2 * char_match + 0.5 * keyword_match + 0.3 * word_match
+
+def error_analysis(error_msg: str) -> str:
+    """
+    分析SQL错误类型
+    
+    Args:
+        error_msg: 错误信息
+        
+    Returns:
+        str: 错误类型描述
+    """
+    error_msg = error_msg.lower()
+    
+    if "syntax error" in error_msg:
+        return "语法错误"
+    elif "table not found" in error_msg or "table doesn't exist" in error_msg:
+        return "表不存在"
+    elif "field not found" in error_msg or "column not found" in error_msg:
+        return "字段不存在"
+    elif "ambiguous" in error_msg:
+        return "字段名称冲突"
+    elif "type" in error_msg and "mismatch" in error_msg:
+        return "类型不匹配"
+    else:
+        return "未知错误"
+
+def execute_sql(sql: str):
+    """
+    执行SQL语句
+    
+    Args:
+        sql: SQL语句
+        
+    Returns:
+        cursor: 数据库游标对象，包含查询结果
+    """
+    from src.utils.db import execute_query
+    return execute_query(sql)

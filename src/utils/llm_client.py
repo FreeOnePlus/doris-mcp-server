@@ -181,7 +181,7 @@ class LLMClient:
             # 检查OpenAI包是否已安装
             openai_spec = importlib.util.find_spec("openai")
             if openai_spec is None:
-                logger.error("OpenAI包未安装，请运行: pip install openai")
+                logger.error("OpenAI包未安装,请运行: pip install openai")
                 raise ImportError("请安装OpenAI包: pip install openai")
             
             try:
@@ -191,34 +191,37 @@ class LLMClient:
                 # 直接使用httpx设置超时和重试
                 timeout = httpx.Timeout(connect=5.0, read=300.0, write=60.0, pool=10.0)
                 
-                # 直接创建OpenAI客户端，设置超时和重试
-                self._client = OpenAI(
-                    api_key=self.config.api_key,
-                    base_url=self.config.base_url,
-                    timeout=timeout,  # 直接传递timeout对象
-                    max_retries=5     # 设置最大重试次数
-                )
-                
-                logger.info(f"已初始化LLM客户端（{self.config.provider}），请求超时设置为300秒")
-            except (ImportError, ModuleNotFoundError) as e:
+                # 捕获"can't register atexit after shutdown"错误
+                try:
+                    # 直接创建OpenAI客户端,设置超时和重试
+                    self._client = OpenAI(
+                        api_key=self.config.api_key,
+                        base_url=self.config.base_url,
+                        timeout=timeout,  # 直接传递timeout对象
+                        max_retries=5     # 设置最大重试次数
+                    )
+                except RuntimeError as e:
+                    if "can't register atexit after shutdown" in str(e):
+                        logger.warning("程序正在退出,无法创建OpenAI客户端")
+                        self._client = None
+                    else:
+                        raise e
+                    
+            except ImportError as e:
                 logger.error(f"导入OpenAI包时出错: {str(e)}")
-                logger.error(f"Python路径: {sys.path}")
-                raise ImportError("请安装OpenAI包: pip install openai")
-            except Exception as e:
-                logger.error(f"初始化OpenAI客户端时出错: {str(e)}")
-                raise
+                raise ImportError(f"导入OpenAI包时出错: {str(e)}")
         elif self.config.provider == LLMProvider.MLX:
             # 检查MLX包是否已安装
             mlx_spec = importlib.util.find_spec("mlx")
             mlx_lm_spec = importlib.util.find_spec("mlx_lm")
             
             if mlx_spec is None or mlx_lm_spec is None:
-                logger.error("MLX或MLX-LM包未安装，请运行: pip install mlx mlx-lm")
+                logger.error("MLX或MLX-LM包未安装,请运行: pip install mlx mlx-lm")
                 raise ImportError("请安装MLX包: pip install mlx mlx-lm")
             
             try:
-                # 这里不实际加载模型，而是在调用时加载
-                logger.info(f"MLX模式已就绪，将使用模型: {self.config.model}")
+                # 这里不实际加载模型,而是在调用时加载
+                logger.info(f"MLX模式已就绪,将使用模型: {self.config.model}")
             except Exception as e:
                 logger.error(f"初始化MLX客户端时出错: {str(e)}")
                 raise
@@ -243,6 +246,9 @@ class LLMClient:
                 formatted_messages.append(message.to_dict())
             else:
                 formatted_messages.append(message)
+        
+        # 验证并修复消息序列,防止连续的用户或助手消息（DeepSeek模型不支持）
+        formatted_messages = self._validate_message_sequence(formatted_messages)
                 
         # 根据不同提供商调用不同的方法
         if self.config.provider in [LLMProvider.OPENAI, LLMProvider.DEEPSEEK]:
@@ -259,6 +265,57 @@ class LLMClient:
             return self._chat_mlx(formatted_messages, stream)
         else:
             raise ValueError(f"不支持的LLM提供商: {self.config.provider}")
+    
+    def _validate_message_sequence(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """
+        验证并修复消息序列,确保没有连续的用户或助手消息
+        
+        Args:
+            messages: 消息列表
+            
+        Returns:
+            List[Dict[str, str]]: 修复后的消息列表
+        """
+        if not messages or len(messages) <= 1:
+            return messages
+            
+        # 检查是否使用DeepSeek提供商（该模型特别要求消息交替）
+        is_deepseek = self.config.provider == LLMProvider.DEEPSEEK
+        
+        # 定义合并两个消息内容的函数
+        def merge_messages(msg1, msg2):
+            return {
+                "role": msg1["role"],
+                "content": f"{msg1['content']}\n\n{msg2['content']}"
+            }
+            
+        # 修复消息序列
+        fixed_messages = [messages[0]]  # 保留第一个消息
+        
+        for i in range(1, len(messages)):
+            curr_msg = messages[i]
+            prev_msg = fixed_messages[-1]
+            
+            # 如果当前消息与前一个消息角色相同
+            if curr_msg["role"] == prev_msg["role"]:
+                if is_deepseek:
+                    # 对于DeepSeek,合并相同角色的消息
+                    logger.warning(f"检测到连续的 {curr_msg['role']} 角色消息,正在合并...")
+                    fixed_messages[-1] = merge_messages(prev_msg, curr_msg)
+                else:
+                    # 对于其他模型,添加警告但允许连续消息
+                    logger.warning(f"检测到连续的 {curr_msg['role']} 角色消息,某些模型可能不支持")
+                    fixed_messages.append(curr_msg)
+            else:
+                # 角色不同,直接添加
+                fixed_messages.append(curr_msg)
+                
+        # 确保最终消息序列的合法性
+        if is_deepseek and len(fixed_messages) > 1:
+            roles = [msg["role"] for msg in fixed_messages]
+            logger.info(f"最终消息角色序列: {roles}")
+            
+        return fixed_messages
     
     def _chat_openai_compatible(self, messages: List[Dict[str, str]], stream: bool = False) -> LLMResponse:
         """
@@ -343,9 +400,9 @@ class LLMClient:
             # 加载模型
             model, tokenizer = load(model_path, model_config=model_config)
             loading_time = time.time() - start_time
-            logger.info(f"MLX模型加载完成，耗时: {loading_time:.2f}秒")
+            logger.info(f"MLX模型加载完成,耗时: {loading_time:.2f}秒")
             
-            # 提取提示词，将消息列表转换为单个字符串提示词
+            # 提取提示词,将消息列表转换为单个字符串提示词
             prompt = self._format_messages_for_mlx(messages)
             
             # 创建采样器 - 使用温度参数
@@ -354,7 +411,7 @@ class LLMClient:
             sampler = make_sampler(temp=temp)
             
             # 生成选项 - 注意：不同版本的MLX_LM可能支持不同的参数
-            # 根据错误信息来看，generate_step()不支持temperature参数
+            # 根据错误信息来看,generate_step()不支持temperature参数
             generation_args = {
                 "prompt": prompt,
                 "max_tokens": self.config.max_tokens if self.config.max_tokens else 512,
@@ -371,7 +428,7 @@ class LLMClient:
                     content += token
                 
                 generation_time = time.time() - start_time
-                logger.info(f"流式生成完成，耗时: {generation_time:.2f}秒")
+                logger.info(f"流式生成完成,耗时: {generation_time:.2f}秒")
             else:
                 # 非流式生成
                 start_time = time.time()
@@ -380,7 +437,7 @@ class LLMClient:
                 content = generate(model, tokenizer, **generation_args)
                 
                 generation_time = time.time() - start_time
-                logger.info(f"生成完成，耗时: {generation_time:.2f}秒")
+                logger.info(f"生成完成,耗时: {generation_time:.2f}秒")
             
             # 构建用量统计
             usage = {
@@ -422,7 +479,7 @@ class LLMClient:
             else:
                 prompt += f"{content}\n\n"
         
-        # 添加最后的标记，提示模型开始回复
+        # 添加最后的标记,提示模型开始回复
         prompt += "<助手>: "
         
         return prompt
@@ -672,8 +729,8 @@ class LLMClient:
     
     def _parse_ollama_response(self, response_text: str) -> Dict[str, Any]:
         """
-        安全解析Ollama的响应，处理可能的多行JSON或格式错误
-        保留原始响应完整性，采用提取而非删除的策略
+        安全解析Ollama的响应,处理可能的多行JSON或格式错误
+        保留原始响应完整性,采用提取而非删除的策略
         
         Args:
             response_text: Ollama的原始响应文本
@@ -695,9 +752,9 @@ class LLMClient:
             try:
                 return json.loads(json_content)
             except json.JSONDecodeError:
-                logger.debug("代码块内容解析失败，尝试其他方法")
+                logger.debug("代码块内容解析失败,尝试其他方法")
         
-        # 2. 检查是否有<think>标签，如果有，尝试提取标签外的JSON
+        # 2. 检查是否有<think>标签,如果有,尝试提取标签外的JSON
         think_start = response_text.find('<think>')
         think_end = response_text.find('</think>')
         
@@ -708,9 +765,9 @@ class LLMClient:
                 # 尝试解析</think>后的内容
                 return self._extract_json_from_text(post_think_text)
             except json.JSONDecodeError:
-                logger.debug("</think>标签后的内容解析失败，尝试其他方法")
+                logger.debug("</think>标签后的内容解析失败,尝试其他方法")
         
-        # 3. 如果以上方法都失败，尝试从完整内容中提取JSON
+        # 3. 如果以上方法都失败,尝试从完整内容中提取JSON
         return self._extract_json_from_text(response_text)
     
     def _extract_json_from_text(self, text: str) -> Dict[str, Any]:
@@ -742,13 +799,13 @@ class LLMClient:
                 json_end = text.rfind('}') + 1
                 if json_start >= 0 and json_end > json_start:
                     json_part = text[json_start:json_end]
-                    # 处理特殊情况，如果JSON包含转义的尖括号如\<，先将其标准化
+                    # 处理特殊情况,如果JSON包含转义的尖括号如\<,先将其标准化
                     json_part = json_part.replace('\\<', '<').replace('\\>', '>')
                     return json.loads(json_part)
             except (json.JSONDecodeError, ValueError):
                 pass
             
-            # 所有尝试失败，返回空字典
+            # 所有尝试失败,返回空字典
             logger.warning(f"无法从文本中提取JSON: {text[:100]}...")
             return {}
     
@@ -779,7 +836,7 @@ class LLMClient:
             # 构建URL
             url = f"{self.config.base_url}/api/chat"
             
-            # 增加timeout时间，确保有足够时间获取完整响应
+            # 增加timeout时间,确保有足够时间获取完整响应
             timeout = self.config.timeout * 2  # 双倍超时时间
             
             # 发送请求
@@ -794,7 +851,7 @@ class LLMClient:
                         try:
                             chunk = json.loads(line)
                             if 'message' in chunk and 'content' in chunk['message']:
-                                # 对于Ollama，每个流式响应包含完整的累积内容
+                                # 对于Ollama,每个流式响应包含完整的累积内容
                                 # 我们需要提取新的内容部分
                                 new_content = chunk['message']['content']
                                 if new_content and len(new_content) > len(content):
@@ -811,11 +868,11 @@ class LLMClient:
                 )
             else:
                 # 非流式响应 - 增加超时时间
-                logger.info(f"向Ollama发送非流式请求，超时时间: {timeout}秒")
+                logger.info(f"向Ollama发送非流式请求,超时时间: {timeout}秒")
                 response = requests.post(url, json=data, timeout=timeout)
                 response.raise_for_status()
                 
-                # 记录响应内容的前100个字符，用于调试
+                # 记录响应内容的前100个字符,用于调试
                 response_preview = response.text[:100] + ("..." if len(response.text) > 100 else "")
                 logger.debug(f"Ollama原始响应(前100字符): {response_preview}")
                 
@@ -828,16 +885,16 @@ class LLMClient:
                     # 使用专门的解析函数处理Ollama响应
                     result = self._parse_ollama_response(response.text)
                     if not result:
-                        # 获取原始内容作为响应，而不是返回错误
-                        # 这样可以确保即使JSON解析失败，原始文本内容也能返回
+                        # 获取原始内容作为响应,而不是返回错误
+                        # 这样可以确保即使JSON解析失败,原始文本内容也能返回
                         raw_content = response.text
-                        # 检查是否有思考标签，提取有用的部分
+                        # 检查是否有思考标签,提取有用的部分
                         if "<think>" in raw_content and "</think>" in raw_content:
-                            logger.info("检测到<think>标签，提取标签后的内容")
+                            logger.info("检测到<think>标签,提取标签后的内容")
                             post_think = raw_content.split("</think>", 1)
                             raw_content = post_think[1] if len(post_think) > 1 else raw_content
                         
-                        logger.info(f"无法解析为JSON，返回原始响应内容，长度: {len(raw_content)}")
+                        logger.info(f"无法解析为JSON,返回原始响应内容,长度: {len(raw_content)}")
                         return LLMResponse(
                             content=raw_content.strip(),
                             model=self.config.model,
@@ -848,9 +905,9 @@ class LLMClient:
                 except Exception as e:
                     logger.error(f"解析Ollama响应时出错: {str(e)}")
                     raw_content = response.text
-                    # 检查是否有思考标签，提取有用的部分
+                    # 检查是否有思考标签,提取有用的部分
                     if "<think>" in raw_content and "</think>" in raw_content:
-                        logger.info("检测到<think>标签，提取标签后的内容")
+                        logger.info("检测到<think>标签,提取标签后的内容")
                         post_think = raw_content.split("</think>", 1)
                         raw_content = post_think[1] if len(post_think) > 1 else raw_content
                     
@@ -865,10 +922,10 @@ class LLMClient:
                 # 构建响应
                 content = result.get('message', {}).get('content', '')
                 
-                # 如果解析后的内容为空，但原始响应不为空，则返回原始响应
+                # 如果解析后的内容为空,但原始响应不为空,则返回原始响应
                 if not content and response.text.strip():
                     content = response.text.strip()
-                    logger.info(f"从解析结果中未获取到内容，使用原始响应, 长度: {len(content)}")
+                    logger.info(f"从解析结果中未获取到内容,使用原始响应, 长度: {len(content)}")
                 
                 # 构建用量统计
                 usage = {}
@@ -889,64 +946,95 @@ class LLMClient:
             logger.error(f"调用Ollama本地模型时出错: {str(e)}")
             raise
 
-def get_llm_client(provider_name: Optional[str] = None, stage: Optional[str] = None) -> LLMClient:
+def get_llm_client(provider_name: Optional[str] = None, stage: Optional[str] = None) -> Optional[LLMClient]:
     """
     获取LLM客户端
     
     Args:
-        provider_name: LLM提供商名称，默认从环境变量获取
-        stage: LLM调用的阶段名称，可以是:
-            - "business_check": 业务查询检查
-            - "similar_example": 查找相似示例
-            - "sql_generation": SQL生成
-            - "metadata": 元数据处理
-            如果为None，则使用默认配置
+        provider_name: 提供商名称,如果为None则使用环境变量中的LLM_PROVIDER
+        stage: 处理阶段,用于选择不同的模型配置（如果配置了特定阶段的模型）
         
     Returns:
-        LLMClient: LLM客户端
+        LLMClient: LLM客户端,如果创建失败则返回None
     """
     try:
-        # 如果未指定提供商，根据阶段从环境变量获取
-        if not provider_name:
-            if stage:
-                # 尝试获取阶段特定的LLM供应商
-                provider_env_var = f"LLM_PROVIDER_{stage.upper()}"
-                provider_name = os.getenv(provider_env_var)
-                
-                if provider_name:
-                    logger.info(f"为阶段 '{stage}' 使用LLM供应商: {provider_name}")
-                
-            # 如果没有阶段特定配置，使用默认配置
-            if not provider_name:
-                provider_name = os.getenv("LLM_PROVIDER", "openai")
-                logger.info(f"使用默认LLM供应商: {provider_name}")
-            
-        # 根据阶段获取特定的模型配置
-        model_name = None
+        # 如果指定了处理阶段且环境变量中有该阶段的配置,则使用该阶段的配置
         if stage:
-            model_env_var = f"LLM_MODEL_{stage.upper()}"
-            model_name = os.getenv(model_env_var)
+            stage_provider_key = f"LLM_PROVIDER_{stage.upper()}"
+            stage_provider = os.getenv(stage_provider_key)
+            if stage_provider:
+                logger.info(f"使用{stage}阶段配置的LLM供应商: {stage_provider}")
+                provider_name = stage_provider
+        
+        # 如果没有指定提供商,则使用环境变量中的默认值
+        if not provider_name:
+            provider_name = os.getenv("LLM_PROVIDER", "openai")
+        
+        # 创建配置
+        try:
+            config = LLMConfig.from_env(provider_name)
             
-            if model_name:
-                logger.info(f"为阶段 '{stage}' 使用模型: {model_name}")
+            # 如果指定了处理阶段,尝试使用该阶段的特定模型
+            if stage:
+                stage_model_key = f"LLM_MODEL_{stage.upper()}"
+                stage_model = os.getenv(stage_model_key)
+                if stage_model:
+                    logger.info(f"使用{stage}阶段配置的模型: {stage_model}")
+                    config.model = stage_model
+            
+            # 创建客户端
+            client = LLMClient(config)
+            logger.info(f"使用{provider_name}供应商的模型: {config.model}")
+            return client
+            
+        except (ValueError, ImportError) as e:
+            logger.error(f"创建LLM配置时出错: {str(e)}")
+            
+            # 如果不是默认提供商,则尝试回退到默认提供商
+            if provider_name != "openai":
+                logger.info(f"尝试回退到OpenAI提供商")
+                try:
+                    config = LLMConfig.from_env("openai")
+                    client = LLMClient(config)
+                    logger.info("已回退到OpenAI提供商")
+                    return client
+                except Exception as e2:
+                    logger.error(f"回退到OpenAI提供商时出错: {str(e2)}")
+            
+            # 如果是程序退出导致的错误,返回None
+            if "can't register atexit after shutdown" in str(e):
+                logger.warning("程序正在退出,无法创建LLM客户端")
+                return None
                 
-                # 临时设置环境变量以便LLMConfig.from_env能够读取到正确的模型
-                original_model_env = os.getenv(f"LLM_MODEL_{provider_name.upper()}")
-                os.environ[f"LLM_MODEL_{provider_name.upper()}"] = model_name
-        
-        # 从环境变量创建配置
-        config = LLMConfig.from_env(provider_name)
-        
-        # 如果临时修改了环境变量，恢复原值
-        if stage and model_name and original_model_env is not None:
-            os.environ[f"LLM_MODEL_{provider_name.upper()}"] = original_model_env
-        elif stage and model_name and original_model_env is None:
-            del os.environ[f"LLM_MODEL_{provider_name.upper()}"]
+            # 尝试加载DeepSeek
+            try:
+                logger.info("尝试使用DeepSeek提供商")
+                config = LLMConfig.from_env("deepseek")
+                client = LLMClient(config)
+                logger.info("已使用DeepSeek提供商")
+                return client
+            except Exception as e3:
+                logger.error(f"使用DeepSeek提供商时出错: {str(e3)}")
             
-        # 创建客户端
-        client = LLMClient(config)
-            
-        return client
+            # 最后尝试Ollama本地模型
+            try:
+                logger.info("尝试使用Ollama本地模型")
+                config = LLMConfig.from_env("ollama")
+                client = LLMClient(config)
+                logger.info("已使用Ollama本地模型")
+                return client
+            except Exception as e4:
+                logger.error(f"使用Ollama本地模型时出错: {str(e4)}")
+                logger.error("所有LLM提供商均不可用")
+                return None
+    
+    except RuntimeError as e:
+        if "can't register atexit after shutdown" in str(e):
+            logger.warning("程序正在退出,无法创建LLM客户端")
+            return None
+        else:
+            logger.error(f"获取LLM客户端时出错: {str(e)}")
+            return None
     except Exception as e:
         logger.error(f"获取LLM客户端时出错: {str(e)}")
-        raise 
+        return None 

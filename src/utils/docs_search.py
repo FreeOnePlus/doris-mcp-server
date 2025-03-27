@@ -14,7 +14,7 @@ class DorisDocsSearch:
         初始化文档搜索
         
         Args:
-            docs_path: 文档路径，如果为None则加载默认样本数据
+            docs_path: 文档路径,如果为None则加载默认样本数据
         """
         if docs_path and os.path.exists(docs_path):
             with open(docs_path, 'r', encoding='utf-8') as f:
@@ -41,8 +41,8 @@ class DorisDocsSearch:
             {
                 "id": 1,
                 "title": "Apache Doris 简介",
-                "content": """Apache Doris 是一个现代化的MPP分析型数据库产品。仅需亚秒级响应时间即可获得查询结果，有效支持实时数据分析。
-                Apache Doris 可以轻松地与大数据生态系统中的各种工具集成。Apache Doris 的分布式架构非常简洁，易于运维，具有出色的灵活性。"""
+                "content": """Apache Doris 是一个现代化的MPP分析型数据库产品。仅需亚秒级响应时间即可获得查询结果,有效支持实时数据分析。
+                Apache Doris 可以轻松地与大数据生态系统中的各种工具集成。Apache Doris 的分布式架构非常简洁,易于运维,具有出色的灵活性。"""
             },
             {
                 "id": 2,
@@ -85,7 +85,7 @@ class DorisDocsSearch:
                 "id": 5,
                 "title": "Doris 表引擎类型",
                 "content": """Doris支持多种表引擎类型：
-                1. OLAP表：Doris的默认表引擎，提供高性能的分析能力
+                1. OLAP表：Doris的默认表引擎,提供高性能的分析能力
                 2. MySQL表：映射到外部MySQL表的外表
                 3. ODBC表：通过ODBC连接外部数据源的外表
                 4. ELASTICSEARCH表：映射到ElasticSearch索引的外表
@@ -133,7 +133,7 @@ class DorisDocsSearch:
         Returns:
             List[Dict]: 搜索结果列表
         """
-        # 这里可以实现实际的在线搜索逻辑，例如调用搜索API
+        # 这里可以实现实际的在线搜索逻辑,例如调用搜索API
         # 目前使用模拟数据作为示例
         try:
             # 调用搜索API的示例代码
@@ -146,7 +146,7 @@ class DorisDocsSearch:
             return self.search(query, top_k)
         except Exception as e:
             print(f"在线搜索失败: {e}")
-            # 如果在线搜索失败，回退到离线搜索
+            # 如果在线搜索失败,回退到离线搜索
             return self.search(query, top_k)
 
 # 创建全局搜索实例

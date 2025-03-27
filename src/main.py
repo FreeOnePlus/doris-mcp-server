@@ -16,6 +16,12 @@ import datetime
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+# 导入统一日志配置
+from src.utils.logger import get_logger, audit_logger
+
+# 获取日志器
+logger = get_logger(__name__)
+
 # 替换json.dumps，确保中文不被转义为Unicode序列
 _original_dumps = json.dumps
 def _custom_dumps(*args, **kwargs):
@@ -38,8 +44,8 @@ auto_refresh_metadata = os.getenv("AUTO_REFRESH_METADATA", "false").lower() == "
 # 初始化MCP服务器
 mcp = FastMCP("Doris NL2SQL")
 
-# 初始化NL2SQL服务
-service = NL2SQLService(auto_refresh_metadata=auto_refresh_metadata)
+# 初始化NL2SQL服务 (使用新的初始化参数格式)
+service = NL2SQLService()
 
 @mcp.resource("doris://database/info")
 def doris_database_info():
@@ -68,13 +74,54 @@ def nl2sql_query(query: str):
         查询结果，包含SQL、执行结果等
     """
     try:
+        # 记录开始处理请求
+        start_time = datetime.datetime.now()
+        request_id = hash(f"{query}_{start_time.isoformat()}")
+        
+        # 记录请求到审计日志
+        audit_data = {
+            "timestamp": start_time.isoformat(),
+            "request_id": str(request_id),
+            "action": "nl2sql_query",
+            "query": query,
+            "status": "processing"
+        }
+        audit_logger.audit(json.dumps(audit_data))
+        
         # 调用服务处理查询
         result = service.process_query(query)
+        
+        # 记录处理结果到审计日志
+        end_time = datetime.datetime.now()
+        duration_ms = (end_time - start_time).total_seconds() * 1000
+        
+        audit_data.update({
+            "end_timestamp": end_time.isoformat(),
+            "duration_ms": duration_ms,
+            "status": "completed" if result.get("success", False) else "failed",
+            "sql": result.get("sql", ""),
+            "error": result.get("error", None)
+        })
+        audit_logger.audit(json.dumps(audit_data))
+        
+        # 返回结果
         return result
     except Exception as e:
+        # 记录错误到审计日志和错误日志
+        error_msg = str(e)
+        logger.error(f"处理查询时出错: {error_msg}")
+        
+        # 错误审计
+        if 'audit_data' in locals():
+            audit_data.update({
+                "status": "error",
+                "error": error_msg
+            })
+            audit_logger.audit(json.dumps(audit_data))
+        
         return {
             "success": False,
-            "message": f"处理查询时出错: {str(e)}",
+            "message": f"处理查询时出错: {error_msg}",
             "query": query
         }
 
@@ -207,7 +254,33 @@ def set_llm_provider(provider_name: str):
         }
 
 def main():
-    """主程序入口"""
+    """
+    服务主函数
+    """
+    # 设置环境变量，禁用控制台日志输出
+    os.environ["CONSOLE_LOGGING"] = "false"
+    
+    # 初始化MCP服务器
+    mcp.init()
+    
+    # 创建服务
+    service = NL2SQLService()
+    
+    # 设置自定义JSON序列化函数
+    import simplejson as json
+    from decimal import Decimal
+    
+    # 记录服务启动
+    logger.info("启动Doris MCP NL2SQL服务")
+    logger.info(f"当前工作目录: {os.getcwd()}")
+    logger.info(f"Python版本: {sys.version}")
+    logger.info(f"日志配置: LOG_DIR={os.getenv('LOG_DIR', 'logs')}, LOG_LEVEL={os.getenv('LOG_LEVEL', 'INFO')}")
+    
+    # 从环境变量读取配置
+    host = os.getenv("SERVER_HOST", "0.0.0.0")
+    port = int(os.getenv("SERVER_PORT", "8080"))
+    mcp_port = int(os.getenv("MCP_PORT", "3000"))
+    
     # 配置roots目录能力 - 允许客户端访问的根目录
     root_dirs = [
         {

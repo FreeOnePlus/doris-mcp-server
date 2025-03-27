@@ -6,14 +6,14 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 class SQLSampleManager:
-    """SQL样本管理类，用于存储和检索SQL样本"""
+    """SQL样本管理类,用于存储和检索SQL样本"""
     
     def __init__(self, samples_path=None):
         """
         初始化SQL样本管理器
         
         Args:
-            samples_path: 样本文件路径，如果为None则加载默认样本
+            samples_path: 样本文件路径,如果为None则加载默认样本
         """
         if samples_path and os.path.exists(samples_path):
             with open(samples_path, 'r', encoding='utf-8') as f:
@@ -52,7 +52,7 @@ class SQLSampleManager:
                 WHERE create_time BETWEEN '2023-01-01' AND '2023-01-31'
                 GROUP BY order_date
                 ORDER BY order_date""",
-                "explanation": "这个查询使用DATE_FORMAT函数将订单创建时间格式化为年-月-日格式，然后按天分组统计订单数量。"
+                "explanation": "这个查询使用DATE_FORMAT函数将订单创建时间格式化为年-月-日格式,然后按天分组统计订单数量。"
             },
             {
                 "id": 2,
@@ -67,7 +67,7 @@ class SQLSampleManager:
                 GROUP BY p.product_name
                 ORDER BY total_sales DESC
                 LIMIT 10""",
-                "explanation": "这个查询计算每个产品的总销售额和总销售数量，然后按销售额降序排序并限制返回前10条结果。"
+                "explanation": "这个查询计算每个产品的总销售额和总销售数量,然后按销售额降序排序并限制返回前10条结果。"
             },
             {
                 "id": 3,
@@ -81,7 +81,7 @@ class SQLSampleManager:
                 WHERE activity_time >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
                 GROUP BY user_id
                 ORDER BY active_days DESC, total_activities DESC""",
-                "explanation": "这个查询统计了每个用户在过去30天内的活跃天数和总活动次数，可以用于分析用户活跃度。"
+                "explanation": "这个查询统计了每个用户在过去30天内的活跃天数和总活动次数,可以用于分析用户活跃度。"
             },
             {
                 "id": 4,
@@ -102,7 +102,7 @@ class SQLSampleManager:
                     AND MONTH(o.order_date) = MONTH(CURRENT_DATE())
                 GROUP BY r.region_name
                 ORDER BY growth_rate DESC""",
-                "explanation": "这个复杂查询计算了每个区域在当前年份和上一年同期的销售额，以及同比增长率。使用CASE语句分别计算不同年份的销售额。"
+                "explanation": "这个复杂查询计算了每个区域在当前年份和上一年同期的销售额,以及同比增长率。使用CASE语句分别计算不同年份的销售额。"
             },
             {
                 "id": 5,
@@ -120,7 +120,7 @@ class SQLSampleManager:
                 GROUP BY c.customer_id, c.customer_name
                 HAVING COUNT(o.order_id) > 1
                 ORDER BY avg_days_between_orders""",
-                "explanation": "这个查询分析了每个客户在过去一年内的订单数量、平均订单间隔天数和平均订单金额，可用于客户分层分析。"
+                "explanation": "这个查询分析了每个客户在过去一年内的订单数量、平均订单间隔天数和平均订单金额,可用于客户分层分析。"
             }
         ]
     

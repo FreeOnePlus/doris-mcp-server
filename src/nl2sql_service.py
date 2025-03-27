@@ -7,23 +7,26 @@ Apache Doris NL2SQL 服务主入口
 import os
 import sys
 import json
-import logging
 import argparse
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
+import threading
+import time
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+
+# 导入统一日志配置
+from src.utils.logger import get_logger, audit_logger
+
+# 获取日志器
+logger = get_logger(__name__)
 
 # 导入相关模块
 from src.utils.llm_client import get_llm_client, Message, LLMProvider
 from src.utils.metadata_extractor import MetadataExtractor
 from src.utils.nl2sql_processor import NL2SQLProcessor
 from src.utils.db import execute_query, execute_query_df
-
-# 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 # 加载环境变量
 load_dotenv()
@@ -35,50 +38,91 @@ class NL2SQLService:
     整合所有功能的主服务类
     """
     
-    def __init__(self, db_name: Optional[str] = None, auto_refresh_metadata: bool = False):
+    def __init__(self, db_name=None, host=None, port=None, user=None, password=None):
         """
         初始化NL2SQL服务
         
         Args:
-            db_name: 数据库名称，如果为None则从环境变量获取
-            auto_refresh_metadata: 是否在初始化时自动刷新元数据，默认为False
+            db_name: 数据库名称（可选,默认从环境变量读取）
+            host: 数据库主机地址（可选,默认从环境变量读取）
+            port: 数据库端口（可选,默认从环境变量读取）
+            user: 数据库用户名（可选,默认从环境变量读取）
+            password: 数据库密码（可选,默认从环境变量读取）
         """
         self.db_name = db_name or os.getenv("DB_DATABASE", "")
+        self.db_host = host or os.getenv("DB_HOST", "localhost")
+        self.db_port = port or int(os.getenv("DB_PORT", "9030"))
+        self.db_user = user or os.getenv("DB_USER", "root")
+        self.db_password = password or os.getenv("DB_PASSWORD", "")
         
-        # 初始化元数据提取器
-        self.metadata_extractor = MetadataExtractor(self.db_name)
+        # 创建NL2SQL处理器
+        self.processor = NL2SQLProcessor()
         
-        # 初始化NL2SQL处理器
-        self.nl2sql_processor = NL2SQLProcessor(self.db_name)
-        
-        # 服务配置
-        self.max_token_limit = int(os.getenv("MAX_TOKEN_LIMIT", "4000"))
-        self.refresh_metadata_interval = int(os.getenv("REFRESH_METADATA_INTERVAL", "86400"))  # 默认1天
-        self.llm_provider = os.getenv("LLM_PROVIDER", "openai")
-        
-        # 如果设置了自动刷新，则刷新元数据
-        if auto_refresh_metadata:
-            self._refresh_metadata(force=False)
-            logger.info("服务初始化时完成元数据增量刷新")
-        else:
-            logger.info("跳过初始化时的元数据刷新")
+        # 获取元数据提取器
+        try:
+            # 检查是否启用多数据库模式
+            from src.utils.db import ENABLE_MULTI_DATABASE
+            self.metadata_extractor = MetadataExtractor(self.db_name)
+            
+            # 启动时刷新元数据
+            refresh_interval = int(os.getenv("REFRESH_METADATA_INTERVAL", "86400"))
+            if refresh_interval > 0:
+                # 将刷新放入单独线程,避免启动阻塞
+                threading.Thread(target=self._delayed_refresh_metadata).start()
+                logger.info("已安排元数据后台刷新")
+        except Exception as e:
+            logger.error(f"创建元数据提取器出错: {str(e)}")
+            self.metadata_extractor = None
     
     def _refresh_metadata(self, force: bool = False):
         """
         刷新并保存元数据
         
         Args:
-            force: 是否强制执行全量刷新，默认为False(增量刷新)
+            force: 是否强制执行全量刷新,默认为False(增量刷新)
         """
         try:
-            logger.info(f"正在{'全量' if force else '增量'}刷新元数据...")
+            logger.info("开始刷新元数据...")
             
-            # 使用增量刷新替代全量刷新，除非指定了force=True
-            self.metadata_extractor.refresh_metadata(self.db_name, force=force)
+            # 确保元数据提取器实例化
+            if not hasattr(self, 'metadata_extractor') or self.metadata_extractor is None:
+                self.metadata_extractor = MetadataExtractor(self.db_name)
             
-            logger.info("元数据刷新完成")
+            # 判断是进行单数据库刷新还是多数据库刷新
+            if self.metadata_extractor.enable_multi_database:
+                # 获取配置的多数据库列表
+                from src.utils.db import MULTI_DATABASE_NAMES
+                logger.info(f"多数据库模式已启用,正在刷新以下数据库的元数据: {MULTI_DATABASE_NAMES}")
+                
+                # 多数据库刷新
+                success = self.metadata_extractor.refresh_all_databases_metadata(force=force)
+                if success:
+                    logger.info("所有配置的数据库元数据刷新完成")
+                else:
+                    logger.warning("部分或所有数据库元数据刷新失败")
+            else:
+                # 单数据库刷新
+                logger.info(f"单数据库模式,正在刷新数据库 {self.db_name} 的元数据")
+                success = self.metadata_extractor.refresh_all_databases_metadata(force=force)
+                if success:
+                    logger.info(f"数据库 {self.db_name} 元数据刷新完成")
+                else:
+                    logger.warning(f"数据库 {self.db_name} 元数据刷新失败")
+                
+            return success
         except Exception as e:
             logger.error(f"刷新元数据时出错: {str(e)}")
+            return False
+    
+    def _delayed_refresh_metadata(self):
+        """后台延迟刷新元数据,避免启动阻塞"""
+        try:
+            # 等待5秒后再开始刷新
+            time.sleep(5)
+            logger.info("开始后台刷新元数据...")
+            self._refresh_metadata(force=False)
+        except Exception as e:
+            logger.error(f"后台刷新元数据时出错: {str(e)}")
     
     def process_query(self, query: str) -> Dict[str, Any]:
         """
@@ -88,34 +132,70 @@ class NL2SQLService:
             query: 自然语言查询
             
         Returns:
-            Dict[str, Any]: 包含SQL、执行结果和元数据的字典
+            Dict[str, Any]: 包含处理结果的字典
         """
+        start_time = time.time()
+        query_id = hash(f"{query}_{start_time}")
+        
+        # 记录处理开始到审计日志
+        audit_data = {
+            "event": "process_query_start",
+            "query_id": str(query_id),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "query": query
+        }
+        # 将完整JSON记录到审计日志
+        audit_logger.audit(json.dumps(audit_data))
+        
         try:
-            # 记录查询
-            logger.info(f"收到查询: {query}")
-            
-            # 不再每次查询时刷新元数据
             # 直接处理查询
-            result = self.nl2sql_processor.process(query)
+            result = self.processor.process(query)
             
-            # 简化结果以减少token数量（如果需要）
-            if result.get('success') and 'data' in result:
-                data_size = len(json.dumps(result['data']))
-                if data_size > self.max_token_limit:
-                    # 只保留部分数据
-                    truncated_data = result['data'][:20]  # 只保留前20条
-                    result['data'] = truncated_data
-                    result['truncated'] = True
-                    result['original_row_count'] = result.get('row_count', 0)
-                    result['displayed_row_count'] = len(truncated_data)
+            # 记录处理时间
+            processing_time = time.time() - start_time
+            logger.info(f"查询处理完成,耗时 {processing_time:.2f} 秒")
+            
+            # 添加处理时间到结果
+            if isinstance(result, dict):
+                result['processing_time'] = processing_time
+            
+            # 记录处理结果到审计日志
+            audit_data = {
+                "event": "process_query_complete",
+                "query_id": str(query_id),
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "query": query,
+                "processing_time": processing_time,
+                "success": result.get('success', False),
+                "sql": result.get('sql', ''),
+                "error": result.get('error', None)
+            }
+            # 将完整JSON记录到审计日志
+            audit_logger.audit(json.dumps(audit_data))
             
             return result
         except Exception as e:
-            logger.error(f"处理查询时出错: {str(e)}")
+            error_msg = str(e)
+            logger.error(f"处理查询时出错: {error_msg}")
+            
+            # 记录处理错误到审计日志
+            processing_time = time.time() - start_time
+            audit_data = {
+                "event": "process_query_error",
+                "query_id": str(query_id),
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "query": query,
+                "processing_time": processing_time,
+                "error": error_msg
+            }
+            # 将完整JSON记录到审计日志
+            audit_logger.audit(json.dumps(audit_data))
+            
             return {
                 'success': False,
-                'message': f'处理查询时出错: {str(e)}',
-                'query': query
+                'message': f"处理查询时出错: {error_msg}",
+                'query': query,
+                'processing_time': processing_time
             }
     
     def get_available_llm_providers(self) -> List[str]:
@@ -235,7 +315,7 @@ class NL2SQLService:
                 }
                 tables_info.append(table_info)
             
-            # 将结果缓存起来，便于后续快速访问
+            # 将结果缓存起来,便于后续快速访问
             self._cached_tables = tables_info
             self._cached_table_count = len(tables)
             
@@ -288,17 +368,17 @@ class NL2SQLService:
     
     def get_cached_table_count(self) -> int:
         """
-        获取缓存的表数量，如果没有缓存则查询数据库
+        获取缓存的表数量,如果没有缓存则查询数据库
         
         Returns:
             int: 表数量
         """
-        # 如果已有缓存，直接返回
+        # 如果已有缓存,直接返回
         if hasattr(self, '_cached_table_count'):
             return self._cached_table_count
         
         try:
-            # 如果没有缓存，查询数据库
+            # 如果没有缓存,查询数据库
             from src.utils.db import execute_query
             result = execute_query(f"SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = '{self.db_name}' AND table_type = 'BASE TABLE'")
             if result and result[0]:
@@ -312,17 +392,17 @@ class NL2SQLService:
     
     def get_cached_tables(self) -> List[Dict[str, Any]]:
         """
-        获取缓存的表信息，如果没有缓存则查询数据库
+        获取缓存的表信息,如果没有缓存则查询数据库
         
         Returns:
-            List[Dict[str, Any]]: 表信息列表，每个表包含name、comment等信息
+            List[Dict[str, Any]]: 表信息列表,每个表包含name、comment等信息
         """
-        # 如果已有缓存，直接返回
+        # 如果已有缓存,直接返回
         if hasattr(self, '_cached_tables'):
             return self._cached_tables
         
         try:
-            # 如果没有缓存，调用list_tables获取
+            # 如果没有缓存,调用list_tables获取
             result = self.list_tables()
             if result.get('success', False):
                 return result.get('tables', [])
@@ -368,7 +448,7 @@ class NL2SQLService:
             # 先从元数据库中查询业务概览信息
             business_metadata = self.metadata_extractor.get_business_metadata_from_database(self.db_name)
             
-            # 如果元数据库中存在业务概览信息，则直接返回
+            # 如果元数据库中存在业务概览信息,则直接返回
             if business_metadata and isinstance(business_metadata, dict) and 'business_domain' in business_metadata:
                 logger.info(f"从元数据库中获取到业务概览信息")
                 
@@ -388,15 +468,15 @@ class NL2SQLService:
                 
                 return result
             
-            # 如果元数据库中不存在业务概览信息，则刷新元数据
-            logger.info(f"元数据库中不存在业务概览信息，将刷新元数据")
+            # 如果元数据库中不存在业务概览信息,则刷新元数据
+            logger.info(f"元数据库中不存在业务概览信息,将刷新元数据")
             
             # 刷新元数据
             refresh_success = self.metadata_extractor._update_sql_patterns_and_business_metadata(self.db_name)
             
             if refresh_success:
                 # 再次尝试从元数据库中获取业务概览信息
-                logger.info(f"元数据刷新成功，再次尝试获取业务概览信息")
+                logger.info(f"元数据刷新成功,再次尝试获取业务概览信息")
                 business_metadata = self.metadata_extractor.get_business_metadata_from_database(self.db_name)
                 
                 if business_metadata and isinstance(business_metadata, dict) and 'business_domain' in business_metadata:
@@ -418,8 +498,8 @@ class NL2SQLService:
                     
                     return result
             
-            # 如果刷新元数据失败或者刷新后仍无法获取业务概览信息，则调用LLM生成
-            logger.info(f"元数据刷新后仍无法获取业务概览信息，将使用LLM生成")
+            # 如果刷新元数据失败或者刷新后仍无法获取业务概览信息,则调用LLM生成
+            logger.info(f"元数据刷新后仍无法获取业务概览信息,将使用LLM生成")
             
             # 获取业务元数据
             business_metadata = self.metadata_extractor.summarize_business_metadata(self.db_name)
@@ -464,7 +544,7 @@ def main():
     args = parser.parse_args()
     
     # 初始化服务
-    service = NL2SQLService(args.database, auto_refresh_metadata=args.auto_refresh)
+    service = NL2SQLService(args.database)
     
     # 处理命令行参数
     if args.list_llm_providers:
@@ -478,7 +558,7 @@ def main():
         if success:
             print(f"已切换到LLM提供商: {args.set_llm_provider}")
         else:
-            print(f"切换LLM提供商失败，{args.set_llm_provider} 可能不可用")
+            print(f"切换LLM提供商失败,{args.set_llm_provider} 可能不可用")
     elif args.refresh_metadata or args.force_refresh:
         # 使用force参数
         force = args.force_refresh
@@ -539,7 +619,7 @@ def main():
             if 'data' in result:
                 print(f"查询结果 ({result.get('row_count', 0)} 行):")
                 if result.get('truncated'):
-                    print(f"注意: 结果已截断，只显示 {result.get('displayed_row_count')} 行，共 {result.get('original_row_count')} 行")
+                    print(f"注意: 结果已截断,只显示 {result.get('displayed_row_count')} 行,共 {result.get('original_row_count')} 行")
                 
                 if result['data']:
                     # 打印列头
@@ -554,7 +634,7 @@ def main():
                 else:
                     print("查询结果为空")
             else:
-                print("查询执行成功，但没有返回数据")
+                print("查询执行成功,但没有返回数据")
         else:
             print(f"错误: {result.get('message', '处理查询时出错')}")
             

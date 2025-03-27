@@ -5,41 +5,120 @@
 """
 
 import os
-import logging
 import json
 import pandas as pd
-from typing import Dict, List, Any, Optional
-from dotenv import load_dotenv
-import time
-from datetime import datetime, timedelta
 import re
+import time
+from typing import Dict, List, Any, Optional, Tuple
+from dotenv import load_dotenv
+from datetime import datetime, timedelta
+
+# 导入统一日志配置
+from src.utils.logger import get_logger
 
 # 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # 加载环境变量
 load_dotenv()
 
 # 导入本地模块
-from src.utils.db import execute_query_df, execute_query, get_db_connection
+from src.utils.db import execute_query_df, execute_query, get_db_connection, ENABLE_MULTI_DATABASE, MULTI_DATABASE_NAMES
 from src.utils.llm_client import get_llm_client, Message
 from src.prompts.prompts import BUSINESS_METADATA_PROMPTS
 
 class MetadataExtractor:
     """Apache Doris元数据提取器"""
     
-    def __init__(self, db_name: Optional[str] = None):
+    def __init__(self, db_name: str = None):
         """
         初始化元数据提取器
         
         Args:
-            db_name: 数据库名称，如果为None则从环境变量获取
+            db_name: 数据库名称,默认使用环境变量中的DB_DATABASE
         """
         self.db_name = db_name or os.getenv("DB_DATABASE", "")
+        
+        # 设置元数据数据库名称
+        self.metadata_db = "doris_metadata"
+        
+        # 缓存设置
         self.metadata_cache = {}
         self.metadata_cache_time = {}
         self.cache_ttl = int(os.getenv("METADATA_CACHE_TTL", "3600"))  # 默认缓存1小时
+        
+        # 启用多数据库支持 - 使用从db.py导入的变量
+        self.enable_multi_database = ENABLE_MULTI_DATABASE
+        
+        # 如果开启了多数据库支持,获取多数据库列表
+        if self.enable_multi_database:
+            logger.info(f"多数据库模式已启用,配置的数据库: {MULTI_DATABASE_NAMES}")
+        
+        # 加载表层级匹配配置
+        self.enable_table_hierarchy = os.getenv("ENABLE_TABLE_HIERARCHY", "false").lower() == "true"
+        if self.enable_table_hierarchy:
+            self.table_hierarchy_patterns = self._load_table_hierarchy_patterns()
+            logger.info(f"表层级匹配已启用,模式: {self.table_hierarchy_patterns}")
+        else:
+            self.table_hierarchy_patterns = []
+        
+        # 加载需要排除的数据库列表
+        self.excluded_databases = self._load_excluded_databases()
+    
+    def _load_excluded_databases(self) -> List[str]:
+        """
+        加载排除的数据库列表配置
+        
+        Returns:
+            排除的数据库列表
+        """
+        excluded_dbs_str = os.getenv("EXCLUDED_DATABASES", 
+                               '["information_schema", "mysql", "performance_schema", "sys", "doris_metadata"]')
+        try:
+            excluded_dbs = json.loads(excluded_dbs_str)
+            if isinstance(excluded_dbs, list):
+                logger.info(f"已加载排除的数据库列表: {excluded_dbs}")
+                return excluded_dbs
+            else:
+                logger.warning("排除的数据库列表配置不是列表格式,使用默认值")
+        except json.JSONDecodeError:
+            logger.warning("解析排除的数据库列表JSON时出错,使用默认值")
+        
+        # 默认值
+        default_excluded_dbs = ["information_schema", "mysql", "performance_schema", "sys", "doris_metadata"]
+        return default_excluded_dbs
+        
+    def _load_table_hierarchy_patterns(self) -> List[str]:
+        """
+        加载表层级匹配模式配置
+        
+        Returns:
+            表层级匹配正则表达式列表
+        """
+        patterns_str = os.getenv("TABLE_HIERARCHY_PATTERNS", 
+                               '["^ads_.*$","^dim_.*$","^dws_.*$","^dwd_.*$","^ods_.*$","^tmp_.*$","^stg_.*$","^.*$"]')
+        try:
+            patterns = json.loads(patterns_str)
+            if isinstance(patterns, list):
+                # 确保所有模式都是有效的正则表达式
+                validated_patterns = []
+                for pattern in patterns:
+                    try:
+                        re.compile(pattern)
+                        validated_patterns.append(pattern)
+                    except re.error:
+                        logger.warning(f"无效的正则表达式模式: {pattern}")
+                
+                logger.info(f"已加载表层级匹配模式: {validated_patterns}")
+                return validated_patterns
+            else:
+                logger.warning("表层级匹配模式配置不是列表格式,使用默认值")
+        except json.JSONDecodeError:
+            logger.warning("解析表层级匹配模式JSON时出错,使用默认值")
+        
+        # 默认值
+        default_patterns = ["^ads_.*$", "^dim_.*$", "^dws_.*$", "^dwd_.*$", "^ods_.*$", "^.*$"]
+        return default_patterns
         
     def get_all_databases(self) -> List[str]:
         """
@@ -81,13 +160,49 @@ class MetadataExtractor:
         except Exception as e:
             logger.error(f"获取数据库列表时出错: {str(e)}")
             return []
+
+    def get_all_target_databases(self) -> List[str]:
+        """
+        获取所有目标数据库
+        
+        如果启用了多数据库支持,则返回配置中的所有数据库；
+        否则返回当前数据库
+        
+        Returns:
+            目标数据库列表
+        """
+        if self.enable_multi_database:
+            # 从配置中获取多数据库列表
+            from src.utils.db import MULTI_DATABASE_NAMES
+            
+            # 如果配置为空,则返回当前数据库和系统中所有数据库
+            if not MULTI_DATABASE_NAMES:
+                all_dbs = self.get_all_databases()
+                # 把当前数据库放在最前面
+                if self.db_name in all_dbs:
+                    all_dbs.remove(self.db_name)
+                    all_dbs = [self.db_name] + all_dbs
+                return all_dbs
+            else:
+                # 确保当前数据库在列表中且位于最前面
+                db_names = list(MULTI_DATABASE_NAMES)  # 复制一份避免修改原始列表
+                if self.db_name and self.db_name not in db_names:
+                    db_names.insert(0, self.db_name)
+                elif self.db_name and self.db_name in db_names:
+                    # 如果当前数据库在列表中但不在第一位,调整位置
+                    db_names.remove(self.db_name)
+                    db_names.insert(0, self.db_name)
+                return db_names
+        else:
+            # 只返回当前数据库
+            return [self.db_name] if self.db_name else []
     
     def get_database_tables(self, db_name: Optional[str] = None) -> List[str]:
         """
         获取数据库中所有表的列表
         
         Args:
-            db_name: 数据库名称，如果为None则使用当前数据库
+            db_name: 数据库名称,如果为None则使用当前数据库
             
         Returns:
             表名列表
@@ -113,14 +228,18 @@ class MetadataExtractor:
                 AND TABLE_TYPE = 'BASE TABLE'
             """
             
-            result = execute_query(query)
-            logger.info(f"information_schema.tables查询结果: {result}")
+            result = execute_query(query, db_name)
+            logger.info(f"{db_name}.information_schema.tables查询结果: {result}")
             
             if not result:
                 tables = []
             else:
                 tables = [table['TABLE_NAME'] for table in result]
-                logger.info(f"从information_schema.tables获取的表名: {tables}")
+                logger.info(f"从{db_name}.information_schema.tables获取的表名: {tables}")
+            
+            # 按层级匹配对表进行排序（如果启用）
+            if self.enable_table_hierarchy and tables:
+                tables = self._sort_tables_by_hierarchy(tables)
             
             # 更新缓存
             self.metadata_cache[cache_key] = tables
@@ -131,16 +250,143 @@ class MetadataExtractor:
             logger.error(f"获取表列表时出错: {str(e)}")
             return []
     
+    def get_all_tables_and_columns(self) -> Dict[str, Any]:
+        """
+        获取所有表和列的信息
+        
+        Returns:
+            Dict[str, Any]: 包含所有表和列信息的字典
+        """
+        cache_key = f"all_tables_columns_{self.db_name}"
+        if cache_key in self.metadata_cache and (datetime.now() - self.metadata_cache_time.get(cache_key, datetime.min)).total_seconds() < self.cache_ttl:
+            return self.metadata_cache[cache_key]
+        
+        try:
+            result = {}
+            tables = self.get_database_tables(self.db_name)
+            
+            for table_name in tables:
+                schema = self.get_table_schema(table_name, self.db_name)
+                if schema:
+                    columns = schema.get("columns", [])
+                    column_names = [col.get("name") for col in columns if col.get("name")]
+                    column_types = {col.get("name"): col.get("type") for col in columns if col.get("name") and col.get("type")}
+                    column_comments = {col.get("name"): col.get("comment") for col in columns if col.get("name")}
+                    
+                    result[table_name] = {
+                        "comment": schema.get("comment", ""),
+                        "columns": column_names,
+                        "column_types": column_types,
+                        "column_comments": column_comments
+                    }
+            
+            # 更新缓存
+            self.metadata_cache[cache_key] = result
+            self.metadata_cache_time[cache_key] = datetime.now()
+            
+            return result
+        except Exception as e:
+            logger.error(f"获取所有表和列信息时出错: {str(e)}")
+            return {}
+    
+    def _sort_tables_by_hierarchy(self, tables: List[str]) -> List[str]:
+        """
+        根据层级匹配模式对表进行排序
+        
+        Args:
+            tables: 表名列表
+            
+        Returns:
+            排序后的表名列表
+        """
+        if not self.enable_table_hierarchy or not self.table_hierarchy_patterns:
+            return tables
+        
+        # 按照模式优先级对表进行分组
+        table_groups = []
+        remaining_tables = set(tables)
+        
+        for pattern in self.table_hierarchy_patterns:
+            matching_tables = []
+            regex = re.compile(pattern)
+            
+            for table in list(remaining_tables):
+                if regex.match(table):
+                    matching_tables.append(table)
+                    remaining_tables.remove(table)
+            
+            if matching_tables:
+                # 在每个分组内部,按字母顺序排序
+                matching_tables.sort()
+                table_groups.append(matching_tables)
+        
+        # 将剩余的表添加到最后
+        if remaining_tables:
+            table_groups.append(sorted(list(remaining_tables)))
+        
+        # 扁平化分组
+        return [table for group in table_groups for table in group]
+    
+    def get_all_tables_from_all_databases(self) -> Dict[str, List[str]]:
+        """
+        获取所有目标数据库中的所有表
+        
+        Returns:
+            数据库名到表名列表的映射
+        """
+        all_tables = {}
+        target_dbs = self.get_all_target_databases()
+        
+        for db_name in target_dbs:
+            tables = self.get_database_tables(db_name)
+            if tables:
+                all_tables[db_name] = tables
+        
+        return all_tables
+    
+    def find_tables_by_pattern(self, pattern: str, db_name: Optional[str] = None) -> List[Tuple[str, str]]:
+        """
+        根据模式在数据库中查找匹配的表
+        
+        Args:
+            pattern: 表名模式（正则表达式）
+            db_name: 数据库名称,如果为None则搜索所有目标数据库
+            
+        Returns:
+            匹配的(数据库名,表名)元组列表
+        """
+        try:
+            regex = re.compile(pattern)
+        except re.error:
+            logger.error(f"无效的正则表达式模式: {pattern}")
+            return []
+        
+        matches = []
+        
+        if db_name:
+            # 只在指定数据库中搜索
+            tables = self.get_database_tables(db_name)
+            matches = [(db_name, table) for table in tables if regex.match(table)]
+        else:
+            # 在所有目标数据库中搜索
+            all_tables = self.get_all_tables_from_all_databases()
+            
+            for db, tables in all_tables.items():
+                db_matches = [(db, table) for table in tables if regex.match(table)]
+                matches.extend(db_matches)
+        
+        return matches
+    
     def get_table_schema(self, table_name: str, db_name: Optional[str] = None) -> Dict[str, Any]:
         """
         获取表的结构信息
         
         Args:
             table_name: 表名
-            db_name: 数据库名称，如果为None则使用当前数据库
+            db_name: 数据库名称,如果为None则使用当前数据库
             
         Returns:
-            表结构信息，包含列名、类型、是否允许空值、默认值、注释等
+            表结构信息,包含列名、类型、是否允许空值、默认值、注释等
         """
         db_name = db_name or self.db_name
         if not db_name:
@@ -181,7 +427,7 @@ class MetadataExtractor:
             # 创建结构化的表模式信息
             columns = []
             for col in result:
-                # 确保使用实际的列值，而不是列名
+                # 确保使用实际的列值,而不是列名
                 column_info = {
                     "name": col.get("COLUMN_NAME", ""),
                     "type": col.get("DATA_TYPE", ""),
@@ -240,7 +486,7 @@ class MetadataExtractor:
         
         Args:
             table_name: 表名
-            db_name: 数据库名称，如果为None则使用当前数据库
+            db_name: 数据库名称,如果为None则使用当前数据库
             
         Returns:
             表注释
@@ -288,7 +534,7 @@ class MetadataExtractor:
         
         Args:
             table_name: 表名
-            db_name: 数据库名称，如果为None则使用当前数据库
+            db_name: 数据库名称,如果为None则使用当前数据库
             
         Returns:
             列名和注释的字典
@@ -341,7 +587,7 @@ class MetadataExtractor:
         
         Args:
             table_name: 表名
-            db_name: 数据库名称，如果为None则使用初始化时指定的数据库
+            db_name: 数据库名称,如果为None则使用初始化时指定的数据库
             
         Returns:
             List[Dict[str, Any]]: 索引信息列表
@@ -409,7 +655,7 @@ class MetadataExtractor:
             relationships = []
             
             # 简单的外键命名规则检测
-            # 例如: 如果一个表有一个列名为 xxx_id，并且有另一个表名为 xxx，则可能是外键关系
+            # 例如: 如果一个表有一个列名为 xxx_id,并且有另一个表名为 xxx,则可能是外键关系
             for table_name in tables:
                 schema = self.get_table_schema(table_name, self.db_name)
                 columns = schema.get("columns", [])
@@ -434,7 +680,7 @@ class MetadataExtractor:
                                     "references_table": ref_table_name,
                                     "references_column": "id",
                                     "relationship_type": "many-to-one",
-                                    "confidence": "medium"  # 置信度不高，基于命名约定
+                                    "confidence": "medium"  # 置信度不高,基于命名约定
                                 })
             
             # 更新缓存
@@ -498,7 +744,7 @@ class MetadataExtractor:
         all_comments = single_line_comments + multi_line_comments
         return '\n'.join(comment.strip() for comment in all_comments if comment.strip())
     
-    def extract_common_sql_patterns(self, limit: int = 50) -> Dict[str, List[Dict[str, Any]]]:
+    def extract_common_sql_patterns(self, limit: int = 50) -> List[Dict[str, Any]]:
         """
         提取常见的SQL模式
         
@@ -506,16 +752,29 @@ class MetadataExtractor:
             limit: 最多获取多少条审计日志
             
         Returns:
-            Dict[str, List[Dict[str, Any]]]: SQL模式信息
+            List[Dict[str, Any]]: SQL模式信息列表,包含pattern, type, frequency等字段
         """
         try:
             # 获取审计日志
             audit_logs = self.get_recent_audit_logs(days=30, limit=limit)
             if audit_logs.empty:
-                return {}
+                # 如果无法获取审计日志,返回一些默认模式
+                default_patterns = [
+                    {
+                        "pattern": "SELECT * FROM {table} WHERE {condition}",
+                        "type": "SELECT",
+                        "frequency": 1
+                    },
+                    {
+                        "pattern": "SELECT {columns} FROM {table} GROUP BY {group_by} ORDER BY {order_by} LIMIT {limit}",
+                        "type": "SELECT",
+                        "frequency": 1
+                    }
+                ]
+                return default_patterns
             
             # 按SQL类型分组处理
-            patterns = {}
+            patterns_by_type = {}
             for _, row in audit_logs.iterrows():
                 sql = row['stmt']
                 if not sql:
@@ -535,13 +794,13 @@ class MetadataExtractor:
                 # 提取SQL注释
                 comments = self.extract_sql_comments(sql)
                 
-                # 如果是新模式，初始化
-                if sql_type not in patterns:
-                    patterns[sql_type] = []
+                # 如果是新模式,初始化
+                if sql_type not in patterns_by_type:
+                    patterns_by_type[sql_type] = []
                     
                 # 查找是否有类似的模式
                 found_similar = False
-                for pattern in patterns[sql_type]:
+                for pattern in patterns_by_type[sql_type]:
                     if self._are_sqls_similar(simplified_sql, pattern['simplified_sql']):
                         pattern['count'] += 1
                         pattern['examples'].append(sql)
@@ -550,9 +809,9 @@ class MetadataExtractor:
                         found_similar = True
                         break
                         
-                # 如果没有找到类似的模式，添加新模式
+                # 如果没有找到类似的模式,添加新模式
                 if not found_similar:
-                    patterns[sql_type].append({
+                    patterns_by_type[sql_type].append({
                         'simplified_sql': simplified_sql,
                         'examples': [sql],
                         'comments': [comments] if comments else [],
@@ -560,14 +819,71 @@ class MetadataExtractor:
                         'tables': tables
                     })
                     
-            # 按照频率排序
-            for sql_type in patterns:
-                patterns[sql_type] = sorted(patterns[sql_type], key=lambda x: x['count'], reverse=True)
+            # 将分组的模式转换为必要的输出格式
+            result_patterns = []
+            
+            # 按照频率排序并转换格式
+            for sql_type, type_patterns in patterns_by_type.items():
+                sorted_patterns = sorted(type_patterns, key=lambda x: x['count'], reverse=True)
                 
-            return patterns
+                # 提取前3个模式并转换为预期格式
+                for pattern in sorted_patterns[:3]:
+                    # 创建与_update_sql_patterns_for_all_databases中使用的格式一致的输出
+                    result_patterns.append({
+                        "pattern": pattern['simplified_sql'],
+                        "type": sql_type,
+                        "frequency": pattern['count'],
+                        "examples": json.dumps(pattern['examples'][:3], ensure_ascii=False),
+                        "comments": json.dumps(pattern['comments'][:3], ensure_ascii=False) if pattern['comments'] else "[]",
+                        "tables": json.dumps(pattern['tables'], ensure_ascii=False)
+                    })
+            
+            # 如果没有找到任何模式,返回默认值
+            if not result_patterns:
+                default_patterns = [
+                    {
+                        "pattern": "SELECT * FROM {table} WHERE {condition}",
+                        "type": "SELECT",
+                        "frequency": 1,
+                        "examples": "[]",
+                        "comments": "[]",
+                        "tables": "[]"
+                    },
+                    {
+                        "pattern": "SELECT {columns} FROM {table} GROUP BY {group_by} ORDER BY {order_by} LIMIT {limit}",
+                        "type": "SELECT",
+                        "frequency": 1,
+                        "examples": "[]",
+                        "comments": "[]",
+                        "tables": "[]"
+                    }
+                ]
+                return default_patterns
+            
+            return result_patterns
+            
         except Exception as e:
             logger.error(f"提取SQL模式时出错: {str(e)}")
-            return {}
+            # 返回一些默认模式,确保不会导致后续处理错误
+            default_patterns = [
+                {
+                    "pattern": "SELECT * FROM {table} WHERE {condition}",
+                    "type": "SELECT",
+                    "frequency": 1,
+                    "examples": "[]",
+                    "comments": "[]",
+                    "tables": "[]"
+                },
+                {
+                    "pattern": "SELECT {columns} FROM {table} GROUP BY {group_by} ORDER BY {order_by} LIMIT {limit}",
+                    "type": "SELECT",
+                    "frequency": 1,
+                    "examples": "[]",
+                    "comments": "[]",
+                    "tables": "[]"
+                }
+            ]
+            return default_patterns
     
     def _simplify_sql(self, sql: str) -> str:
         """
@@ -650,12 +966,45 @@ class MetadataExtractor:
         
         return list(tables)
     
-    def summarize_business_metadata(self, db_name: Optional[str] = None) -> Dict[str, Any]:
+    def _get_sql_type(self, sql: str) -> str:
         """
-        获取业务元数据摘要，优先从元数据库获取，若不存在则通过LLM生成
+        判断SQL语句的类型
         
         Args:
-            db_name: 数据库名称，如果为None则使用初始化时指定的数据库
+            sql: SQL语句
+            
+        Returns:
+            str: SQL类型,如SELECT, INSERT, UPDATE等
+        """
+        sql = sql.strip().upper()
+        
+        if sql.startswith('SELECT'):
+            return 'SELECT'
+        elif sql.startswith('INSERT'):
+            return 'INSERT'
+        elif sql.startswith('UPDATE'):
+            return 'UPDATE'
+        elif sql.startswith('DELETE'):
+            return 'DELETE'
+        elif sql.startswith('CREATE'):
+            return 'CREATE'
+        elif sql.startswith('DROP'):
+            return 'DROP'
+        elif sql.startswith('ALTER'):
+            return 'ALTER'
+        elif sql.startswith('SHOW'):
+            return 'SHOW'
+        elif sql.startswith('DESCRIBE'):
+            return 'DESCRIBE'
+        else:
+            return 'OTHER'
+    
+    def summarize_business_metadata(self, db_name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        获取业务元数据摘要,优先从元数据库获取,若不存在则通过LLM生成
+        
+        Args:
+            db_name: 数据库名称,如果为None则使用初始化时指定的数据库
             
         Returns:
             Dict[str, Any]: 业务元数据总结
@@ -669,26 +1018,53 @@ class MetadataExtractor:
         if cache_key in self.metadata_cache and (datetime.now() - self.metadata_cache_time.get(cache_key, datetime.min)).total_seconds() < self.cache_ttl:
             return self.metadata_cache[cache_key]
         
+        # 定义默认元数据
+        default_metadata = {
+            "business_domain": f"{db_name}数据库",
+            "core_entities": [],
+            "business_processes": [],
+            "tables_summary": []
+        }
+        
         try:
             # 首先尝试从元数据库获取业务元数据
             logger.info(f"尝试从元数据库获取 {db_name} 的业务元数据")
-            db_metadata = self.get_business_metadata_from_database(db_name)
             
-            # 如果从元数据库成功获取业务元数据，则直接返回
-            if db_metadata and isinstance(db_metadata, dict) and len(db_metadata) > 0:
-                logger.info(f"成功从元数据库获取 {db_name} 的业务元数据")
-                
-                # 更新缓存
-                self.metadata_cache[cache_key] = db_metadata
-                self.metadata_cache_time[cache_key] = datetime.now()
-                
-                return db_metadata
+            # 修改为正确的查询方式
+            query = f"""
+            SELECT metadata_value 
+            FROM {self.metadata_db}.business_metadata 
+            WHERE db_name = '{db_name}' 
+            AND table_name = '' 
+            AND metadata_type = 'business_summary'
+            """
             
-            logger.info(f"元数据库中没有找到 {db_name} 的业务元数据，将通过LLM生成")
+            try:
+                result = execute_query(query)
+                logger.info(f"元数据查询结果: {result}")
+                
+                if result and len(result) > 0 and 'metadata_value' in result[0]:
+                    try:
+                        db_metadata = json.loads(result[0]['metadata_value'])
+                        if isinstance(db_metadata, dict) and len(db_metadata) > 0:
+                            logger.info(f"成功从元数据库获取 {db_name} 的业务元数据")
+                            
+                            # 更新缓存
+                            self.metadata_cache[cache_key] = db_metadata
+                            self.metadata_cache_time[cache_key] = datetime.now()
+                            
+                            return db_metadata
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"解析元数据JSON时出错: {str(e)}")
+                        # 继续执行,通过LLM生成新的元数据
+                
+                logger.info(f"元数据库中没有找到 {db_name} 的业务元数据,将通过LLM生成")
+            except Exception as e:
+                logger.warning(f"查询元数据时出错: {str(e)},将通过LLM生成新的元数据")
             
             # 获取数据库所有表
             tables = self.get_database_tables(db_name)
-            logger.info(f"为 {db_name} 总结业务元数据，发现 {len(tables)} 个表")
+            logger.info(f"为 {db_name} 总结业务元数据,发现 {len(tables)} 个表")
             
             # 收集所有表的元数据
             tables_metadata = []
@@ -718,17 +1094,12 @@ class MetadataExtractor:
             
             # 准备SQL模式信息文本
             sql_patterns_text = ""
-            for sql_type, patterns in sql_patterns.items():
-                if patterns:
-                    sql_patterns_text += f"- {sql_type} 查询:\n"
-                    for pattern in patterns[:3]:  # 每种类型最多展示3个模式
-                        example = pattern["examples"][0] if pattern["examples"] else ""
-                        comments = pattern["comments"][0] if pattern["comments"] else ""
-                        sql_patterns_text += f"  * 频率: {pattern['count']}\n"
-                        sql_patterns_text += f"    示例: {example[:100]}...\n"
-                        if comments:
-                            sql_patterns_text += f"    注释: {comments}\n"
-                    sql_patterns_text += "\n"
+            if isinstance(sql_patterns, list):
+                for pattern in sql_patterns[:5]:  # 最多展示5个模式
+                    sql_type = pattern.get("type", "未知")
+                    pattern_text = pattern.get("pattern", "")
+                    frequency = pattern.get("frequency", 0)
+                    sql_patterns_text += f"- {sql_type}查询 (频率: {frequency}):\n  {pattern_text}\n\n"
             
             # 使用提示词模板
             system_prompt = BUSINESS_METADATA_PROMPTS["system"]
@@ -739,7 +1110,6 @@ class MetadataExtractor:
             )
             
             # 创建日志目录
-            # 获取项目根目录下的log目录
             from pathlib import Path
             project_root = Path(__file__).parents[3]
             log_dir = project_root / "log" / "llm_calls"
@@ -765,1566 +1135,758 @@ class MetadataExtractor:
             
             # 调用LLM
             try:
-                llm_client = get_llm_client()
-                messages = [
+                from src.utils.llm_client import get_llm_client, Message
+                
+                client = get_llm_client(stage="metadata")
+                
+                # 如果LLM客户端为None（可能是程序正在退出）,返回默认值
+                if client is None:
+                    logger.warning("无法获取LLM客户端,可能是程序正在退出")
+                    return default_metadata
+                
+                response = client.chat([
                     Message.system(system_prompt),
                     Message.user(user_prompt)
-                ]
-                response = llm_client.chat(messages)
+                ])
                 
-                # 检查返回的内容是否有效
-                if not response.content or response.content.strip() == "":
-                    logger.error("LLM返回了空的响应内容")
-                    return {"error": "LLM返回了空的响应内容", "tables_summary": []}
+                if not response or not response.content:
+                    logger.warning("LLM响应为空")
+                    return default_metadata
                 
-                # 记录LLM响应
-                llm_response_log = {
-                    "function": "summarize_business_metadata",
-                    "db_name": db_name,
-                    "response_content": response.content,
-                    "timestamp": datetime.now().isoformat()
-                }
-                
-                # 保存响应日志 - 使用相同的时间戳前缀，便于关联请求和响应
-                response_log_path = log_dir / f"{timestamp}_business_metadata_response.json"
+                # 解析LLM回复获取业务元数据
                 try:
-                    with open(response_log_path, 'w', encoding='utf-8') as f:
-                        # 使用ensure_ascii=False确保中文正常显示
-                        # 这里为了处理可能存在的特殊字符，我们先转义一些可能导致JSON格式错误的字符
-                        safe_content = response.content.replace("\\", "\\\\").replace("\"", "\\\"")
-                        # 对于标签类内容，也进行转义，避免被截断
-                        safe_content = safe_content.replace("<", "\\<").replace(">", "\\>")
-                        
-                        # 更新日志对象
-                        llm_response_log["response_content"] = safe_content
-                        
-                        json.dump(llm_response_log, f, ensure_ascii=False, indent=2)
-                    
-                    logger.info(f"LLM响应日志保存到: {response_log_path}")
-                except Exception as log_error:
-                    logger.error(f"保存LLM响应日志时出错: {str(log_error)}")
-                    # 尝试替代方案：以文本形式保存
-                    try:
-                        text_log_path = log_dir / f"{timestamp}_business_metadata_response.txt"
-                        with open(text_log_path, 'w', encoding='utf-8') as f:
-                            f.write(f"Function: summarize_business_metadata\n")
-                            f.write(f"DB Name: {db_name}\n")
-                            f.write(f"Timestamp: {datetime.now().isoformat()}\n")
-                            f.write(f"Response Content:\n{response.content}")
-                        logger.info(f"LLM响应保存为文本文件: {text_log_path}")
-                    except Exception as text_error:
-                        logger.error(f"保存LLM响应文本日志时出错: {str(text_error)}")
+                    metadata = self._extract_json_from_llm_response(response.content)
+                except Exception as e:
+                    logger.error(f"解析LLM响应提取JSON时出错: {str(e)}")
+                    return default_metadata
                 
-                logger.info(f"LLM响应内容前100个字符: {response.content[:100]}...")
-            except Exception as e:
-                error_msg = str(e)
-                logger.error(f"调用LLM生成业务元数据摘要时出错: {error_msg}")
-                return {"error": f"调用LLM时出错: {error_msg}", "tables_summary": []}
-            
-            # 增强的JSON解析，更健壮地处理LLM响应
-            result = self._parse_llm_json_response(response.content)
-            
-            # 确保结果包含必要的字段，即使解析失败
-            if "tables_summary" not in result:
-                result["tables_summary"] = []
-            
-            # 更新缓存
-            self.metadata_cache[cache_key] = result
-            self.metadata_cache_time[cache_key] = datetime.now()
-            
-            # 考虑将LLM生成的结果保存到元数据库
-            try:
-                # 构建要保存的元数据
-                metadata_to_save = {
-                    "summary": result
-                }
+                if not metadata or metadata.get("extraction_failed", False):
+                    logger.warning(f"从LLM响应中提取JSON失败: {response.content[:200]}...")
+                    return default_metadata
                 
-                # 将结果保存到元数据库
-                self._save_business_metadata(db_name, "business_summary", json.dumps(metadata_to_save, ensure_ascii=False))
-                logger.info(f"已将LLM生成的业务元数据保存到元数据库")
+                # 确保必要字段存在
+                if not isinstance(metadata, dict):
+                    logger.warning("LLM返回的不是有效的字典对象")
+                    return default_metadata
+                
+                if "tables_summary" not in metadata:
+                    metadata["tables_summary"] = {}
+                
+                # 记录业务元数据以供参考
+                metadata_log_path = os.path.join(log_dir, f"metadata_{db_name}_{timestamp}.json")
+                with open(metadata_log_path, 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, ensure_ascii=False, indent=2)
+                
+                logger.info(f"业务元数据保存到: {metadata_log_path}")
+                
+                return metadata
             except Exception as e:
-                logger.error(f"保存LLM生成的业务元数据到元数据库时出错: {str(e)}")
-            
-            logger.info(f"成功生成业务元数据摘要，包含 {len(result.get('tables_summary', []))} 个表摘要")
-            return result
+                logger.error(f"调用LLM生成业务元数据摘要时出错: {str(e)}")
+                return default_metadata
+                
         except Exception as e:
-            error_msg = str(e)
-            logger.error(f"总结业务元数据时出错: {error_msg}")
-            # 返回至少包含空tables_summary的结构，避免后续处理错误
-            return {"error": error_msg, "tables_summary": []}
+            logger.error(f"调用LLM生成业务元数据摘要时出错: {str(e)}")
+            return default_metadata
     
-    def _parse_llm_json_response(self, content: str) -> Dict[str, Any]:
+    def _extract_json_from_llm_response(self, content: str) -> Dict:
         """
-        解析LLM返回的JSON格式响应
-        采用提取而非删除的策略，保留原始响应完整性
+        从LLM响应中提取JSON内容
         
         Args:
-            content: 包含JSON数据的字符串
+            content: LLM响应内容
             
         Returns:
-            Dict[str, Any]: 解析后的JSON数据，如果解析失败则返回包含error字段的字典
+            Dict: 提取的JSON对象
         """
-        if not content or not content.strip():
-            logging.error("LLM返回的内容为空")
-            return {"error": "empty_response", "message": "LLM返回内容为空"}
-            
-        # 记录原始响应的前100个字符，用于调试
-        logging.info(f"原始LLM响应(前100字符): {content[:100]}")
+        result = {}
         
-        # 方法0: 优先使用多行JSON处理函数，它已经包含了处理```json代码块和<think>标签的逻辑
-        result = self._handle_multiline_json(content)
-        if result:
-            logging.info("成功使用多行JSON处理提取有效JSON")
-            return result
-        
-        # 方法1: 尝试修复可能的JSON格式问题并解析
+        # 1. 寻找代码块中的JSON
         try:
-            # 处理常见的格式问题
-            fixed_content = content.replace("'", '"')  # 将单引号替换为双引号
-            fixed_content = re.sub(r'(\w+):', r'"\1":', fixed_content)  # 将没有引号的键名加上引号
+            json_block_pattern = r'```(?:json)?\s*\n([\s\S]*?)\n```'
+            json_block_matches = re.findall(json_block_pattern, content)
             
-            # 尝试解析修复后的内容
-            data = json.loads(fixed_content)
-            logging.info("成功修复并解析JSON")
-            return data
-        except json.JSONDecodeError:
-            logging.warning("修复JSON格式后仍无法解析")
-        
-        # 方法2: 尝试提取可能的JSON部分
-        # 查找最外层的花括号
-        try:
-            start_idx = content.find('{')
-            end_idx = content.rfind('}')
+            if json_block_matches:
+                for json_str in json_block_matches:
+                    try:
+                        json_obj = json.loads(json_str)
+                        return json_obj
+                    except json.JSONDecodeError as je:
+                        logging.warning(f"JSON代码块解析失败: {str(je)}")
+                        continue
             
-            if start_idx >= 0 and end_idx > start_idx:
-                potential_json = content[start_idx:end_idx+1]
-                data = json.loads(potential_json)
-                logging.info("成功从内容中提取JSON部分")
-                return data
-        except json.JSONDecodeError:
-            logging.warning("无法从内容中提取有效的JSON部分")
+            # 2. 如果代码块中没有找到,尝试在整个内容中寻找
+            bracket_pattern = r'\{[\s\S]*\}'
+            bracket_matches = re.findall(bracket_pattern, content)
+            
+            if bracket_matches:
+                for json_str in bracket_matches:
+                    try:
+                        json_obj = json.loads(json_str)
+                        return json_obj
+                    except json.JSONDecodeError as je:
+                        logging.warning(f"整体内容JSON解析失败: {str(je)}")
+                        continue
+        except Exception as e:
+            logging.warning(f"提取JSON时出错: {str(e)}")
         
-        # 方法3: 所有方法都失败，解析为业务领域和核心实体的字典
-        logging.error(f"所有方法都无法提取有效JSON: {content[:200]}")
-        
-        # 尝试检测是否包含一些关键信息，如业务领域描述
-        business_domain_match = re.search(r'(业务领域|business_domain|领域描述)[:：][\s,]*([^,\n]+)', content, re.IGNORECASE)
-        
-        # 返回一个包含可能提取到的业务领域信息的字典
-        result = {
-            "business_domain": business_domain_match.group(2).strip() if business_domain_match else "未识别的业务领域",
-            "core_entities": [],
-            "business_processes": []
+        logging.warning(f"无法从内容中提取有效的JSON: {content[:100]}...")
+        return {
+            "default_response": True,
+            "extraction_failed": True,
+            "content_sample": content[:200] + ("..." if len(content) > 200 else "")
         }
         
-        return result
-    
-    def save_metadata_to_database(self, db_name: Optional[str] = None) -> bool:
+    def refresh_all_databases_metadata(self, force: bool = False) -> bool:
         """
-        将提取和总结的元数据保存到数据库中
+        刷新所有目标数据库的元数据
         
         Args:
-            db_name: 数据库名称，如果为None则使用初始化时指定的数据库
+            force: 是否强制执行全量刷新,默认为False(增量刷新)
             
         Returns:
-            bool: 操作是否成功
+            bool: 刷新是否成功
         """
-        db_name = db_name or self.db_name
-        if not db_name:
-            logger.error("未指定数据库名称")
-            return False
-        
         try:
-            # 使用统一的元数据库
-            metadata_db = "doris_metadata"
+            # 获取所有目标数据库
+            target_databases = self.get_all_target_databases()
+            logger.info(f"将刷新以下数据库的元数据: {target_databases}")
             
-            # 创建元数据数据库（如果不存在）
-            create_db_query = f"CREATE DATABASE IF NOT EXISTS `{metadata_db}`"
-            execute_query(create_db_query)
+            # 检查元数据表是否存在
+            check_db_query = "SHOW DATABASES LIKE 'doris_metadata'"
+            db_exists = execute_query(check_db_query)
             
-            # 创建表结构元数据表，添加database_name作为区分不同数据库的字段
-            create_schema_table_query = f"""
-            CREATE TABLE IF NOT EXISTS `{metadata_db}`.`table_metadata` (
-                `database_name` VARCHAR(100) NOT NULL COMMENT '数据库名称',
-                `table_name` VARCHAR(100) NOT NULL COMMENT '表名',
-                `table_type` VARCHAR(50) COMMENT '表类型',
-                `engine` VARCHAR(50) COMMENT '引擎类型',
-                `table_comment` TEXT COMMENT '表注释',
-                `column_info` TEXT COMMENT '列信息 (JSON格式)',
-                `partition_info` TEXT COMMENT '分区信息 (JSON格式)',
-                `business_summary` TEXT COMMENT '业务摘要',
-                `update_time` DATETIME COMMENT '更新时间'
-            )
-            ENGINE=OLAP
-            DUPLICATE KEY(`database_name`, `table_name`)
-            COMMENT '表结构元数据'
-            DISTRIBUTED BY HASH(`database_name`, `table_name`) BUCKETS 3
-            PROPERTIES("replication_num" = "1");
-            """
-            execute_query(create_schema_table_query)
-            
-            # 创建SQL模式表，添加database_name
-            create_sql_patterns_table_query = f"""
-            CREATE TABLE IF NOT EXISTS `{metadata_db}`.`sql_patterns` (
-                `pattern_id` BIGINT NOT NULL AUTO_INCREMENT COMMENT '模式ID',
-                `database_name` VARCHAR(100) NOT NULL COMMENT '数据库名称',
-                `sql_type` VARCHAR(20) COMMENT 'SQL类型 (SELECT, INSERT等)',
-                `simplified_sql` TEXT COMMENT '简化后的SQL',
-                `examples` TEXT COMMENT 'SQL示例 (JSON格式)',
-                `comments` TEXT COMMENT 'SQL注释 (JSON格式)',
-                `frequency` INT COMMENT '出现频率',
-                `tables` TEXT COMMENT '相关表 (JSON格式)',
-                `update_time` DATETIME COMMENT '更新时间'
-            )
-            ENGINE=OLAP
-            DUPLICATE KEY(`pattern_id`)
-            COMMENT 'SQL查询模式'
-            DISTRIBUTED BY HASH(`pattern_id`) BUCKETS 3
-            PROPERTIES("replication_num" = "1");
-            """
-            execute_query(create_sql_patterns_table_query)
-            
-            # 创建业务元数据总结表，添加database_name
-            create_business_metadata_table_query = f"""
-            CREATE TABLE IF NOT EXISTS `{metadata_db}`.`business_metadata` (
-                `database_name` VARCHAR(100) NOT NULL COMMENT '数据库名称',
-                `metadata_key` VARCHAR(50) NOT NULL COMMENT '元数据键',
-                `metadata_value` TEXT COMMENT '元数据值 (JSON格式)',
-                `update_time` DATETIME COMMENT '更新时间'
-            )
-            ENGINE=OLAP
-            DUPLICATE KEY(`database_name`, `metadata_key`)
-            COMMENT '业务元数据总结'
-            DISTRIBUTED BY HASH(`database_name`, `metadata_key`) BUCKETS 3
-            PROPERTIES("replication_num" = "1");
-            """
-            execute_query(create_business_metadata_table_query)
-            
-            # 获取当前时间
-            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            # 获取数据库中的所有表
-            tables = self.get_database_tables(db_name)
-            logger.info(f"开始处理{db_name}数据库中的表: {tables}")
-            
-            for table_name in tables:
-                logger.info(f"正在处理表: {db_name}.{table_name}")
-                
-                # 检查表名是否为"TABLE_NAME"，这可能是误解
-                if table_name == "TABLE_NAME":
-                    logger.warning(f"发现表名为'TABLE_NAME'，这可能是列名被错误解析为表名，跳过处理")
-                    continue
-                
-                # 获取完整表信息
-                table_info = self.get_complete_table_info(table_name, db_name)
-                
-                # 确保获取到了表信息
-                if not table_info:
-                    logger.warning(f"跳过表 {table_name} 的元数据保存，无法获取表结构")
-                    continue
-                
-                try:
-                    # 将表结构信息保存到数据库
-                    tables_saved = 0
-                    
-                    # 从表信息中提取各字段值
-                    columns_json = json.dumps(table_info.get("columns", []), ensure_ascii=False)
-                    partitions_json = json.dumps(table_info.get("partitions", []), ensure_ascii=False)
-                    
-                    # 明确指定列名的插入语句，添加database_name
-                    table_insert_query = f"""
-                    INSERT INTO `{metadata_db}`.`table_metadata`
-                    (`database_name`, `table_name`, `table_type`, `engine`, `table_comment`, 
-                     `column_info`, `partition_info`, `business_summary`, `update_time`)
-                    VALUES (
-                        '{db_name}',
-                        '{table_name}',
-                        '{table_info.get('table_type', '')}',
-                        '{table_info.get('engine', '')}',
-                        '{table_info.get('table_comment', '').replace("'", "''")}',
-                        '{columns_json.replace("'", "''")}',
-                        '{partitions_json.replace("'", "''")}',
-                        '{table_info.get('business_summary', '').replace("'", "''")}',
-                        '{current_time}'
-                    )
-                    """
-                    execute_query(table_insert_query)
-                    tables_saved += 1
-                    
-                except Exception as e:
-                    logger.error(f"保存表 {table_name} 元数据时出错: {str(e)}")
-            
-            # 将SQL模式保存到数据库
-            patterns_saved = 0
-            patterns = self.extract_common_sql_patterns()
-            
-            for sql_type, pattern_list in patterns.items():
-                for pattern in pattern_list:
-                    try:
-                        simplified_sql = pattern.get("simplified_sql", "").replace("'", "''")
-                        examples_json = json.dumps(pattern.get("examples", []), ensure_ascii=False).replace("'", "''")
-                        comments_json = json.dumps(pattern.get("comments", []), ensure_ascii=False).replace("'", "''")
-                        tables_json = json.dumps(pattern.get("tables", []), ensure_ascii=False).replace("'", "''")
-                        
-                        # 明确指定列名的插入语句，添加database_name
-                        pattern_insert_query = f"""
-                        INSERT INTO `{metadata_db}`.`sql_patterns`
-                        (`database_name`, `sql_type`, `simplified_sql`, `examples`, `comments`, 
-                         `frequency`, `tables`, `update_time`)
-                        VALUES (
-                            '{db_name}',
-                            '{sql_type}',
-                            '{simplified_sql}',
-                            '{examples_json}',
-                            '{comments_json}',
-                            {pattern.get('count', 0)},
-                            '{tables_json}',
-                            '{current_time}'
-                        )
-                        """
-                        execute_query(pattern_insert_query)
-                        patterns_saved += 1
-                    except Exception as e:
-                        logger.error(f"保存SQL模式时出错: {str(e)}")
-            
-            logger.info(f"成功保存 {patterns_saved}/{sum(len(patterns[t]) for t in patterns)} 个SQL模式")
-            
-            # 将业务元数据总结保存到数据库
-            business_summary = self.summarize_business_metadata(db_name)
-            
-            # 获取表数量
-            tables_count = len(tables)
-            logger.info(f"为 {db_name} 总结业务元数据，发现 {tables_count} 个表")
-            
-            try:
-                # 将业务概要保存为JSON
-                tables_summary = business_summary.get("tables_summary", [])
-                
-                # 处理业务领域信息
-                business_domain = business_summary.get("business_domain", "")
-                core_entities = business_summary.get("core_entities", [])
-                business_processes = business_summary.get("business_processes", [])
-                
-                # 将业务概要保存为JSON
-                metadata_json = json.dumps({
-                    "tables_count": tables_count,
-                    "tables": tables,
-                    "summary": {
-                        "business_domain": business_domain,
-                        "core_entities": core_entities,
-                        "business_processes": business_processes
-                    },
-                    "tables_summary": tables_summary
-                }, ensure_ascii=False).replace("'", "''").replace('"', '\\"')
-                
-                # 保存业务概要
-                business_summary_query = f"""
-                INSERT INTO `{metadata_db}`.`business_metadata`
-                (`database_name`, `metadata_key`, `metadata_value`, `update_time`)
-                VALUES ('{db_name}', 'business_summary', "{metadata_json}", '{current_time}')
-                """
-                execute_query(business_summary_query)
-                
-                # 保存数据库统计信息
-                db_stats = {
-                    "tables_count": tables_count,
-                    "updated_at": current_time
-                }
-                db_stats_json = json.dumps(db_stats, ensure_ascii=False).replace("'", "''").replace('"', '\\"')
-                
-                # 使用明确的列名插入
-                db_stats_query = f"""
-                INSERT INTO `{metadata_db}`.`business_metadata` 
-                (`database_name`, `metadata_key`, `metadata_value`, `update_time`)
-                VALUES ('{db_name}', 'db_stats', "{db_stats_json}", '{current_time}')
-                """
-                execute_query(db_stats_query)
-                
-                logger.info(f"成功保存业务元数据")
-                return True
-            
-            except Exception as e:
-                logger.error(f"保存业务元数据时出错: {str(e)}")
-                return False
-            
-        except Exception as e:
-            logger.error(f"保存元数据到数据库时出错: {str(e)}")
-            return False
-    
-    def get_table_partitions(self, table_name: str, db_name: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        获取表的分区信息
-        
-        Args:
-            table_name: 表名
-            db_name: 数据库名称，如果为None则使用当前数据库
-            
-        Returns:
-            分区信息列表
-        """
-        db_name = db_name or self.db_name
-        if not db_name:
-            logger.warning("未指定数据库名称")
-            return []
-        
-        cache_key = f"partitions_{db_name}_{table_name}"
-        if cache_key in self.metadata_cache and (datetime.now() - self.metadata_cache_time.get(cache_key, datetime.min)).total_seconds() < self.cache_ttl:
-            return self.metadata_cache[cache_key]
-        
-        try:
-            # 使用information_schema.partitions表获取分区信息
-            query = f"""
-            SELECT 
-                PARTITION_NAME,
-                PARTITION_ORDINAL_POSITION,
-                PARTITION_METHOD,
-                PARTITION_EXPRESSION,
-                PARTITION_DESCRIPTION,
-                TABLE_ROWS,
-                DATA_LENGTH,
-                CREATE_TIME,
-                PARTITION_COMMENT
-            FROM 
-                information_schema.partitions
-            WHERE 
-                TABLE_SCHEMA = '{db_name}' 
-                AND TABLE_NAME = '{table_name}'
-                AND PARTITION_NAME IS NOT NULL
-            ORDER BY 
-                PARTITION_ORDINAL_POSITION
-            """
-            
-            result = execute_query(query)
-            
-            if not result:
-                logger.info(f"表 {db_name}.{table_name} 没有分区信息")
-                return []
-                
-            # 创建结构化的分区信息
-            partitions = []
-            for part in result:
-                # 确保使用实际的分区值，而不是列名
-                partition_info = {
-                    "name": part.get("PARTITION_NAME", ""),
-                    "position": part.get("PARTITION_ORDINAL_POSITION", ""),
-                    "method": part.get("PARTITION_METHOD", ""),
-                    "expression": part.get("PARTITION_EXPRESSION", ""),
-                    "description": part.get("PARTITION_DESCRIPTION", ""),
-                    "table_rows": part.get("TABLE_ROWS", ""),
-                    "create_time": part.get("CREATE_TIME", ""),
-                    "update_time": "", # 分区没有独立的更新时间字段
-                    "comment": part.get("PARTITION_COMMENT", "") or ""
-                }
-                partitions.append(partition_info)
-            
-            # 更新缓存
-            self.metadata_cache[cache_key] = partitions
-            self.metadata_cache_time[cache_key] = datetime.now()
-            
-            return partitions
-        except Exception as e:
-            logger.error(f"获取分区信息时出错: {str(e)}")
-            return []
-    
-    def get_complete_table_info(self, table_name: str, db_name: Optional[str] = None) -> Dict[str, Any]:
-        """
-        获取表的完整信息，包括表基本信息、列信息和分区信息
-        
-        Args:
-            table_name: 表名
-            db_name: 数据库名称，如果为None则使用初始化时指定的数据库
-            
-        Returns:
-            Dict[str, Any]: 表的完整信息
-        """
-        db_name = db_name or self.db_name
-        if not db_name:
-            logger.error("未指定数据库名称")
-            return {}
-        
-        cache_key = f"complete_info_{db_name}_{table_name}"
-        if cache_key in self.metadata_cache and (datetime.now() - self.metadata_cache_time.get(cache_key, datetime.min)).total_seconds() < self.cache_ttl:
-            return self.metadata_cache[cache_key]
-        
-        try:
-            # 获取表基本信息
-            schema = self.get_table_schema(table_name, db_name)
-            if not schema:
-                logger.warning(f"无法获取表 {db_name}.{table_name} 的模式信息")
-                return {}
-            
-            # 获取分区信息
-            partitions = self.get_table_partitions(table_name, db_name)
-            
-            # 获取表类型和引擎信息
-            table_type_query = f"""
-            SELECT 
-                TABLE_TYPE,
-                ENGINE 
-            FROM 
-                information_schema.tables 
-            WHERE 
-                TABLE_SCHEMA = '{db_name}' 
-                AND TABLE_NAME = '{table_name}'
-            """
-            table_type_result = execute_query(table_type_query)
-            
-            # 检查是否是视图
-            is_view = False
-            if table_type_result and table_type_result[0].get("TABLE_TYPE") == "VIEW":
-                is_view = True
-                view_query = f"""
-                SELECT VIEW_DEFINITION
-                FROM information_schema.views
-                WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{table_name}'
-                """
-                view_result = execute_query(view_query)
-                if view_result:
-                    schema['view_definition'] = view_result[0].get("VIEW_DEFINITION", "")
-            
-            # 添加表类型和引擎信息
-            if table_type_result:
-                schema['table_type'] = table_type_result[0].get("TABLE_TYPE", "")
-                schema['engine'] = table_type_result[0].get("ENGINE", "")
-            
-            # 组装完整信息
-            complete_info = {
-                **schema,
-                "partitions": partitions
-            }
-            
-            # 更新缓存
-            self.metadata_cache[cache_key] = complete_info
-            self.metadata_cache_time[cache_key] = datetime.now()
-            
-            return complete_info
-        except Exception as e:
-            logger.error(f"获取表完整信息时出错: {str(e)}")
-            return {}
-    
-    def get_database_metadata(self, db_name: Optional[str] = None) -> Dict[str, Any]:
-        """
-        获取数据库的完整元数据
-        
-        Args:
-            db_name: 数据库名称，如果为None则使用初始化时指定的数据库
-            
-        Returns:
-            Dict[str, Any]: 数据库元数据
-        """
-        db_name = db_name or self.db_name
-        if not db_name:
-            logger.error("未指定数据库名称")
-            return {}
-        
-        cache_key = f"db_metadata_{db_name}"
-        if cache_key in self.metadata_cache and (datetime.now() - self.metadata_cache_time.get(cache_key, datetime.min)).total_seconds() < self.cache_ttl:
-            return self.metadata_cache[cache_key]
-        
-        try:
-            # 获取数据库基本信息
-            db_query = f"""
-            SELECT SCHEMA_NAME, DEFAULT_CHARACTER_SET_NAME, 
-                   DEFAULT_COLLATION_NAME
-            FROM information_schema.SCHEMATA
-            WHERE SCHEMA_NAME = '{db_name}'
-            """
-            db_df = execute_query_df(db_query)
-            
-            if db_df.empty:
-                logger.warning(f"数据库 {db_name} 不存在")
-                return {}
-            
-            db_info = db_df.iloc[0].to_dict()
-            
-            # 获取所有表
-            tables = self.get_database_tables(db_name)
-            
-            # 获取表信息
-            table_info_list = []
-            for table_name in tables:
-                table_info = self.get_table_schema(table_name, db_name)
-                if table_info:
-                    # 获取分区信息（如果有）
-                    partitions = self.get_table_partitions(table_name, db_name)
-                    if partitions:
-                        table_info['partitions'] = partitions
-                    
-                    table_info_list.append(table_info)
-            
-            # 获取视图信息
-            view_query = f"""
-            SELECT TABLE_NAME, VIEW_DEFINITION
-            FROM information_schema.VIEWS
-            WHERE TABLE_SCHEMA = '{db_name}'
-            """
-            view_df = execute_query_df(view_query)
-            
-            views = []
-            if not view_df.empty:
-                for _, row in view_df.iterrows():
-                    view_info = {
-                        "name": row['TABLE_NAME'],
-                        "definition": row['VIEW_DEFINITION']
-                    }
-                    views.append(view_info)
-            
-            # 组装完整元数据
-            metadata = {
-                "database_name": db_name,
-                "character_set": db_info.get('DEFAULT_CHARACTER_SET_NAME', ''),
-                "collation": db_info.get('DEFAULT_COLLATION_NAME', ''),
-                "tables": table_info_list,
-                "views": views,
-                "table_count": len(table_info_list),
-                "view_count": len(views)
-            }
-            
-            # 更新缓存
-            self.metadata_cache[cache_key] = metadata
-            self.metadata_cache_time[cache_key] = datetime.now()
-            
-            return metadata
-        except Exception as e:
-            logger.error(f"获取数据库元数据时出错: {str(e)}")
-            return {}
-    
-    def _get_sql_type(self, sql: str) -> str:
-        """
-        获取SQL语句的类型
-        
-        Args:
-            sql: SQL语句
-            
-        Returns:
-            str: SQL类型
-        """
-        sql_upper = sql.upper().strip()
-        
-        # 定义可能的SQL类型
-        sql_types = ["SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "SHOW", "DESCRIBE", "EXPLAIN"]
-        
-        # 检查SQL类型
-        for sql_type in sql_types:
-            if sql_upper.startswith(sql_type):
-                return sql_type
-        
-        return "OTHER"
-
-    def refresh_metadata(self, db_name: Optional[str] = None, force: bool = False) -> bool:
-        """
-        增量刷新元数据，仅在必要时更新
-        
-        Args:
-            db_name: 数据库名称，如果为None则使用初始化时指定的数据库
-            force: 是否强制全量刷新
-            
-        Returns:
-            bool: 操作是否成功
-        """
-        db_name = db_name or self.db_name
-        if not db_name:
-            logger.error("未指定数据库名称")
-            return False
-        
-        # 使用统一的元数据库名称
-        metadata_db = "doris_metadata"
-        
-        try:
-            # 检查元数据表是否存在数据
-            check_query = f"SELECT COUNT(*) as count FROM `{metadata_db}`.`table_metadata` WHERE database_name = '{db_name}'"
-            try:
-                result = execute_query(check_query)
-                metadata_exists = result[0]['count'] > 0 if result else False
-            except Exception as e:
-                # 如果出错，可能是表不存在，自动进行全量刷新
-                logger.warning(f"检查元数据表时出错，将进行全量刷新: {str(e)}")
-                return self.save_metadata_to_database(db_name)
-            
-            # 若无数据或强制刷新，则全量刷新
-            if force or not metadata_exists:
-                logger.info(f"执行全量元数据刷新: force={force}, metadata_exists={metadata_exists}")
-                return self.save_metadata_to_database(db_name)
-            
-            # 获取当前所有表
-            current_tables = self.get_database_tables(db_name)
-            
-            # 获取元数据中的表
-            tables_query = f"SELECT table_name FROM `{metadata_db}`.`table_metadata` WHERE database_name = '{db_name}'"
-            stored_tables_result = execute_query(tables_query)
-            stored_tables = [t['table_name'] for t in stored_tables_result] if stored_tables_result else []
-            
-            # 新增的表
-            new_tables = [t for t in current_tables if t not in stored_tables]
-            if new_tables:
-                logger.info(f"发现 {len(new_tables)} 个新表需要添加元数据: {new_tables}")
-            
-            # 检查已存在表的更新时间
-            tables_to_update = []
-            for table in current_tables:
-                if table in new_tables:
-                    continue  # 新表会全部处理，不需要检查
-                
-                # 获取表结构的最后更新时间
-                try:
-                    table_info_query = f"""
-                    SELECT TABLE_NAME, UPDATE_TIME 
-                    FROM information_schema.tables 
-                    WHERE TABLE_SCHEMA = '{db_name}' AND TABLE_NAME = '{table}'
-                    """
-                    table_info = execute_query(table_info_query)
-                    if not table_info:
-                        continue
-                    
-                    db_update_time = table_info[0].get('UPDATE_TIME')
-                    if not db_update_time:
-                        continue
-                    
-                    # 获取元数据中的更新时间
-                    metadata_query = f"SELECT update_time FROM `{metadata_db}`.`table_metadata` WHERE database_name = '{db_name}' AND table_name = '{table}'"
-                    metadata_info = execute_query(metadata_query)
-                    if not metadata_info:
-                        tables_to_update.append(table)
-                        continue
-                    
-                    metadata_update_time = metadata_info[0].get('update_time')
-                    if not metadata_update_time:
-                        tables_to_update.append(table)
-                        continue
-                
-                    # 比较更新时间
-                    if isinstance(db_update_time, str):
-                        db_update_time = datetime.strptime(db_update_time, '%Y-%m-%d %H:%M:%S')
-                    if isinstance(metadata_update_time, str):
-                        metadata_update_time = datetime.strptime(metadata_update_time, '%Y-%m-%d %H:%M:%S')
-                    
-                    if db_update_time > metadata_update_time:
-                        tables_to_update.append(table)
-                except Exception as e:
-                    logger.warning(f"检查表 {table} 更新时间时出错: {str(e)}")
-                    # 如果检查出错，为安全起见添加到更新列表
-                    tables_to_update.append(table)
-            
-            if tables_to_update:
-                logger.info(f"发现 {len(tables_to_update)} 个表需要更新元数据: {tables_to_update}")
-            
-            # 执行增量更新
-            if new_tables or tables_to_update:
-                tables_to_process = new_tables + tables_to_update
-                # 更新元数据
-                self._update_selected_tables_metadata(db_name, tables_to_process)
-                logger.info(f"成功增量更新 {len(tables_to_process)} 个表的元数据")
+            if not db_exists:
+                logger.warning("元数据数据库不存在,将创建并执行全量刷新")
+                force = True
             else:
-                logger.info("所有表的元数据均为最新，无需刷新")
+                check_table_query = "SHOW TABLES FROM `doris_metadata` LIKE 'business_metadata'"
+                table_exists = execute_query(check_table_query)
+                
+                if not table_exists:
+                    logger.warning("元数据表不存在,将创建并执行全量刷新")
+                    force = True
             
-            # 更新SQL模式和业务元数据
-            self._update_sql_patterns_and_business_metadata(db_name)
+            overall_success = True
             
-            return True
+            # 遍历每个数据库,刷新元数据
+            for db_name in target_databases:
+                try:
+                    # 如果不是强制刷新,先检查是否已存在元数据
+                    if not force:
+                        # 检查是否已有元数据
+                        query = f"""
+                        SELECT COUNT(*) as count
+                        FROM {self.metadata_db}.business_metadata 
+                        WHERE db_name = '{db_name}' 
+                        AND table_name = '' 
+                        AND metadata_type = 'business_summary'
+                        """
+                        
+                        try:
+                            result = execute_query(query)
+                            if result and result[0]['count'] > 0:
+                                logger.info(f"数据库 {db_name} 已存在元数据,跳过刷新")
+                                continue
+                        except Exception as e:
+                            logger.warning(f"检查数据库 {db_name} 元数据时出错: {str(e)}")
+                            # 出错时继续刷新
+                    
+                    # 更新SQL模式和业务元数据
+                    logger.info(f"开始刷新数据库 {db_name} 的元数据")
+                    success = self._update_sql_patterns_and_business_metadata(db_name, force)
+                    
+                    if success:
+                        logger.info(f"成功刷新数据库 {db_name} 的元数据")
+                    else:
+                        logger.warning(f"刷新数据库 {db_name} 的元数据失败")
+                        overall_success = False
+                except Exception as e:
+                    logger.error(f"刷新数据库 {db_name} 的元数据时出错: {str(e)}")
+                    overall_success = False
+            
+            # 记录最后刷新时间
+            self.last_refresh_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            return overall_success
         except Exception as e:
-            logger.error(f"增量刷新元数据时出错: {str(e)}")
-            # 出错时默认尝试全量刷新
-            return self.save_metadata_to_database(db_name)
+            logger.error(f"刷新所有数据库元数据时出错: {str(e)}")
+            return False
     
-    def _update_selected_tables_metadata(self, db_name: str, tables: List[str]) -> bool:
-        """
-        更新指定表的元数据
-        
-        Args:
-            db_name: 数据库名称
-            tables: 要更新的表名列表
-            
-        Returns:
-            bool: 操作是否成功
-        """
-        if not tables:
-            return True
-        
-        metadata_db = "doris_metadata"
-        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        tables_updated = 0
-        
-        for table_name in tables:
-            logger.info(f"正在处理表: {db_name}.{table_name}")
-            
-            # 获取完整表信息
-            table_info = self.get_complete_table_info(table_name, db_name)
-            
-            # 确保获取到了表信息
-            if not table_info:
-                logger.warning(f"跳过表 {table_name} 的元数据保存，无法获取表结构")
-                continue
-            
-            try:
-                # 将表结构信息保存到数据库
-                # 从表信息中提取各字段值
-                columns_json = json.dumps(table_info.get("columns", []), ensure_ascii=False)
-                partitions_json = json.dumps(table_info.get("partitions", []), ensure_ascii=False)
-                
-                # 检查表是否已存在
-                check_query = f"SELECT COUNT(*) as count FROM `{metadata_db}`.`table_metadata` WHERE database_name = '{db_name}' AND table_name = '{table_name}'"
-                result = execute_query(check_query)
-                exists = result[0]['count'] > 0 if result else False
-                
-                if exists:
-                    # 更新现有记录
-                    table_update_query = f"""
-                    UPDATE `{metadata_db}`.`table_metadata`
-                    SET 
-                        `table_type` = '{table_info.get('table_type', '')}',
-                        `engine` = '{table_info.get('engine', '')}',
-                        `table_comment` = '{table_info.get('table_comment', '').replace("'", "''")}',
-                        `column_info` = '{columns_json.replace("'", "''")}',
-                        `partition_info` = '{partitions_json.replace("'", "''")}',
-                        `business_summary` = '{table_info.get('business_summary', '').replace("'", "''")}',
-                        `update_time` = '{current_time}'
-                    WHERE `database_name` = '{db_name}' AND `table_name` = '{table_name}'
-                    """
-                else:
-                    # 插入新记录
-                    table_insert_query = f"""
-                    INSERT INTO `{metadata_db}`.`table_metadata`
-                    (`database_name`, `table_name`, `table_type`, `engine`, `table_comment`, 
-                     `column_info`, `partition_info`, `business_summary`, `update_time`)
-                    VALUES (
-                        '{db_name}',
-                        '{table_name}',
-                        '{table_info.get('table_type', '')}',
-                        '{table_info.get('engine', '')}',
-                        '{table_info.get('table_comment', '').replace("'", "''")}',
-                        '{columns_json.replace("'", "''")}',
-                        '{partitions_json.replace("'", "''")}',
-                        '{table_info.get('business_summary', '').replace("'", "''")}',
-                        '{current_time}'
-                    )
-                    """
-                
-                # 执行SQL
-                execute_query(table_update_query if exists else table_insert_query)
-                tables_updated += 1
-                
-            except Exception as e:
-                logger.error(f"保存表 {table_name} 元数据时出错: {str(e)}")
-        
-        logger.info(f"成功更新 {tables_updated}/{len(tables)} 个表的元数据")
-        return tables_updated > 0
-
-    def _update_sql_patterns_and_business_metadata(self, db_name: str) -> bool:
+    def _update_sql_patterns_and_business_metadata(self, db_name: str, force: bool = False) -> bool:
         """
         更新SQL模式和业务元数据
         
         Args:
             db_name: 数据库名称
+            force: 是否强制执行全量刷新,默认为False(增量刷新)
             
         Returns:
-            bool: 操作是否成功
+            bool: 更新是否成功
         """
-        metadata_db = "doris_metadata"
-        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
         try:
-            # 更新SQL模式
-            patterns = self.extract_common_sql_patterns()
-            patterns_saved = 0
+            logger.info(f"开始更新数据库 {db_name} 的SQL模式和业务元数据")
             
-            # 先清空该数据库的现有模式
-            try:
-                execute_query(f"DELETE FROM `{metadata_db}`.`sql_patterns` WHERE database_name = '{db_name}'")
-            except Exception as e:
-                logger.warning(f"清空SQL模式表时出错: {str(e)}")
+            # 清除缓存（如果强制刷新）
+            if force:
+                for key in list(self.metadata_cache.keys()):
+                    if key.endswith(db_name):
+                        del self.metadata_cache[key]
+                        if key in self.metadata_cache_time:
+                            del self.metadata_cache_time[key]
+                logger.info(f"强制刷新：已清除数据库 {db_name} 的元数据缓存")
             
-            for sql_type, pattern_list in patterns.items():
-                for pattern in pattern_list:
-                    try:
-                        simplified_sql = pattern.get("simplified_sql", "").replace("'", "''")
-                        examples_json = json.dumps(pattern.get("examples", []), ensure_ascii=False).replace("'", "''")
-                        comments_json = json.dumps(pattern.get("comments", []), ensure_ascii=False).replace("'", "''")
-                        tables_json = json.dumps(pattern.get("tables", []), ensure_ascii=False).replace("'", "''")
-                        
-                        # 明确指定列名的插入语句
-                        pattern_insert_query = f"""
-                        INSERT INTO `{metadata_db}`.`sql_patterns`
-                        (`database_name`, `sql_type`, `simplified_sql`, `examples`, `comments`, 
-                         `frequency`, `tables`, `update_time`)
-                        VALUES (
-                            '{db_name}',
-                            '{sql_type}',
-                            '{simplified_sql}',
-                            '{examples_json}',
-                            '{comments_json}',
-                            {pattern.get('count', 0)},
-                            '{tables_json}',
-                            '{current_time}'
-                        )
-                        """
-                        execute_query(pattern_insert_query)
-                        patterns_saved += 1
-                    except Exception as e:
-                        logger.error(f"保存SQL模式时出错: {str(e)}")
+            # 获取业务元数据（这会触发从数据库获取或通过LLM生成）
+            business_metadata = self.summarize_business_metadata(db_name)
             
-            logger.info(f"成功保存 {patterns_saved}/{sum(len(patterns[t]) for t in patterns)} 个SQL模式")
-            
-            # 更新业务元数据
-            business_summary = self.summarize_business_metadata(db_name)
-            
-            # 获取表数量
-            tables_count = len(self.get_database_tables(db_name))
-            logger.info(f"为 {db_name} 总结业务元数据，发现 {tables_count} 个表")
-            
-            # 先清空该数据库的现有业务元数据
-            try:
-                execute_query(f"DELETE FROM `{metadata_db}`.`business_metadata` WHERE database_name = '{db_name}'")
-            except Exception as e:
-                logger.warning(f"清空业务元数据表时出错: {str(e)}")
-            
-            try:
-                # 将业务概要保存为JSON
-                tables_summary = business_summary.get("tables_summary", [])
-                
-                # 处理业务领域信息
-                business_domain = business_summary.get("business_domain", "")
-                core_entities = business_summary.get("core_entities", [])
-                business_processes = business_summary.get("business_processes", [])
-                
-                # 将业务概要保存为JSON
-                metadata_json = json.dumps({
-                    "tables_count": tables_count,
-                    "tables": self.get_database_tables(db_name),
-                    "summary": {
-                        "business_domain": business_domain,
-                        "core_entities": core_entities,
-                        "business_processes": business_processes
-                    },
-                    "tables_summary": tables_summary
-                }, ensure_ascii=False).replace("'", "''").replace('"', '\\"')
-                
-                # 保存业务概要
-                business_summary_query = f"""
-                INSERT INTO `{metadata_db}`.`business_metadata`
-                (`database_name`, `metadata_key`, `metadata_value`, `update_time`)
-                VALUES ('{db_name}', 'business_summary', "{metadata_json}", '{current_time}')
-                """
-                execute_query(business_summary_query)
-                
-                # 保存数据库统计信息
-                db_stats = {
-                    "tables_count": tables_count,
-                    "updated_at": current_time
-                }
-                db_stats_json = json.dumps(db_stats, ensure_ascii=False).replace("'", "''").replace('"', '\\"')
-                
-                # 使用明确的列名插入
-                db_stats_query = f"""
-                INSERT INTO `{metadata_db}`.`business_metadata` 
-                (`database_name`, `metadata_key`, `metadata_value`, `update_time`)
-                VALUES ('{db_name}', 'db_stats', "{db_stats_json}", '{current_time}')
-                """
-                execute_query(db_stats_query)
-                
-                logger.info(f"成功保存业务元数据")
-                return True
-            
-            except Exception as e:
-                logger.error(f"保存业务元数据时出错: {str(e)}")
+            # 检查业务元数据是否成功获取
+            if not business_metadata or not isinstance(business_metadata, dict):
+                logger.warning(f"获取数据库 {db_name} 的业务元数据失败")
                 return False
+            
+            # 获取表级别的摘要并单独保存每个表的元数据
+            tables_summary = business_metadata.get("tables_summary", {})
+            if isinstance(tables_summary, dict) and tables_summary:
+                logger.info(f"更新数据库 {db_name} 的表级别业务元数据,发现 {len(tables_summary)} 个表摘要")
+                for table_name, table_summary in tables_summary.items():
+                    try:
+                        # 构建表级别元数据
+                        table_metadata = {
+                            "summary": table_summary,
+                            "update_time": datetime.now().isoformat()
+                        }
+                        
+                        # 保存表级别元数据
+                        self._save_business_metadata(
+                            db_name, 
+                            table_name, 
+                            "table_summary", 
+                            json.dumps(table_metadata, ensure_ascii=False)
+                        )
+                        logger.info(f"已保存表 {db_name}.{table_name} 的业务元数据摘要")
+                    except Exception as e:
+                        logger.warning(f"保存表 {db_name}.{table_name} 的业务元数据时出错: {str(e)}")
+            
+            logger.info(f"成功更新数据库 {db_name} 的业务元数据")
+            
+            # 记录最后刷新时间
+            self.last_refresh_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            return True
         except Exception as e:
-            logger.error(f"更新SQL模式和业务元数据时出错: {str(e)}")
+            logger.error(f"更新数据库 {db_name} 的SQL模式和业务元数据时出错: {str(e)}")
             return False
     
-    def save_all_databases_metadata(self, exclude_dbs: List[str] = None) -> bool:
+    def _save_business_metadata(self, db_name: str, table_name: str, metadata_type: str, metadata_value: str) -> None:
         """
-        导出所有数据库的元数据到统一的元数据库
-        
-        Args:
-            exclude_dbs: 要排除的数据库列表，默认排除系统数据库
-            
-        Returns:
-            bool: 操作是否成功
-        """
-        # 默认排除的系统数据库
-        if exclude_dbs is None:
-            exclude_dbs = ['information_schema', 'mysql', '__internal_schema', 'doris_metadata']
-            
-        # 获取所有数据库
-        all_databases = self.get_all_databases()
-        
-        # 排除系统数据库和指定排除的数据库
-        databases_to_process = [db for db in all_databases if db not in exclude_dbs]
-        
-        logger.info(f"开始处理 {len(databases_to_process)} 个数据库的元数据：{databases_to_process}")
-        
-        # 跟踪成功处理的数据库数量
-        success_count = 0
-        
-        # 依次处理每个数据库
-        for db_name in databases_to_process:
-            logger.info(f"开始处理数据库 {db_name} 的元数据")
-            
-            try:
-                # 为该数据库保存元数据
-                if self.save_metadata_to_database(db_name):
-                    success_count += 1
-                    logger.info(f"数据库 {db_name} 的元数据保存成功")
-                else:
-                    logger.warning(f"数据库 {db_name} 的元数据保存失败")
-            except Exception as e:
-                logger.error(f"处理数据库 {db_name} 的元数据时出错: {str(e)}")
-        
-        # 生成整体统计信息
-        try:
-            metadata_db = "doris_metadata"
-            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            # 保存全局统计信息
-            global_stats = {
-                "total_databases": len(databases_to_process),
-                "processed_databases": success_count,
-                "database_list": databases_to_process,
-                "updated_at": current_time
-            }
-            global_stats_json = json.dumps(global_stats, ensure_ascii=False).replace("'", "''")
-            
-            # 保存到特殊的全局记录
-            global_stats_query = f"""
-            INSERT INTO `{metadata_db}`.`business_metadata`
-            (`database_name`, `metadata_key`, `metadata_value`, `update_time`)
-            VALUES ('global', 'databases_stats', '{global_stats_json}', '{current_time}')
-            """
-            execute_query(global_stats_query)
-            
-            logger.info(f"全局元数据统计信息保存成功，总共 {len(databases_to_process)} 个数据库，成功处理 {success_count} 个")
-        except Exception as e:
-            logger.error(f"保存全局元数据统计信息时出错: {str(e)}")
-        
-        return success_count == len(databases_to_process)
-
-    def refresh_all_databases_metadata(self, exclude_dbs: List[str] = None, force: bool = False) -> bool:
-        """
-        增量刷新所有数据库的元数据
-        
-        Args:
-            exclude_dbs: 要排除的数据库列表，默认排除系统数据库
-            force: 是否强制全量刷新
-            
-        Returns:
-            bool: 操作是否成功
-        """
-        # 默认排除的系统数据库
-        if exclude_dbs is None:
-            exclude_dbs = ['information_schema', 'mysql', 'performance_schema', 'sys', 'doris_metadata']
-            
-        # 获取所有数据库
-        all_databases = self.get_all_databases()
-        
-        # 排除系统数据库和指定排除的数据库
-        databases_to_process = [db for db in all_databases if db not in exclude_dbs]
-        
-        logger.info(f"开始增量刷新 {len(databases_to_process)} 个数据库的元数据：{databases_to_process}")
-        
-        # 跟踪成功处理的数据库数量
-        success_count = 0
-        
-        # 依次处理每个数据库
-        for db_name in databases_to_process:
-            logger.info(f"开始增量刷新数据库 {db_name} 的元数据")
-            
-            try:
-                # 为该数据库增量刷新元数据
-                if self.refresh_metadata(db_name, force):
-                    success_count += 1
-                    logger.info(f"数据库 {db_name} 的元数据增量刷新成功")
-                else:
-                    logger.warning(f"数据库 {db_name} 的元数据增量刷新失败")
-            except Exception as e:
-                logger.error(f"增量刷新数据库 {db_name} 的元数据时出错: {str(e)}")
-        
-        # 更新整体统计信息
-        try:
-            metadata_db = "doris_metadata"
-            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            # 保存全局统计信息
-            global_stats = {
-                "total_databases": len(databases_to_process),
-                "processed_databases": success_count,
-                "database_list": databases_to_process,
-                "updated_at": current_time
-            }
-            global_stats_json = json.dumps(global_stats, ensure_ascii=False).replace("'", "''")
-            
-            # 更新全局记录
-            try:
-                # 检查是否存在全局记录
-                check_query = f"SELECT COUNT(*) as count FROM `{metadata_db}`.`business_metadata` WHERE database_name = 'global' AND metadata_key = 'databases_stats'"
-                result = execute_query(check_query)
-                exists = result[0]['count'] > 0 if result else False
-                
-                if exists:
-                    # 更新现有记录
-                    global_stats_query = f"""
-                    UPDATE `{metadata_db}`.`business_metadata`
-                    SET `metadata_value` = '{global_stats_json}', `update_time` = '{current_time}'
-                    WHERE `database_name` = 'global' AND `metadata_key` = 'databases_stats'
-                    """
-                else:
-                    # 插入新记录
-                    global_stats_query = f"""
-                    INSERT INTO `{metadata_db}`.`business_metadata`
-                    (`database_name`, `metadata_key`, `metadata_value`, `update_time`)
-                    VALUES ('global', 'databases_stats', '{global_stats_json}', '{current_time}')
-                    """
-                execute_query(global_stats_query)
-            except Exception as e:
-                logger.error(f"更新全局元数据统计记录时出错: {str(e)}")
-                # 尝试使用插入语句
-                try:
-                    global_stats_query = f"""
-                    INSERT INTO `{metadata_db}`.`business_metadata`
-                    (`database_name`, `metadata_key`, `metadata_value`, `update_time`)
-                    VALUES ('global', 'databases_stats', '{global_stats_json}', '{current_time}')
-                    """
-                    execute_query(global_stats_query)
-                except Exception as e2:
-                    logger.error(f"插入全局元数据统计记录时出错: {str(e2)}")
-            
-            logger.info(f"全局元数据统计信息更新成功，总共 {len(databases_to_process)} 个数据库，成功处理 {success_count} 个")
-        except Exception as e:
-            logger.error(f"更新全局元数据统计信息时出错: {str(e)}")
-        
-        return success_count == len(databases_to_process) 
-
-    def _handle_multiline_json(self, content: str) -> Dict[str, Any]:
-        """
-        处理可能包含多行JSON的内容，尝试提取第一个有效的JSON对象
-        保留原始响应完整性，采用提取而非删除的策略
-        
-        Args:
-            content: 可能包含JSON的内容
-            
-        Returns:
-            Dict[str, Any]: 解析后的JSON数据，如果解析失败则返回空字典
-        """
-        if not content or not content.strip():
-            logging.warning("传入的内容为空或只有空白")
-            return {}
-        
-        # 1. 优先从```json代码块中提取内容
-        json_block_start = content.find('```json')
-        json_block_end = content.find('```', json_block_start + 6) if json_block_start >= 0 else -1
-        
-        if json_block_start >= 0 and json_block_end > json_block_start:
-            # 提取```json和```之间的内容
-            json_content = content[json_block_start + 7:json_block_end].strip()
-            logging.debug("从Markdown代码块中提取JSON内容")
-            try:
-                result = json.loads(json_content)
-                logging.debug(f"成功解析Markdown代码块中的JSON: {result}")
-                return result
-            except json.JSONDecodeError as e:
-                logging.debug(f"解析Markdown代码块中的JSON失败: {str(e)}")
-        
-        # 2. 检查是否有<think>标签，如果有，尝试提取标签外的JSON
-        think_start = content.find('<think>')
-        think_end = content.find('</think>', think_start) if think_start >= 0 else -1
-        
-        if think_start >= 0:
-            # 如果找到了开始标签但没有结束标签
-            if think_end == -1:
-                logging.warning("找到<think>标签但没有找到对应的</think>标签")
-                # 尝试从<think>后面提取JSON
-                post_think_text = content[think_start + 7:].strip()
-                result = self._extract_json_from_text(post_think_text)
-                if result:
-                    logging.debug(f"成功从未闭合<think>标签后提取JSON: {result}")
-                    return result
-            else:
-                # 尝试在</think>标签后查找JSON
-                post_think_text = content[think_end + 8:].strip()
-                if post_think_text:
-                    # 尝试解析</think>后的内容
-                    result = self._extract_json_from_text(post_think_text)
-                    if result:
-                        logging.debug(f"成功从</think>标签后提取JSON: {result}")
-                        return result
-                    
-                # 如果</think>后没有内容或解析失败，检查<think>标签内的内容
-                think_text = content[think_start + 7:think_end].strip()
-                if think_text:
-                    # 检查标签内的内容是否有JSON
-                    result = self._extract_json_from_text(think_text)
-                    if result:
-                        logging.debug(f"成功从<think>标签内部提取JSON: {result}")
-                        return result
-        
-        # 3. 如果以上方法都失败，尝试从完整内容中提取JSON
-        return self._extract_json_from_text(content)
-    
-    def _extract_json_from_text(self, text: str) -> Dict[str, Any]:
-        """
-        从文本中提取JSON对象
-        
-        Args:
-            text: 可能包含JSON的文本
-            
-        Returns:
-            Dict[str, Any]: 解析后的JSON数据
-        """
-        # 尝试解析第一行
-        try:
-            lines = text.strip().split('\n')
-            first_line = lines[0].strip()
-            if first_line and (first_line.startswith('{') and first_line.endswith('}')):
-                result = json.loads(first_line)
-                logging.debug(f"成功解析第一行JSON: {result}")
-                return result
-        except (json.JSONDecodeError, IndexError) as e:
-            logging.debug(f"解析第一行JSON失败: {str(e)}")
-        
-        # 逐行尝试解析
-        for line in text.strip().split('\n'):
-            line = line.strip()
-            if not line:
-                continue
-            
-            if line.startswith('{') and line.endswith('}'):
-                try:
-                    result = json.loads(line)
-                    logging.debug(f"在多行内容中找到有效JSON: {result}")
-                    return result
-                except json.JSONDecodeError:
-                    pass
-        
-        # 尝试解析整个内容
-        try:
-            result = json.loads(text)
-            logging.debug(f"成功解析整个内容为JSON: {result}")
-            return result
-        except json.JSONDecodeError as e:
-            logging.debug(f"解析整个内容为JSON失败: {str(e)}")
-        
-        # 尝试提取完整的JSON对象
-        try:
-            # 找到第一个左大括号和最后一个右大括号
-            start_idx = text.find('{')
-            if start_idx >= 0:
-                # 计算嵌套层级，确保找到匹配的右大括号
-                level = 0
-                end_idx = -1
-                for i in range(start_idx, len(text)):
-                    if text[i] == '{':
-                        level += 1
-                    elif text[i] == '}':
-                        level -= 1
-                        if level == 0:
-                            end_idx = i
-                            break
-                
-                if end_idx > start_idx:
-                    json_str = text[start_idx:end_idx+1]
-                    try:
-                        result = json.loads(json_str)
-                        logging.debug(f"提取并解析了完整JSON对象: {result}")
-                        return result
-                    except json.JSONDecodeError as e:
-                        logging.debug(f"解析提取的JSON对象失败: {str(e)}")
-        except Exception as e:
-            logging.debug(f"提取JSON对象时出错: {str(e)}")
-        
-        logging.warning(f"无法从内容中提取有效的JSON: {text[:100]}...")
-        return {}
-
-    def get_business_metadata_from_database(self, db_name: Optional[str] = None) -> Dict[str, Any]:
-        """
-        从元数据库中获取业务元数据信息
-        
-        Args:
-            db_name: 数据库名称，如果为None则使用初始化时指定的数据库
-            
-        Returns:
-            Dict[str, Any]: 业务元数据信息，如果不存在则返回空字典
-        """
-        db_name = db_name or self.db_name
-        if not db_name:
-            logger.error("未指定数据库名称")
-            return {}
-        
-        # 使用统一的元数据库名称
-        metadata_db = "doris_metadata"
-        
-        try:
-            # 查询业务元数据
-            query = f"""
-            SELECT metadata_value, update_time 
-            FROM `{metadata_db}`.`business_metadata` 
-            WHERE database_name = '{db_name}' AND metadata_key = 'business_summary'
-            """
-            
-            result = execute_query(query)
-            
-            if not result or len(result) == 0:
-                logger.info(f"数据库 {db_name} 的业务元数据不存在")
-                return {}
-            
-            # 解析JSON数据
-            metadata_value = result[0].get('metadata_value', '{}')
-            update_time = result[0].get('update_time')
-            
-            try:
-                # 先解析metadata_value为JSON对象
-                metadata_json = json.loads(metadata_value)
-                logger.info(f"成功从元数据库获取数据库 {db_name} 的业务元数据，更新时间: {update_time}")
-                
-                # 从metadata_json直接获取summary字段，它现在应该是一个嵌套的JSON对象
-                summary_obj = metadata_json.get('summary', {})
-                
-                # 如果summary_obj是空字典，说明元数据库中没有有效的业务概览信息
-                if not summary_obj or not isinstance(summary_obj, dict):
-                    logger.info(f"元数据库中的业务概览信息为空或格式不正确，需要重新生成")
-                    return {}
-                
-                # 检查summary_obj是否包含必要的字段
-                # 例如business_domain，core_entities等
-                if not ('business_domain' in summary_obj or 
-                      'core_entities' in summary_obj or 
-                      'business_processes' in summary_obj):
-                    logger.info(f"元数据库中的业务概览信息格式不包含必要字段，需要重新生成")
-                    return {}
-                
-                return summary_obj
-                
-            except json.JSONDecodeError as e:
-                logger.error(f"解析业务元数据JSON时出错: {str(e)}")
-                return {}
-                
-        except Exception as e:
-            logger.error(f"从元数据库获取业务元数据时出错: {str(e)}")
-            return {}
-
-    # 在get_business_metadata_from_database方法后面添加
-    def _save_business_metadata(self, db_name: str, metadata_key: str, metadata_value: str) -> bool:
-        """
-        将业务元数据保存到元数据库
+        保存业务元数据到元数据表
         
         Args:
             db_name: 数据库名称
-            metadata_key: 元数据键
-            metadata_value: 元数据值（JSON字符串）
-            
-        Returns:
-            bool: 保存是否成功
+            table_name: 表名
+            metadata_type: 元数据类型
+            metadata_value: 元数据值
         """
-        # 使用统一的元数据库名称
-        metadata_db = "doris_metadata"
-        
         try:
-            # 确保元数据库存在
-            create_db_query = f"CREATE DATABASE IF NOT EXISTS `{metadata_db}`"
-            execute_query(create_db_query)
+            # 首先检查doris_metadata数据库是否存在,如果不存在则创建
+            check_db_query = "SHOW DATABASES LIKE 'doris_metadata'"
+            db_exists = execute_query(check_db_query)
             
-            # 确保元数据表存在
-            create_table_query = f"""
-            CREATE TABLE IF NOT EXISTS `{metadata_db}`.`business_metadata` (
-                `database_name` VARCHAR(100) COMMENT '数据库名称',
-                `metadata_key` VARCHAR(100) COMMENT '元数据键',
-                `metadata_value` TEXT COMMENT '元数据值（JSON格式）',
-                `create_time` DATETIME COMMENT '创建时间',
-                `update_time` DATETIME COMMENT '更新时间'
-            ) ENGINE=OLAP
-            UNIQUE KEY(`database_name`, `metadata_key`)
-            COMMENT '业务元数据表'
-            DISTRIBUTED BY HASH(`database_name`) BUCKETS 3
-            PROPERTIES (
-                "replication_allocation" = "tag.location.default: 1"
-            )
-            """
-            execute_query(create_table_query)
+            if not db_exists:
+                create_db_query = "CREATE DATABASE IF NOT EXISTS `doris_metadata`"
+                execute_query(create_db_query)
+                logger.info("已创建元数据库 doris_metadata")
             
-            # 检查元数据是否已存在
-            check_query = f"""
-            SELECT COUNT(*) as cnt FROM `{metadata_db}`.`business_metadata`
-            WHERE database_name = '{db_name}' AND metadata_key = '{metadata_key}'
-            """
-            result = execute_query(check_query)
-            exists = result[0]['cnt'] > 0 if result else False
+            # 检查business_metadata表是否存在,检查表结构
+            check_table_query = "SHOW TABLES FROM `doris_metadata` LIKE 'business_metadata'"
+            table_exists = execute_query(check_table_query)
             
-            if exists:
-                # 更新现有元数据
-                update_query = f"""
-                UPDATE `{metadata_db}`.`business_metadata` SET
-                    metadata_value = '{metadata_value.replace("'", "''")}',
-                    update_time = NOW()
-                WHERE database_name = '{db_name}' AND metadata_key = '{metadata_key}'
+            old_table_backup = False
+            
+            # 如果表存在,检查列结构是否正确
+            if table_exists:
+                # 检查表结构
+                desc_query = "DESC `doris_metadata`.`business_metadata`"
+                table_structure = execute_query(desc_query)
+                
+                # 检查是否包含db_name列和business_keywords列
+                column_names = [col.get('Field', '') for col in table_structure]
+                
+                # 如果表结构不正确但存在旧数据,先备份旧数据
+                if ('db_name' in column_names) and ('business_keywords' not in column_names):
+                    logger.info("检测到旧版元数据表结构,准备备份数据并升级表结构")
+                    # 检查是否有数据需要备份
+                    count_query = "SELECT COUNT(*) as count FROM `doris_metadata`.`business_metadata`"
+                    count_result = execute_query(count_query)
+                    
+                    if count_result and count_result[0]['count'] > 0:
+                        # 备份旧数据
+                        backup_query = "SELECT * FROM `doris_metadata`.`business_metadata`"
+                        old_data = execute_query(backup_query)
+                        old_table_backup = True
+                        logger.info(f"成功备份 {len(old_data)} 条旧元数据记录")
+                
+                # 如果表结构不正确,删除表并重新创建
+                if 'db_name' not in column_names or 'business_keywords' not in column_names:
+                    logger.warning("表business_metadata结构不正确,将重新创建")
+                    drop_query = "DROP TABLE IF EXISTS `doris_metadata`.`business_metadata`"
+                    execute_query(drop_query)
+                    table_exists = False
+                    
+            # 如果表不存在,创建表
+            if not table_exists:
+                create_table_query = """
+                CREATE TABLE IF NOT EXISTS `doris_metadata`.`business_metadata` (
+                    `db_name` VARCHAR(100) NOT NULL COMMENT '数据库名',
+                    `table_name` VARCHAR(100) COMMENT '表名',
+                    `metadata_type` VARCHAR(50) NOT NULL COMMENT '元数据类型',
+                    `metadata_value` TEXT COMMENT '元数据内容',
+                    `business_keywords` TEXT COMMENT '业务关键词',
+                    `update_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '更新时间'
+                )
+                ENGINE=OLAP
+                UNIQUE KEY(`db_name`, `table_name`, `metadata_type`)
+                COMMENT '业务元数据表'
+                DISTRIBUTED BY HASH(`db_name`) BUCKETS 1
+                PROPERTIES (
+                    "replication_num" = "1"
+                );
                 """
-                execute_query(update_query)
-                logger.info(f"已更新数据库 {db_name} 的业务元数据，键: {metadata_key}")
-            else:
-                # 插入新元数据
-                insert_query = f"""
-                INSERT INTO `{metadata_db}`.`business_metadata`
-                (database_name, metadata_key, metadata_value, create_time, update_time)
-                VALUES
-                ('{db_name}', '{metadata_key}', '{metadata_value.replace("'", "''")}', NOW(), NOW())
-                """
-                execute_query(insert_query)
-                logger.info(f"已保存数据库 {db_name} 的业务元数据，键: {metadata_key}")
+                execute_query(create_table_query, "doris_metadata")
+                logger.info("已创建business_metadata表")
+                
+                # 恢复备份的数据
+                if old_table_backup and locals().get('old_data'):
+                    logger.info("开始恢复备份的元数据...")
+                    count = 0
+                    for record in old_data:
+                        try:
+                            # 转义元数据值中的单引号
+                            safe_metadata_value = record['metadata_value'].replace("'", "''") if record.get('metadata_value') else ''
+                            
+                            # 构建插入语句,包括新的business_keywords列（设为NULL）
+                            restore_query = f"""
+                            INSERT INTO `doris_metadata`.`business_metadata` 
+                            (`db_name`, `table_name`, `metadata_type`, `metadata_value`, `business_keywords`, `update_time`)
+                            VALUES
+                            ('{record.get('db_name', '')}', '{record.get('table_name', '')}', 
+                             '{record.get('metadata_type', '')}', '{safe_metadata_value}', 
+                             NULL, '{record.get('update_time', 'NOW()')}')
+                            """
+                            execute_query(restore_query, "doris_metadata")
+                            count += 1
+                        except Exception as e:
+                            logger.error(f"恢复元数据记录时出错: {str(e)}")
+                    
+                    logger.info(f"成功恢复 {count} 条备份的元数据记录")
             
-            return True
+            # 转义元数据值中的单引号,防止SQL注入
+            safe_metadata_value = metadata_value.replace("'", "''")
+            
+            # 根据metadata_type设置business_keywords值
+            business_keywords_value = "NULL"
+            if metadata_type == "business_keywords":
+                business_keywords_value = f"'{safe_metadata_value}'"
+                
+            # 插入或更新元数据,包含business_keywords列
+            upsert_query = f"""
+            INSERT INTO `doris_metadata`.`business_metadata` 
+            (`db_name`, `table_name`, `metadata_type`, `metadata_value`, `business_keywords`, `update_time`)
+            VALUES
+            ('{db_name}', '{table_name}', '{metadata_type}', '{safe_metadata_value}', {business_keywords_value}, NOW())
+            """
+            execute_query(upsert_query, "doris_metadata")
+            
+            logger.info(f"已保存数据库 {db_name} 表 {table_name} 的 {metadata_type} 元数据")
         except Exception as e:
             logger.error(f"保存业务元数据时出错: {str(e)}")
-            return False
-
-    # 在_save_business_metadata方法后面添加
-    def get_business_keywords_from_database(self, db_name: Optional[str] = None) -> Dict[str, float]:
+            # 不要抛出异常,以避免影响主流程
+    
+    def get_business_metadata_from_database(self, db_name: Optional[str] = None) -> Dict[str, Any]:
         """
-        从元数据库获取业务关键词及其置信度
-
+        从数据库获取业务元数据
+        
         Args:
-            db_name: 数据库名称，如果为None则使用初始化时指定的数据库
-
+            db_name: 数据库名称,默认为当前数据库
+            
         Returns:
-            Dict[str, float]: 业务关键词及其置信度，如果不存在则返回空字典
+            Dict: 业务元数据
         """
-        db_name = db_name or self.db_name
+        # 如果没有指定数据库名,使用当前数据库
+        if db_name is None:
+            db_name = self.db_name
+            
+        # 如果仍然没有数据库名,返回空结果
         if not db_name:
-            logger.error("未指定数据库名称")
+            logger.warning("未指定数据库名,无法获取业务元数据")
+            return {}
+            
+        try:
+            # 从缓存中获取
+            cache_key = f"business_metadata_{db_name}"
+            if cache_key in self.metadata_cache and (datetime.now() - self.metadata_cache_time.get(cache_key, datetime.min)).total_seconds() < self.cache_ttl:
+                logger.info(f"从缓存中获取数据库 {db_name} 的业务元数据")
+                return self.metadata_cache[cache_key]
+            
+            # 确保元数据表存在
+            check_db_query = "SHOW DATABASES LIKE 'doris_metadata'"
+            db_exists = execute_query(check_db_query)
+            
+            if not db_exists:
+                logger.warning("元数据数据库不存在,无法获取业务元数据")
+                return {}
+                
+            check_table_query = "SHOW TABLES FROM `doris_metadata` LIKE 'business_metadata'"
+            table_exists = execute_query(check_table_query)
+            
+            if not table_exists:
+                logger.warning("元数据表不存在,无法获取业务元数据")
+                return {}
+            
+            # 直接从数据库获取已保存的业务元数据
+            query = f"""
+            SELECT metadata_value 
+            FROM {self.metadata_db}.business_metadata 
+            WHERE db_name = '{db_name}' 
+            AND table_name = '' 
+            AND metadata_type = 'business_summary'
+            LIMIT 1
+            """
+            
+            logger.info(f"执行业务元数据查询: {query}")
+            
+            try:
+                result = execute_query(query)
+                logger.info(f"元数据查询结果: {result}")
+                
+                if result and len(result) > 0 and 'metadata_value' in result[0]:
+                    try:
+                        metadata_value = result[0]['metadata_value']
+                        logger.info(f"解析业务元数据JSON: {metadata_value[:100]}...")
+                        
+                        db_metadata = json.loads(metadata_value)
+                        if isinstance(db_metadata, dict) and len(db_metadata) > 0:
+                            logger.info(f"成功从元数据库获取 {db_name} 的业务元数据")
+                            
+                            # 更新缓存
+                            self.metadata_cache[cache_key] = db_metadata
+                            self.metadata_cache_time[cache_key] = datetime.now()
+                            
+                            return db_metadata
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"解析元数据JSON时出错: {str(e)}, 原始数据: {metadata_value[:100]}...")
+                else:
+                    # 尝试执行更详细的调试
+                    debug_query = f"SELECT COUNT(*) as count FROM {self.metadata_db}.business_metadata"
+                    debug_result = execute_query(debug_query)
+                    logger.info(f"元数据表总记录数: {debug_result}")
+                    
+                    # 检查是否有特定db_name的记录
+                    db_debug_query = f"SELECT COUNT(*) as count FROM {self.metadata_db}.business_metadata WHERE db_name = '{db_name}'"
+                    db_debug_result = execute_query(db_debug_query)
+                    logger.info(f"数据库 {db_name} 的元数据记录数: {db_debug_result}")
+                
+                logger.info(f"元数据库中没有找到 {db_name} 的业务元数据摘要,将通过LLM生成")
+            except Exception as e:
+                logger.warning(f"查询元数据时出错: {str(e)},将通过LLM生成新的元数据")
+            
+            # 获取数据库所有表
+            tables = self.get_database_tables(db_name)
+            logger.info(f"为 {db_name} 总结业务元数据,发现 {len(tables)} 个表")
+            
+            # 收集所有表的元数据
+            tables_metadata = []
+            for table_name in tables:
+                schema = self.get_table_schema(table_name, db_name)
+                if schema:  # 只添加成功获取的表结构
+                    tables_metadata.append(schema)
+            
+            # 提取SQL模式
+            sql_patterns = self.extract_common_sql_patterns(limit=50)
+            
+            # 准备表结构信息文本
+            tables_info = ""
+            for table_meta in tables_metadata:
+                table_name = table_meta.get("name", "")
+                table_comment = table_meta.get("comment", "")
+                columns = table_meta.get("columns", [])
+                
+                tables_info += f"- 表名: {table_name} (注释: {table_comment})\n"
+                tables_info += "  列:\n"
+                for column in columns:
+                    name = column.get("name", "")
+                    type = column.get("type", "")
+                    comment = column.get("comment", "")
+                    tables_info += f"    - {name} ({type}) - {comment}\n"
+                tables_info += "\n"
+            
+            # 准备SQL模式信息文本
+            sql_patterns_text = ""
+            if isinstance(sql_patterns, list):
+                for pattern in sql_patterns[:5]:  # 最多展示5个模式
+                    sql_type = pattern.get("type", "未知")
+                    pattern_text = pattern.get("pattern", "")
+                    frequency = pattern.get("frequency", 0)
+                    sql_patterns_text += f"- {sql_type}查询 (频率: {frequency}):\n  {pattern_text}\n\n"
+            
+            # 使用提示词模板
+            system_prompt = BUSINESS_METADATA_PROMPTS["system"]
+            user_prompt = BUSINESS_METADATA_PROMPTS["user"].format(
+                db_name=db_name,
+                tables_info=tables_info,
+                sql_patterns=sql_patterns_text
+            )
+            
+            # 创建日志目录
+            from pathlib import Path
+            project_root = Path(__file__).parents[3]
+            log_dir = project_root / "log" / "llm_calls"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 记录LLM请求
+            llm_request_log = {
+                "function": "summarize_business_metadata",
+                "db_name": db_name,
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            # 保存请求日志
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            request_log_path = log_dir / f"{timestamp}_business_metadata_request.json"
+            with open(request_log_path, 'w', encoding='utf-8') as f:
+                json.dump(llm_request_log, f, ensure_ascii=False, indent=2)
+            
+            logger.info("调用LLM生成业务元数据摘要")
+            logger.info(f"LLM请求日志保存到: {request_log_path}")
+            
+            # 调用LLM
+            try:
+                from src.utils.llm_client import get_llm_client, Message
+                
+                client = get_llm_client(stage="metadata")
+                
+                # 如果LLM客户端为None（可能是程序正在退出）,返回默认值
+                if client is None:
+                    logger.warning("无法获取LLM客户端,可能是程序正在退出")
+                    return {}
+                
+                response = client.chat([
+                    Message.system(system_prompt),
+                    Message.user(user_prompt)
+                ])
+                
+                if not response or not response.content:
+                    logger.warning("LLM响应为空")
+                    return {}
+                
+                # 解析LLM回复获取业务元数据
+                try:
+                    result = self._extract_json_from_llm_response(response.content)
+                except Exception as e:
+                    logger.error(f"解析LLM响应提取JSON时出错: {str(e)}")
+                    return {}
+                
+                # 检查解析结果
+                if not result or result.get("extraction_failed", False):
+                    logger.warning(f"从LLM响应中提取JSON失败: {response.content[:200]}...")
+                    return {}
+                
+                # 确保必要字段存在
+                if not isinstance(result, dict):
+                    logger.warning("LLM返回的不是有效的字典对象")
+                    return {}
+                
+                if "business_summary" not in result:
+                    result["business_summary"] = f"数据库 {db_name} 的业务功能"
+                
+                if "tables_summary" not in result:
+                    result["tables_summary"] = {}
+                
+                if "table_relationships" not in result:
+                    result["table_relationships"] = {}
+                
+                if "business_keywords" not in result:
+                    result["business_keywords"] = {}
+                
+                # 将业务元数据保存到元数据库
+                try:
+                    business_summary_json = json.dumps(result, ensure_ascii=False)
+                    logger.info(f"保存生成的业务元数据摘要: {business_summary_json[:100]}...")
+                    self._save_business_metadata(db_name, "", "business_summary", business_summary_json)
+                    logger.info("成功保存业务元数据摘要")
+                except Exception as e:
+                    logger.warning(f"保存业务元数据时出错: {str(e)}")
+                
+                # 更新缓存
+                self.metadata_cache[cache_key] = result
+                self.metadata_cache_time[cache_key] = datetime.now()
+                
+                return result
+            except Exception as e:
+                logger.error(f"调用LLM生成业务元数据摘要时出错: {str(e)}")
+                return {}
+                
+        except Exception as e:
+            logger.error(f"获取数据库 {db_name} 的业务元数据时出错: {str(e)}")
             return {}
 
-        # 使用统一的元数据库名称
-        metadata_db = "doris_metadata"
-
+    def get_business_keywords_from_database(self, db_name=None):
+        """从元数据库中获取业务关键词
+        
+        Args:
+            db_name: 可选的数据库名称,如果提供则只返回该数据库的关键词
+            
+        Returns:
+            Dict: 业务关键词字典，格式为 {keyword: confidence}
+        """
         try:
-            # 确保元数据库和关键词表存在
-            self._ensure_business_keywords_table_exists()
-
-            # 查询业务关键词
-            query = f"""
-            SELECT keyword, confidence, category 
-            FROM `{metadata_db}`.`business_keywords` 
-            WHERE database_name = '{db_name}' OR database_name = 'global'
+            where_clause = f"WHERE db_name = '{db_name}'" if db_name else ""
+            sql = f"""
+            SELECT DISTINCT business_keywords 
+            FROM {self.metadata_db}.business_metadata 
+            {where_clause}
             """
-
-            result = execute_query(query)
-
-            if not result or len(result) == 0:
-                logger.info(f"数据库 {db_name} 的业务关键词不存在")
-                return {}
-
-            # 构建关键词字典
+            result = execute_query(sql)
+            
+            # 返回格式为字典 {keyword: confidence}
             keywords_dict = {}
-            for item in result:
-                keyword = item.get('keyword', '')
-                confidence = item.get('confidence', 1.0)
-                if keyword:
-                    keywords_dict[keyword] = float(confidence)
-
+            
+            for row in result:
+                if row and 'business_keywords' in row and row['business_keywords']:
+                    try:
+                        keywords = json.loads(row['business_keywords'])
+                        if isinstance(keywords, list):
+                            # 处理关键词列表格式
+                            for item in keywords:
+                                if isinstance(item, dict) and 'keyword' in item and 'confidence' in item:
+                                    # 新格式: [{keyword: xxx, confidence: yyy}, ...]
+                                    keywords_dict[item['keyword']] = item['confidence']
+                                elif isinstance(item, str):
+                                    # 旧格式: [keyword1, keyword2, ...]
+                                    keywords_dict[item] = 0.7  # 默认置信度
+                        elif isinstance(keywords, dict):
+                            # 如果直接是字典格式 {keyword1: confidence1, ...}
+                            keywords_dict.update(keywords)
+                    except Exception as e:
+                        logger.warning(f"解析业务关键词JSON出错: {str(e)}")
+                        
+            if not keywords_dict:
+                # 如果没有找到关键词，返回空字典而不是空列表
+                logger.info(f"数据库 {db_name} 未找到业务关键词")
+                return {}
+                
             return keywords_dict
         except Exception as e:
-            logger.error(f"获取业务关键词时出错: {str(e)}")
+            logger.error(f"从元数据库获取业务关键词出错: {str(e)}")
             return {}
 
-    def save_business_keywords(self, db_name: str, keywords: List[Dict[str, Any]]) -> bool:
-        """
-        保存业务关键词到元数据库
-
+    def save_business_keywords(self, db_name: str, keywords: List[str]) -> bool:
+        """保存业务关键词到元数据数据库
+        
         Args:
             db_name: 数据库名称
-            keywords: 关键词列表，每项包含keyword, confidence, category, source等字段
-
+            keywords: 业务关键词列表
+            
         Returns:
-            bool: 保存是否成功
+            bool: 保存成功返回True,否则返回False
         """
-        if not db_name:
-            logger.error("未指定数据库名称")
-            return False
-
-        # 使用统一的元数据库名称
-        metadata_db = "doris_metadata"
-
         try:
-            # 确保元数据库和关键词表存在
-            self._ensure_business_keywords_table_exists()
-
-            # 当前时间
-            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-            # 批量插入所有关键词
-            for keyword_item in keywords:
-                keyword = keyword_item.get('keyword', '')
-                confidence = keyword_item.get('confidence', 1.0)
-                category = keyword_item.get('category', '其他')
-                source = keyword_item.get('source', 'LLM生成')
-
-                if not keyword:
-                    continue
-
-                # 检查关键词是否已存在
-                check_query = f"""
-                SELECT COUNT(*) as cnt FROM `{metadata_db}`.`business_keywords`
-                WHERE database_name = '{db_name}' AND keyword = '{keyword}'
-                """
-                result = execute_query(check_query)
-                exists = result[0]['cnt'] > 0 if result else False
-
-                if exists:
-                    # 如果关键词已存在，只有当新置信度更高时才更新
-                    update_query = f"""
-                    UPDATE `{metadata_db}`.`business_keywords` SET
-                        confidence = CASE WHEN confidence < {confidence} THEN {confidence} ELSE confidence END,
-                        update_time = '{current_time}'
-                    WHERE database_name = '{db_name}' AND keyword = '{keyword}'
-                    """
-                    execute_query(update_query)
-                else:
-                    # 插入新关键词
-                    insert_query = f"""
-                    INSERT INTO `{metadata_db}`.`business_keywords`
-                    (database_name, keyword, confidence, category, source, create_time, update_time)
-                    VALUES
-                    ('{db_name}', '{keyword}', {confidence}, '{category}', '{source}', '{current_time}', '{current_time}')
-                    """
-                    execute_query(insert_query)
-
-            logger.info(f"已保存数据库 {db_name} 的业务关键词，共 {len(keywords)} 个")
-            return True
-        except Exception as e:
-            logger.error(f"保存业务关键词时出错: {str(e)}")
-            return False
-
-    def _ensure_business_keywords_table_exists(self) -> bool:
-        """
-        确保业务关键词表存在
-
-        Returns:
-            bool: 操作是否成功
-        """
-        # 使用统一的元数据库名称
-        metadata_db = "doris_metadata"
-
-        try:
-            # 确保元数据库存在
-            create_db_query = f"CREATE DATABASE IF NOT EXISTS `{metadata_db}`"
-            execute_query(create_db_query)
-
-            # 确保关键词表存在
-            create_table_query = f"""
-            CREATE TABLE IF NOT EXISTS `{metadata_db}`.`business_keywords` (
-                `database_name` VARCHAR(100) COMMENT '数据库名称',
-                `keyword` VARCHAR(255) COMMENT '业务关键词',
-                `confidence` FLOAT COMMENT '置信度',
-                `category` VARCHAR(100) COMMENT '类别',
-                `source` VARCHAR(100) COMMENT '来源',
-                `create_time` DATETIME COMMENT '创建时间',
-                `update_time` DATETIME COMMENT '更新时间'
-            ) ENGINE=OLAP
-            UNIQUE KEY(`database_name`, `keyword`)
-            COMMENT '业务关键词表'
-            DISTRIBUTED BY HASH(`database_name`) BUCKETS 3
-            PROPERTIES (
-                "replication_allocation" = "tag.location.default: 1"
+            # 确保keywords是列表
+            if not isinstance(keywords, list):
+                logger.warning(f"保存的业务关键词必须是列表,当前为: {type(keywords)}")
+                return False
+                
+            # 将关键词列表转换为JSON字符串
+            keywords_json = json.dumps(keywords, ensure_ascii=False)
+            
+            # 保存到元数据数据库
+            self._save_business_metadata(
+                db_name, 
+                "", 
+                "business_keywords", 
+                keywords_json
             )
-            """
-            execute_query(create_table_query)
+            
+            logger.info(f"成功保存数据库 {db_name} 的业务关键词,共 {len(keywords)} 个")
             return True
         except Exception as e:
-            logger.error(f"创建业务关键词表时出错: {str(e)}")
+            logger.error(f"保存业务关键词到元数据数据库出错: {str(e)}")
             return False
+
+    def get_business_metadata_for_table(self, db_name: str, table_name: str) -> Dict[str, Any]:
+        """获取指定表的业务元数据
+        
+        Args:
+            db_name: 数据库名称
+            table_name: 表名称
+            
+        Returns:
+            dict: 表的业务元数据
+        """
+        try:
+            # 检查参数
+            if not db_name or not table_name:
+                logger.warning("获取表业务元数据时未指定数据库名或表名")
+                return {}
+                
+            # 从缓存中获取
+            cache_key = f"table_metadata_{db_name}_{table_name}"
+            if cache_key in self.metadata_cache and (datetime.now() - self.metadata_cache_time.get(cache_key, datetime.min)).total_seconds() < self.cache_ttl:
+                logger.info(f"从缓存中获取表 {db_name}.{table_name} 的业务元数据")
+                return self.metadata_cache[cache_key]
+                
+            # 从元数据库查询
+            query = f"""
+            SELECT metadata_value 
+            FROM {self.metadata_db}.business_metadata 
+            WHERE db_name = '{db_name}' 
+            AND table_name = '{table_name}' 
+            AND metadata_type = 'table_summary'
+            """
+            
+            result = execute_query(query)
+            
+            if result and len(result) > 0 and 'metadata_value' in result[0]:
+                try:
+                    table_metadata = json.loads(result[0]['metadata_value'])
+                    
+                    # 更新缓存
+                    self.metadata_cache[cache_key] = table_metadata
+                    self.metadata_cache_time[cache_key] = datetime.now()
+                    
+                    logger.info(f"成功从元数据库获取表 {db_name}.{table_name} 的业务元数据")
+                    return table_metadata
+                except json.JSONDecodeError as e:
+                    logger.warning(f"解析表 {db_name}.{table_name} 的业务元数据JSON时出错: {str(e)}")
+            
+            # 如果表级元数据不存在,尝试从数据库级元数据中提取
+            db_metadata = self.get_business_metadata_from_database(db_name)
+            tables_summary = db_metadata.get("tables_summary", {})
+            
+            if isinstance(tables_summary, dict) and table_name in tables_summary:
+                table_metadata = {
+                    "summary": tables_summary[table_name],
+                    "update_time": datetime.now().isoformat()
+                }
+                
+                # 保存表级元数据以便下次直接获取
+                self._save_business_metadata(
+                    db_name, 
+                    table_name, 
+                    "table_summary", 
+                    json.dumps(table_metadata, ensure_ascii=False)
+                )
+                
+                # 更新缓存
+                self.metadata_cache[cache_key] = table_metadata
+                self.metadata_cache_time[cache_key] = datetime.now()
+                
+                logger.info(f"已从数据库级元数据中提取并保存表 {db_name}.{table_name} 的业务元数据")
+                return table_metadata
+            
+            logger.warning(f"未找到表 {db_name}.{table_name} 的业务元数据")
+            return {}
+        except Exception as e:
+            logger.error(f"获取表{db_name}.{table_name}的业务元数据时出错: {str(e)}")
+            return {}

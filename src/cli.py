@@ -42,12 +42,12 @@ def main():
         explain_db_table(args.explain_table, args.database)
         return
     
-    # 如果没有提供查询，进入交互模式
+    # 如果没有提供查询,进入交互模式
     if not args.query:
         show_menu()
         
         while True:
-            choice = input("\n请选择操作 (1-4，或输入 'exit' 退出): ")
+            choice = input("\n请选择操作 (1-4,或输入 'exit' 退出): ")
             
             if choice.lower() in ('exit', 'quit'):
                 break
@@ -72,7 +72,7 @@ def main():
                 if sql.strip():
                     execute_sql_query(sql)
             else:
-                print("无效的选择，请重试")
+                print("无效的选择,请重试")
     else:
         # 处理命令行传入的查询
         process_query(args.query, execute_sql=args.execute)
@@ -141,7 +141,7 @@ def process_query(query, execute_sql=False):
         print(sql)
         print("-" * 80)
         
-        # 如果指定了执行SQL，则执行
+        # 如果指定了执行SQL,则执行
         if execute_sql:
             execute_sql_query(sql)
         else:
@@ -169,7 +169,7 @@ def execute_sql_query(sql):
     try:
         df = execute_query_df(sql)
         if len(df) > 20:
-            print(f"查询结果包含 {len(df)} 行。为限制输出，仅显示前20行:\n")
+            print(f"查询结果包含 {len(df)} 行。为限制输出,仅显示前20行:\n")
             print(df.head(20).to_string(index=False))
         else:
             print(df.to_string(index=False))

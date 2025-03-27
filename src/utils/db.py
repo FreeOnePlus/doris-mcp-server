@@ -1,6 +1,8 @@
 import os
+import json
 import pymysql
 import pandas as pd
+from typing import Dict, List, Optional, Any
 from dotenv import load_dotenv
 
 # 加载环境变量
@@ -17,17 +19,66 @@ DB_CONFIG = {
     "cursorclass": pymysql.cursors.DictCursor
 }
 
-def get_db_connection():
-    """获取数据库连接"""
-    return pymysql.connect(**DB_CONFIG)
+# 多数据库配置
+ENABLE_MULTI_DATABASE = os.getenv("ENABLE_MULTI_DATABASE", "false").lower() == "true"
 
-def get_db_name():
-    """获取当前配置的数据库名"""
-    return DB_CONFIG["database"] or os.getenv("DB_NAME", "")
+# 获取多数据库名称列表
+def get_multi_database_names() -> List[str]:
+    """获取多数据库名称列表"""
+    if not ENABLE_MULTI_DATABASE:
+        return []
+        
+    multi_db_names_str = os.getenv("MULTI_DATABASE_NAMES", "[]")
+    try:
+        multi_db_names = json.loads(multi_db_names_str)
+        if not isinstance(multi_db_names, list):
+            return []
+        # 确保默认数据库也在列表中
+        default_db = DB_CONFIG.get("database")
+        if default_db and default_db not in multi_db_names:
+            multi_db_names.insert(0, default_db)
+        return multi_db_names
+    except json.JSONDecodeError:
+        return []
 
-def execute_query(sql):
-    """执行SQL查询并返回结果"""
-    conn = get_db_connection()
+# 多数据库名称列表
+MULTI_DATABASE_NAMES = get_multi_database_names()
+
+def get_db_connection(db_name: Optional[str] = None):
+    """
+    获取数据库连接
+    
+    Args:
+        db_name: 指定要连接的数据库名称,如果为None则使用默认配置
+    
+    Returns:
+        数据库连接
+    """
+    if db_name:
+        # 使用默认配置但覆盖数据库名
+        config = DB_CONFIG.copy()
+        config["database"] = db_name
+        return pymysql.connect(**config)
+    else:
+        # 使用默认配置
+        return pymysql.connect(**DB_CONFIG)
+
+def get_db_name() -> str:
+    """获取当前配置的默认数据库名"""
+    return DB_CONFIG["database"] or os.getenv("DB_DATABASE", "")
+
+def execute_query(sql, db_name: Optional[str] = None):
+    """
+    执行SQL查询并返回结果
+    
+    Args:
+        sql: SQL查询语句
+        db_name: 指定要连接的数据库名称,如果为None则使用默认配置
+    
+    Returns:
+        查询结果
+    """
+    conn = get_db_connection(db_name)
     try:
         with conn.cursor() as cursor:
             cursor.execute(sql)
@@ -36,16 +87,25 @@ def execute_query(sql):
     finally:
         conn.close()
 
-def execute_query_df(sql):
-    """执行SQL查询并返回pandas DataFrame"""
-    conn = get_db_connection()
+def execute_query_df(sql, db_name: Optional[str] = None):
+    """
+    执行SQL查询并返回pandas DataFrame
+    
+    Args:
+        sql: SQL查询语句
+        db_name: 指定要连接的数据库名称,如果为None则使用默认配置
+    
+    Returns:
+        pandas DataFrame
+    """
+    conn = get_db_connection(db_name)
     try:
         # 使用一个临时游标执行查询并获取结果
         with conn.cursor() as cursor:
             cursor.execute(sql)
             result = cursor.fetchall()
         
-        # 如果没有结果，返回空DataFrame
+        # 如果没有结果,返回空DataFrame
         if not result:
             return pd.DataFrame()
             
