@@ -23,6 +23,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 # 导入统一日志配置
 from src.utils.logger import get_logger, audit_logger
 
+# 导入工具注册中心和初始化模块
+from src.utils.tool_registry import register_tool
+from src.utils.tool_initializer import init_tools, register_legacy_tools
+
 # 获取日志器
 logger = get_logger(__name__)
 
@@ -76,7 +80,7 @@ def doris_database_info():
             "error": f"获取数据库信息时出错: {str(e)}"
         }
 
-@mcp.tool()
+@register_tool(description="将自然语言查询转换为SQL，并执行查询返回结果")
 def nl2sql_query(query: str):
     """
     将自然语言查询转换为SQL，并执行查询返回结果。
@@ -139,7 +143,7 @@ def nl2sql_query(query: str):
             "query": query
         }
 
-@mcp.tool()
+@register_tool(description="将自然语言查询转换为SQL，并使用流式响应返回结果")
 async def nl2sql_query_stream(query: str):
     """
     将自然语言查询转换为SQL，并使用流式响应返回结果。
@@ -210,7 +214,7 @@ async def nl2sql_query_stream(query: str):
             "query": query
         }
 
-@mcp.tool()
+@register_tool(description="列出数据库中的所有表")
 def list_database_tables():
     """
     列出数据库中的所有表
@@ -227,7 +231,7 @@ def list_database_tables():
             "message": f"列出表时出错: {str(e)}"
         }
 
-@mcp.tool()
+@register_tool(description="获取表结构的详细信息")
 def explain_table(table_name: str):
     """
     获取表结构的详细信息
@@ -247,7 +251,7 @@ def explain_table(table_name: str):
             "message": f"解释表时出错: {str(e)}"
         }
 
-@mcp.tool()
+@register_tool(description="获取数据库业务领域概览")
 def get_business_overview():
     """
     获取数据库业务领域概览
@@ -264,7 +268,7 @@ def get_business_overview():
             "message": f"获取业务概览时出错: {str(e)}"
         }
 
-@mcp.tool()
+@register_tool(description="刷新并保存元数据")
 def refresh_metadata(force: bool = False):
     """
     刷新并保存元数据
@@ -288,7 +292,7 @@ def refresh_metadata(force: bool = False):
             "message": f"刷新元数据时出错: {str(e)}"
         }
 
-@mcp.tool()
+@register_tool(description="对SQL语句进行优化分析，提供性能改进建议和业务含义解读")
 def sql_optimize(sql: str, requirements: str = ""):
     """
     对SQL语句进行优化分析，提供性能改进建议和业务含义解读
@@ -353,7 +357,7 @@ def sql_optimize(sql: str, requirements: str = ""):
             "requirements": requirements
         }
 
-@mcp.tool()
+@register_tool(description="修复SQL语句中的错误")
 def fix_sql(sql: str, error_message: str, requirements: str = ""):
     """
     修复SQL语句中的错误
@@ -390,7 +394,7 @@ def fix_sql(sql: str, error_message: str, requirements: str = ""):
             "error_message": error_message
         }
 
-@mcp.tool()
+@register_tool(description="获取当前NL2SQL处理状态")
 def get_nl2sql_status():
     """
     获取当前NL2SQL处理状态
@@ -414,7 +418,7 @@ def get_nl2sql_status():
             "timestamp": datetime.datetime.now().isoformat()
         }
 
-@mcp.tool()
+@register_tool(description="列出可用的LLM提供商")
 def list_llm_providers():
     """
     列出可用的LLM提供商
@@ -435,7 +439,7 @@ def list_llm_providers():
             "message": f"列出LLM提供商时出错: {str(e)}"
         }
 
-@mcp.tool()
+@register_tool(description="设置LLM提供商")
 def set_llm_provider(provider_name: str):
     """
     设置LLM提供商
@@ -464,7 +468,7 @@ def set_llm_provider(provider_name: str):
             "message": f"设置LLM提供商时出错: {str(e)}"
         }
 
-@mcp.tool()
+@register_tool(description="健康检查工具")
 def health():
     """
     健康检查工具
@@ -477,7 +481,7 @@ def health():
         "version": "1.0.0"
     }
 
-@mcp.tool()
+@register_tool(description="获取服务器状态")
 def status():
     """
     获取服务器状态
@@ -499,13 +503,13 @@ def status():
             # 提供一个默认列表，避免前端错误
             llm_providers = ["openai", "local"]
         
-            return {
+        return {
             "service": {
                 "status": "running",
                 "uptime": datetime.datetime.now().timestamp() - process.create_time(),
                 "started_at": datetime.datetime.fromtimestamp(process.create_time()).isoformat(),
                 "timestamp": datetime.datetime.now().isoformat(),
-                "version": "1.0.0"
+                "version": "0.1.0"
             },
             "system": {
                 "platform": platform.platform(),
@@ -530,7 +534,7 @@ def status():
                 "default_provider": os.getenv("LLM_PROVIDER", "openai"),
                 "default_model": os.getenv(f"{os.getenv('LLM_PROVIDER', 'openai').upper()}_MODEL", "unknown")
             }
-            }
+        }
     except Exception as e:
         logger.error(f"获取服务器状态失败: {str(e)}")
         return {
@@ -539,7 +543,7 @@ def status():
             "timestamp": datetime.datetime.now().isoformat()
         }
 
-@mcp.tool()
+@register_tool(description="列出可用的提示模板")
 def list_prompts():
     """列出可用的提示模板"""
     try:
@@ -737,6 +741,16 @@ def main():
     logger.info(f"当前工作目录: {os.getcwd()}")
     logger.info(f"Python版本: {sys.version}")
     logger.info(f"日志配置: LOG_DIR={os.getenv('LOG_DIR', 'logs')}, LOG_LEVEL={os.getenv('LOG_LEVEL', 'INFO')}")
+    
+    # 启动工具自动发现
+    logger.info("启动工具自动发现...")
+    init_tools()
+    logger.info("工具自动发现完成")
+    
+    # 注册遗留工具，确保向后兼容性
+    logger.info("注册遗留MCP工具...")
+    register_legacy_tools()
+    logger.info("遗留工具注册完成")
     
     # 从环境变量读取配置
     host = os.getenv("SERVER_HOST", "0.0.0.0")
