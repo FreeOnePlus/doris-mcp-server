@@ -10,24 +10,42 @@ const router = createRouter({
     {
       path: '/',
       name: 'home',
-      component: HomeView
+      component: HomeView,
+      meta: { keepAlive: false }
     },
     {
       path: '/nl2sql',
       name: 'nl2sql',
-      component: NL2SQLView
+      component: NL2SQLView,
+      meta: { keepAlive: false }
     },
     {
       path: '/sql-optimize',
       name: 'sql-optimize',
-      component: SQLOptimizeView
+      component: SQLOptimizeView,
+      meta: { keepAlive: false }
     },
     {
       path: '/llm-config',
       name: 'llm-config',
-      component: LLMConfigView
+      component: LLMConfigView,
+      meta: { keepAlive: false }
     }
-  ]
+  ],
+  scrollBehavior(to, from, savedPosition) {
+    if (savedPosition) {
+      return savedPosition
+    } else {
+      return { top: 0 }
+    }
+  }
 });
+
+router.beforeEach((to, from, next) => {
+  if (to.path === from.path) {
+    to.query = { ...to.query, _t: Date.now() }
+  }
+  next()
+})
 
 export default router; 

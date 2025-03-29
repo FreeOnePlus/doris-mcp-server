@@ -1,43 +1,45 @@
 <template>
   <div class="nl2sql-view">
-    <el-card class="chat-container">
-      <template #header>
-        <div class="header">
-          <h2>NL2SQL 自然语言查询</h2>
-          <div class="header-actions">
-            <el-switch
-              v-model="debugMode"
-              class="debug-switch"
-              active-text="调试模式"
-              inactive-text=""
-              size="small"
-            />
-            <el-tag 
-              :type="mcpStore.isConnected ? 'success' : 'danger'" 
+    <!-- 将卡片头部移出卡片，固定在顶部 -->
+    <div class="fixed-card-header">
+      <div class="header">
+        <h2><span class="title-decoration"></span>NL2SQL 自然语言查询</h2>
+        <div class="header-actions">
+          <el-switch
+            v-model="debugMode"
+            class="debug-switch"
+            active-text="调试模式"
+            inactive-text=""
+            size="small"
+          />
+          <el-tag 
+            :type="mcpStore.isConnected ? 'success' : 'danger'" 
+            size="small" 
+            class="connection-status"
+          >
+            {{ mcpStore.isConnected ? '已连接' : '未连接' }}
+            <el-button 
+              v-if="!mcpStore.isConnected && !mcpStore.isConnecting" 
+              type="primary" 
               size="small" 
-              class="connection-status"
+              circle 
+              @click="reconnect" 
+              title="重新连接"
+              class="reconnect-btn"
             >
-              {{ mcpStore.isConnected ? '已连接' : '未连接' }}
-              <el-button 
-                v-if="!mcpStore.isConnected && !mcpStore.isConnecting" 
-                type="primary" 
-                size="small" 
-                circle 
-                @click="reconnect" 
-                title="重新连接"
-                class="reconnect-btn"
-              >
-                <el-icon><Refresh /></el-icon>
-              </el-button>
-              <el-icon v-else-if="mcpStore.isConnecting" class="is-loading"><Loading /></el-icon>
-            </el-tag>
-            <el-button type="primary" plain @click="clearChat" :disabled="chatMessages.length === 0">
-              清空对话
+              <el-icon><Refresh /></el-icon>
             </el-button>
-          </div>
+            <el-icon v-else-if="mcpStore.isConnecting" class="is-loading"><Loading /></el-icon>
+          </el-tag>
+          <el-button type="primary" plain @click="clearChat" :disabled="chatMessages.length === 0">
+            清空对话
+          </el-button>
         </div>
-      </template>
-      
+      </div>
+    </div>
+    
+    <!-- 用普通div替换el-card，避免其默认样式 -->
+    <div class="chat-container">
       <!-- 调试信息显示 -->
       <el-collapse v-if="debugMode">
         <el-collapse-item title="调试信息">
@@ -82,176 +84,178 @@
           </el-empty>
         </div>
         
-        <template v-for="(message, index) in chatMessages" :key="index">
-          <!-- 用户消息 -->
-          <div v-if="message.role === 'user'" class="message user-message">
-            <div class="avatar">
-              <el-avatar :icon="UserFilled" />
+        <div v-else class="messages-wrapper">
+          <template v-for="(message, index) in chatMessages" :key="index">
+            <!-- 用户消息 -->
+            <div v-if="message.role === 'user'" class="message user-message">
+              <div class="avatar">
+                <el-avatar :icon="UserFilled" />
+              </div>
+              <div class="content">
+                {{ message.content }}
+              </div>
             </div>
-            <div class="content">
-              {{ message.content }}
+            
+            <!-- 系统消息 -->
+            <div v-else class="message system-message">
+              <div class="avatar">
+                <el-avatar :src="logoUrl" />
+              </div>
+              <div class="content">
+                <!-- 思考过程 -->
+                <div v-if="message.thinking_process" class="thinking-section">
+                  <div class="section-header">
+                    <span>思考过程</span>
+                    <el-button type="text" @click="message.thinkingCollapsed = !message.thinkingCollapsed">
+                      {{ message.thinkingCollapsed ? '展开' : '折叠' }}
+                    </el-button>
+                  </div>
+                  <div v-show="!message.thinkingCollapsed" class="thinking-content">
+                    <pre>{{ message.thinking_process }}</pre>
+                  </div>
+                </div>
+                
+                <!-- SQL查询 -->
+                <div v-if="message.sql" class="sql-section">
+                  <div class="section-header">
+                    <span>SQL查询</span>
+                    <el-button size="small" @click="copySql(message.sql)">复制</el-button>
+                  </div>
+                  <pre class="sql-code">{{ message.sql }}</pre>
+                </div>
+                
+                <!-- 查询结果 -->
+                <div v-if="message.result && message.result.length > 0" class="result-section">
+                  <div class="section-header">
+                    <span>查询结果 ({{ message.result.length }}条记录)</span>
+                  </div>
+                  <el-table :data="message.result.slice(0, 5)" style="width: 100%" border size="small">
+                    <el-table-column
+                      v-for="column in message.column_names"
+                      :key="column"
+                      :prop="column"
+                      :label="column"
+                    />
+                  </el-table>
+                  <div v-if="message.result.length > 5" class="more-results">
+                    <el-button type="text" @click="showFullResults(message.result, message.column_names)">
+                      查看全部 {{ message.result.length }} 条记录
+                    </el-button>
+                  </div>
+                </div>
+                
+                <!-- 业务分析 -->
+                <div v-if="message.business_analysis" class="analysis-section">
+                  <div class="section-header">
+                    <span>业务分析</span>
+                  </div>
+                  <div v-html="formatText(message.business_analysis.business_analysis)" class="analysis-text"></div>
+                  
+                  <!-- 可视化图表 -->
+                  <div v-if="message.business_analysis.visualization" class="visualization">
+                    <h4>{{ message.business_analysis.visualization.title }}</h4>
+                    <div :id="`chart-${index}`" class="chart-container"></div>
+                    <p class="chart-desc">{{ message.business_analysis.visualization.description }}</p>
+                  </div>
+                  
+                  <!-- 趋势和建议 -->
+                  <div v-if="message.business_analysis.trends && message.business_analysis.trends.length" class="trends">
+                    <h4>主要趋势</h4>
+                    <ul>
+                      <li v-for="(trend, i) in message.business_analysis.trends" :key="i">{{ trend }}</li>
+                    </ul>
+                  </div>
+                  
+                  <div v-if="message.business_analysis.recommendations && message.business_analysis.recommendations.length" class="recommendations">
+                    <h4>业务建议</h4>
+                    <ul>
+                      <li v-for="(rec, i) in message.business_analysis.recommendations" :key="i">{{ rec }}</li>
+                    </ul>
+                  </div>
+                </div>
+                
+                <!-- 错误信息 -->
+                <div v-if="message.error" class="error-section">
+                  <el-alert
+                    type="error"
+                    :title="message.error.message || '查询执行出错'"
+                    :closable="false"
+                    show-icon
+                  />
+                  <div v-if="message.error.details" class="error-details">
+                    <p>详细信息：{{ message.error.details }}</p>
+                  </div>
+                  
+                  <!-- 服务器实现问题诊断 -->
+                  <div v-if="message.error.message && message.error.message.includes('服务器未正确处理')" class="server-diagnosis">
+                    <h4>服务器问题诊断</h4>
+                    <p>服务器返回了无效的响应格式，问题可能是：</p>
+                    <ul>
+                      <li>服务器端 <code>nl2sql_query</code> 工具没有完全实现</li>
+                      <li>NL2SQL处理服务没有正确启动或配置</li>
+                      <li>服务器端的数据库连接问题</li>
+                    </ul>
+                    <p>解决建议：</p>
+                    <ul>
+                      <li>检查服务器日志中的错误信息</li>
+                      <li>确认服务器的 <code>nl2sql_processor.py</code> 模块正确实现并返回标准格式</li>
+                      <li>检查 <code>nl2sql_service.py</code> 中的 <code>process_query</code> 方法是否正确处理并返回结果</li>
+                    </ul>
+                  </div>
+                </div>
+                
+                <!-- 普通消息 -->
+                <div v-if="!message.sql && !message.result && !message.error && !message.business_analysis">
+                  {{ message.content }}
+                </div>
+              </div>
             </div>
-          </div>
+          </template>
           
-          <!-- 系统消息 -->
-          <div v-else class="message system-message">
+          <!-- 流式思考过程显示 -->
+          <div v-if="isLoading" class="message system-message">
             <div class="avatar">
               <el-avatar :src="logoUrl" />
             </div>
             <div class="content">
-              <!-- 思考过程 -->
-              <div v-if="message.thinking_process" class="thinking-section">
-                <div class="section-header">
-                  <span>思考过程</span>
-                  <el-button type="text" @click="message.thinkingCollapsed = !message.thinkingCollapsed">
-                    {{ message.thinkingCollapsed ? '展开' : '折叠' }}
-                  </el-button>
-                </div>
-                <div v-show="!message.thinkingCollapsed" class="thinking-content">
-                  <pre>{{ message.thinking_process }}</pre>
-                </div>
-              </div>
-              
-              <!-- SQL查询 -->
-              <div v-if="message.sql" class="sql-section">
-                <div class="section-header">
-                  <span>SQL查询</span>
-                  <el-button size="small" @click="copySql(message.sql)">复制</el-button>
-                </div>
-                <pre class="sql-code">{{ message.sql }}</pre>
-              </div>
-              
-              <!-- 查询结果 -->
-              <div v-if="message.result && message.result.length > 0" class="result-section">
-                <div class="section-header">
-                  <span>查询结果 ({{ message.result.length }}条记录)</span>
-                </div>
-                <el-table :data="message.result.slice(0, 5)" style="width: 100%" border size="small">
-                  <el-table-column
-                    v-for="column in message.column_names"
-                    :key="column"
-                    :prop="column"
-                    :label="column"
-                  />
-                </el-table>
-                <div v-if="message.result.length > 5" class="more-results">
-                  <el-button type="text" @click="showFullResults(message.result, message.column_names)">
-                    查看全部 {{ message.result.length }} 条记录
-                  </el-button>
-                </div>
-              </div>
-              
-              <!-- 业务分析 -->
-              <div v-if="message.business_analysis" class="analysis-section">
-                <div class="section-header">
-                  <span>业务分析</span>
-                </div>
-                <div v-html="formatText(message.business_analysis.business_analysis)" class="analysis-text"></div>
-                
-                <!-- 可视化图表 -->
-                <div v-if="message.business_analysis.visualization" class="visualization">
-                  <h4>{{ message.business_analysis.visualization.title }}</h4>
-                  <div :id="`chart-${index}`" class="chart-container"></div>
-                  <p class="chart-desc">{{ message.business_analysis.visualization.description }}</p>
+              <div class="thinking-section" v-if="mcpStore.currentStage && mcpStore.currentStage !== 'waiting'">
+                <div class="thinking-header">
+                  <span class="thinking-title">思考过程</span>
+                  <span class="thinking-status">
+                    - {{ getStageName(mcpStore.currentStage) }} ({{ mcpStore.queryProgress }}%)
+                    <span v-if="mcpStore.is_processing" class="pulse-dot"></span>
+                  </span>
                 </div>
                 
-                <!-- 趋势和建议 -->
-                <div v-if="message.business_analysis.trends && message.business_analysis.trends.length" class="trends">
-                  <h4>主要趋势</h4>
-                  <ul>
-                    <li v-for="(trend, i) in message.business_analysis.trends" :key="i">{{ trend }}</li>
-                  </ul>
-                </div>
-                
-                <div v-if="message.business_analysis.recommendations && message.business_analysis.recommendations.length" class="recommendations">
-                  <h4>业务建议</h4>
-                  <ul>
-                    <li v-for="(rec, i) in message.business_analysis.recommendations" :key="i">{{ rec }}</li>
-                  </ul>
-                </div>
-              </div>
-              
-              <!-- 错误信息 -->
-              <div v-if="message.error" class="error-section">
-                <el-alert
-                  type="error"
-                  :title="message.error.message || '查询执行出错'"
-                  :closable="false"
-                  show-icon
-                />
-                <div v-if="message.error.details" class="error-details">
-                  <p>详细信息：{{ message.error.details }}</p>
-                </div>
-                
-                <!-- 服务器实现问题诊断 -->
-                <div v-if="message.error.message && message.error.message.includes('服务器未正确处理')" class="server-diagnosis">
-                  <h4>服务器问题诊断</h4>
-                  <p>服务器返回了无效的响应格式，问题可能是：</p>
-                  <ul>
-                    <li>服务器端 <code>nl2sql_query</code> 工具没有完全实现</li>
-                    <li>NL2SQL处理服务没有正确启动或配置</li>
-                    <li>服务器端的数据库连接问题</li>
-                  </ul>
-                  <p>解决建议：</p>
-                  <ul>
-                    <li>检查服务器日志中的错误信息</li>
-                    <li>确认服务器的 <code>nl2sql_processor.py</code> 模块正确实现并返回标准格式</li>
-                    <li>检查 <code>nl2sql_service.py</code> 中的 <code>process_query</code> 方法是否正确处理并返回结果</li>
-                  </ul>
-                </div>
-              </div>
-              
-              <!-- 普通消息 -->
-              <div v-if="!message.sql && !message.result && !message.error && !message.business_analysis">
-                {{ message.content }}
-              </div>
-            </div>
-          </div>
-        </template>
-        
-        <!-- 流式思考过程显示 -->
-        <div v-if="isLoading" class="message system-message">
-          <div class="avatar">
-            <el-avatar :src="logoUrl" />
-          </div>
-          <div class="content">
-            <div class="thinking-section" v-if="mcpStore.currentStage && mcpStore.currentStage !== 'waiting'">
-              <div class="thinking-header">
-                <span class="thinking-title">思考过程</span>
-                <span class="thinking-status">
-                  - {{ getStageName(mcpStore.currentStage) }} ({{ mcpStore.queryProgress }}%)
-                  <span v-if="mcpStore.is_processing" class="pulse-dot"></span>
-                </span>
-              </div>
-              
-              <div class="thinking-process">
-                <div class="progress-container">
-                  <div class="progress-markers">
-                    <div v-for="(marker, index) in dynamicStageMarkers" :key="`marker-${index}`"
-                         :class="['stage-marker', { 
-                           'completed': isStageCompleted(marker.value), 
-                           'current': mapStageToDisplay(mcpStore.currentStage) === marker.value 
-                         }]"
-                         :title="marker.label">
-                      <span class="marker-dot"></span>
-                      <span class="marker-label">{{ marker.label }}</span>
+                <div class="thinking-process">
+                  <div class="progress-container">
+                    <div class="progress-markers">
+                      <div v-for="(marker, index) in dynamicStageMarkers" :key="`marker-${index}`"
+                           :class="['stage-marker', { 
+                             'completed': isStageCompleted(marker.value), 
+                             'current': mapStageToDisplay(mcpStore.currentStage) === marker.value 
+                           }]"
+                           :title="marker.label">
+                        <span class="marker-dot"></span>
+                        <span class="marker-label">{{ marker.label }}</span>
+                      </div>
+                    </div>
+                    <div class="progress-bar">
+                      <div class="progress-filled" :style="{ width: `${mcpStore.queryProgress}%` }" :key="`progress-${mcpStore.queryProgress}`"></div>
                     </div>
                   </div>
-                  <div class="progress-bar">
-                    <div class="progress-filled" :style="{ width: `${mcpStore.queryProgress}%` }" :key="`progress-${mcpStore.queryProgress}`"></div>
-                  </div>
-                </div>
-                
-                <div class="thinking-text">
-                  <div v-if="!mcpStore.currentStage || mcpStore.currentStage === 'waiting'" class="no-thinking-yet">
-                    正在分析您的查询...
-                  </div>
-                  <div v-else>
-                    <p>当前阶段: {{ getStageName(mcpStore.currentStage) || '处理中' }}</p>
-                    <p>处理状态: {{ mcpStore.is_processing ? '处理中' : '空闲' }}</p>
-                    <p>进度: {{ mcpStore.queryProgress }}%</p>
-                    <p v-if="mcpStore.current_query">查询: {{ mcpStore.current_query }}</p>
-                    <p>历史阶段: {{ mcpStore.stageHistory.map(stage => getStageName(stage)).join(' → ') }}</p>
+                  
+                  <div class="thinking-text">
+                    <div v-if="!mcpStore.currentStage || mcpStore.currentStage === 'waiting'" class="no-thinking-yet">
+                      正在分析您的查询...
+                    </div>
+                    <div v-else>
+                      <p>当前阶段: {{ getStageName(mcpStore.currentStage) || '处理中' }}</p>
+                      <p>处理状态: {{ mcpStore.is_processing ? '处理中' : '空闲' }}</p>
+                      <p>进度: {{ mcpStore.queryProgress }}%</p>
+                      <p v-if="mcpStore.current_query">查询: {{ mcpStore.current_query }}</p>
+                      <p>历史阶段: {{ mcpStore.stageHistory.map(stage => getStageName(stage)).join(' → ') }}</p>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -259,7 +263,10 @@
           </div>
         </div>
       </div>
-      
+    </div>
+    
+    <!-- 聊天输入框容器保持不变 -->
+    <div class="chat-input-container">
       <div class="chat-input">
         <el-input
           v-model="inputMessage"
@@ -278,7 +285,7 @@
           发送
         </el-button>
       </div>
-    </el-card>
+    </div>
     
     <!-- 全屏结果对话框 -->
     <el-dialog v-model="fullResultsVisible" title="完整查询结果" width="80%">
@@ -313,6 +320,7 @@ const debugMode = ref(true);
 const showDebug = ref(false);
 const lastStatusUpdateTime = ref('无');
 let typingTimer = null;
+let statusTimer = null;
 
 // 阶段标记定义 - 移除不需要的阶段并修复重复
 const dynamicStageMarkers = computed(() => [
@@ -634,7 +642,11 @@ async function sendMessage() {
 function scrollToBottom() {
   nextTick(() => {
     if (messagesContainer.value) {
-      messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight;
+      // 添加平滑滚动
+      messagesContainer.value.scrollTo({
+        top: messagesContainer.value.scrollHeight,
+        behavior: 'smooth'
+      });
     }
   });
 }
@@ -884,127 +896,322 @@ onUnmounted(() => {
 .nl2sql-view {
   max-width: 1200px;
   margin: 0 auto;
-  padding: 20px;
+  padding: 0 20px 80px;
   height: 100%;
+  position: relative;
+  flex-direction: column;
+  box-sizing: border-box;
   
-  .chat-container {
-    height: calc(100vh - 120px);
-    display: flex;
-    flex-direction: column;
+  // 固定的卡片头部样式
+  .fixed-card-header {
+    position: fixed;
+    top: 60px;
+    left: 0;
+    right: 0;
+    background-color: #fff;
+    z-index: 99;
+    padding: 8px 20px;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.08);
+    border-bottom: 1px solid #ebeef5;
     
+    // 居中内容，与容器保持一致
     .header {
+      max-width: 1160px;
+      margin: 0 auto;
       display: flex;
       justify-content: space-between;
       align-items: center;
+      
+      h2 {
+        margin: 0;
+        font-size: 18px;
+        color: #303133;
+        display: flex;
+        align-items: center;
+        position: relative;
+        padding-left: 15px;
+        
+        .title-decoration {
+          position: absolute;
+          left: 0;
+          top: 50%;
+          transform: translateY(-50%);
+          width: 4px;
+          height: 18px;
+          background-color: #409eff;
+          border-radius: 2px;
+        }
+      }
+      
+      .header-actions {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        
+        .debug-switch {
+          margin-right: 10px;
+        }
+        
+        .connection-status {
+          padding: 0 10px;
+          height: 28px;
+          line-height: 26px;
+          display: flex;
+          align-items: center;
+          
+          .reconnect-btn {
+            padding: 2px;
+            margin-left: 5px;
+          }
+        }
+      }
     }
+  }
+  
+  // 聊天输入框容器样式
+  .chat-input-container {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background-color: #fff;
+    box-shadow: 0 -2px 4px rgba(0, 0, 0, 0.08);
+    padding: 8px 15px;
+    z-index: 10;
+    box-sizing: border-box;
+    transition: transform 0.3s ease;
+    border-top: 1px solid #ebeef5;
     
-    .chat-messages {
-      flex: 1;
-      overflow-y: auto;
-      padding: 20px 0;
-      
-      .empty-chat {
-        height: 100%;
-        display: flex;
-        flex-direction: column;
-        justify-content: center;
-        align-items: center;
-      }
-      
-      .message {
-        display: flex;
-        margin-bottom: 20px;
-        gap: 16px;
-      }
-      
-      .user-message {
-        flex-direction: row-reverse;
-      }
-      
-      .user-message .content {
-        background-color: #ecf5ff;
-        border-radius: 8px 2px 8px 8px;
-        padding: 12px;
-        max-width: 80%;
-      }
-      
-      .system-message .content {
-        background-color: #f5f7fa;
-        border-radius: 2px 8px 8px 8px;
-        padding: 12px;
-        max-width: 80%;
-      }
-      
-      .avatar {
-        flex-shrink: 0;
-      }
-      
-      .thinking-section, .sql-section, .result-section, .analysis-section, .error-section {
-        margin-bottom: 16px;
-        border: 1px solid #ebeef5;
-        border-radius: 8px;
-        overflow: hidden;
-      }
-      
-      .section-header {
-        background: #f5f7fa;
-        padding: 8px 12px;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        font-weight: bold;
-        color: #409eff;
-      }
-      
-      .thinking-content {
-        padding: 12px;
-      }
-      
-      .sql-code {
-        background: #f8f8f8;
-        padding: 10px;
-        border-radius: 4px;
-        font-family: 'Courier New', monospace;
-        overflow-x: auto;
-        margin: 10px 0;
-      }
-      
-      .more-results {
-        text-align: center;
-        padding: 10px;
-        background: #f5f7fa;
-      }
-      
-      .loading-message {
-        display: flex;
-        margin-bottom: 20px;
-        gap: 16px;
-      }
-      
-      .loading-message .content {
-        background-color: #f5f7fa;
-        border-radius: 2px 8px 8px 8px;
-        padding: 12px;
-        flex: 1;
-        max-width: 80%;
-      }
-      
-      .chart-container {
-        height: 300px;
-        margin: 10px 0;
-      }
-      
-      .chart-desc {
-        color: #606266;
-        text-align: center;
-        margin-top: 5px;
-      }
+    &.hidden {
+      transform: translateY(100%);
     }
     
     .chat-input {
+      max-width: 1160px;
+      margin: 0 auto;
       display: flex;
       gap: 10px;
-      margin-top: 20px;
+      
+      .el-input {
+        flex: 1;
+      }
+      
+      .el-button {
+        flex-shrink: 0;
+        align-self: flex-end;
+        height: 40px;
+      }
+      
+      @media (max-width: 768px) {
+        flex-direction: column;
+        
+        .el-button {
+          margin-top: 10px;
+          align-self: stretch;
+          width: 100%;
+        }
+      }
+      
+      :deep(.el-textarea__inner) {
+        border-radius: 8px;
+        border-color: #dcdfe6;
+        padding: 12px;
+        transition: all 0.3s ease;
+        resize: none;
+        
+        &:focus {
+          border-color: #409eff;
+          box-shadow: 0 0 0 2px rgba(64, 158, 255, 0.2);
+        }
+      }
+      
+      .el-button {
+        border-radius: 8px;
+        font-weight: 500;
+        transition: all 0.3s ease;
+        
+        &:hover:not(:disabled) {
+          transform: translateY(-2px);
+          box-shadow: 0 4px 12px rgba(64, 158, 255, 0.2);
+        }
+        
+        &:active:not(:disabled) {
+          transform: translateY(0);
+        }
+      }
+    }
+  }
+  
+  // 响应式调整整体布局
+  @media (max-width: 768px) {
+    padding: 10px 10px 130px;
+    
+    .chat-container {
+      height: calc(100vh - 300px);
+      margin-top: 80px;
+    }
+    
+    .fixed-card-header {
+      padding: 10px;
+    }
+  }
+  
+  // 为所有卡片和按钮添加过渡效果
+  * {
+    transition: background-color 0.3s, border-color 0.3s, box-shadow 0.3s;
+  }
+  
+  // 添加滚动到底部的平滑过渡
+  .chat-messages {
+    scroll-behavior: smooth;
+  }
+  
+  // 消息出现动画
+  .message {
+    animation: fadeIn 0.3s ease-in-out;
+  }
+  
+  @keyframes fadeIn {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+}
+
+// 卡片容器样式 - 现在是普通div，不再是el-card
+.chat-container {
+  height: calc(100vh - 180px);
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0;
+  margin-top: 55px;
+  border-radius: 4px;
+  border: 1px solid #e4e7ed;
+  background-color: #fff;
+  
+  // 调整折叠面板样式
+  :deep(.el-collapse) {
+    border: none;
+    
+    .el-collapse-item__header {
+      font-size: 14px;
+      color: #606266;
+      font-weight: 500;
+      padding: 8px 15px;
+      border-bottom: 1px solid #f0f2f5;
+      background-color: #f8f9fb;
+    }
+    
+    .el-collapse-item__content {
+      padding: 8px 15px;
+      border-bottom: 1px solid #f0f2f5;
+    }
+    
+    // 调整图标样式
+    .el-collapse-item__arrow {
+      margin-right: 0;
+      font-size: 14px;
+    }
+  }
+  
+  // 调整报错提示
+  :deep(.el-alert) {
+    margin: 0 15px 10px;
+  }
+}
+
+// 聊天消息容器
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background-color: #fff;
+}
+
+// 消息包装容器
+.messages-wrapper {
+  padding: 10px 15px;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background-color: #fff;
+}
+
+// 消息样式
+.message {
+  margin-bottom: 12px;
+  display: flex;
+  gap: 10px;
+  
+  &.user-message {
+    .content {
+      background-color: #ecf5ff;
+      color: #303133;
+    }
+  }
+  
+  &.system-message {
+    .content {
+      background-color: #f5f7fa;
+    }
+  }
+  
+  .avatar {
+    flex-shrink: 0;
+  }
+  
+  .content {
+    padding: 10px 15px;
+    border-radius: 8px;
+    max-width: 85%;
+    word-break: break-word;
+  }
+}
+
+// 空状态样式
+.empty-chat {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  flex: 1;
+  padding: 0;
+  
+  .el-empty {
+    margin: 0;
+    padding: 10px 0;
+    
+    :deep(.el-empty__image) {
+      width: 100px;
+      height: 100px;
+    }
+    
+    :deep(.el-empty__description) {
+      margin-top: 15px;
+      color: #909399;
+      font-size: 14px;
+    }
+  }
+  
+  :deep(.el-button) {
+    padding: 8px 20px;
+    font-size: 14px;
+    margin-top: 15px;
+    transition: all 0.3s ease;
+    
+    &:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(64, 158, 255, 0.2);
     }
   }
 }
@@ -1013,11 +1220,8 @@ onUnmounted(() => {
 .progress-container {
   margin: 10px 0;
   position: relative;
-  
-  /* 添加动画效果 */
   transition: all 0.3s ease;
   
-  /* 突出显示当前处理状态 */
   &:has(.stage-marker.active) {
     box-shadow: 0 0 8px rgba(64, 158, 255, 0.2);
   }
@@ -1040,53 +1244,69 @@ onUnmounted(() => {
   width: 60px;
   font-size: 12px;
   color: #909399;
-  transition: all 0.5s ease; /* 增加过渡时间 */
-}
-
-.stage-marker::before {
-  content: '';
-  width: 12px;
-  height: 12px;
-  background-color: #dcdfe6;
-  border-radius: 50%;
-  margin-bottom: 5px;
   transition: all 0.5s ease;
+  
+  &::before {
+    content: '';
+    width: 12px;
+    height: 12px;
+    background-color: #dcdfe6;
+    border-radius: 50%;
+    margin-bottom: 5px;
+    transition: all 0.5s ease;
+  }
+  
+  &.active {
+    color: #409eff;
+    font-weight: bold;
+    transform: scale(1.1);
+    z-index: 1;
+    
+    &::before {
+      background-color: #409eff;
+      box-shadow: 0 0 0 4px rgba(64, 158, 255, 0.3);
+      transform: scale(1.2);
+      animation: pulse-blue 2s infinite;
+    }
+  }
+  
+  &.completed {
+    color: #67c23a;
+    
+    &::before {
+      background-color: #67c23a;
+      box-shadow: 0 0 0 2px rgba(103, 194, 58, 0.2);
+    }
+  }
+  
+  .marker-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background-color: #dcdfe6;
+    margin-bottom: 5px;
+  }
+  
+  &.current .marker-dot {
+    background-color: #409eff;
+    box-shadow: 0 0 0 3px rgba(64, 158, 255, 0.2);
+    animation: pulse 1.5s infinite;
+  }
+  
+  &.completed .marker-dot {
+    background-color: #67c23a;
+  }
+  
+  .marker-label {
+    font-size: 12px;
+    text-align: center;
+  }
 }
 
-.stage-marker.active {
-  color: #409eff;
-  font-weight: bold;
-  transform: scale(1.1); /* 轻微放大 */
-  z-index: 1; /* 确保显示在上层 */
-}
-
-.stage-marker.active::before {
-  background-color: #409eff;
-  box-shadow: 0 0 0 4px rgba(64, 158, 255, 0.3);
-  transform: scale(1.2);
-  animation: pulse-blue 2s infinite; /* 添加脉动动画 */
-}
-
-.stage-marker.completed {
-  color: #67c23a;
-}
-
-.stage-marker.completed::before {
-  background-color: #67c23a;
-  box-shadow: 0 0 0 2px rgba(103, 194, 58, 0.2);
-}
-
-/* 添加一个脉动效果的动画 */
 @keyframes pulse-blue {
-  0% {
-    box-shadow: 0 0 0 0 rgba(64, 158, 255, 0.5);
-  }
-  70% {
-    box-shadow: 0 0 0 6px rgba(64, 158, 255, 0);
-  }
-  100% {
-    box-shadow: 0 0 0 0 rgba(64, 158, 255, 0);
-  }
+  0% { box-shadow: 0 0 0 0 rgba(64, 158, 255, 0.5); }
+  70% { box-shadow: 0 0 0 6px rgba(64, 158, 255, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(64, 158, 255, 0); }
 }
 
 .current-stage-badge {
@@ -1098,13 +1318,13 @@ onUnmounted(() => {
   margin-left: 12px;
   display: inline-flex;
   align-items: center;
-  transition: all 0.3s ease; /* 平滑过渡效果 */
-}
-
-.current-stage-badge.processing {
-  background-color: #f0f9eb;
-  color: #67c23a;
-  animation: slight-pulse 2s infinite; /* 添加轻微的呼吸效果 */
+  transition: all 0.3s ease;
+  
+  &.processing {
+    background-color: #f0f9eb;
+    color: #67c23a;
+    animation: slight-pulse 2s infinite;
+  }
 }
 
 .badge-icon {
@@ -1121,87 +1341,26 @@ onUnmounted(() => {
   animation: pulse 1.5s infinite;
 }
 
-/* 轻微的脉动效果 */
 @keyframes slight-pulse {
-  0% {
-    opacity: 0.9;
-  }
-  50% {
-    opacity: 1;
-  }
-  100% {
-    opacity: 0.9;
-  }
+  0% { opacity: 0.9; }
+  50% { opacity: 1; }
+  100% { opacity: 0.9; }
 }
 
-/* 确保进度条更新时有动画效果 */
-:deep(.el-progress-bar__inner) {
-  transition: width 0.5s ease-out !important;
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(64, 158, 255, 0.4); }
+  70% { box-shadow: 0 0 0 5px rgba(64, 158, 255, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(64, 158, 255, 0); }
 }
 
-/* 连接状态样式 */
-.header-actions {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-}
-
-.connection-status {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-}
-
-.reconnect-btn {
-  padding: 2px;
-  margin-left: 5px;
-}
-
-:deep(.el-tag.el-tag--success) {
-  border-color: #67c23a;
-}
-
-:deep(.el-tag.el-tag--danger) {
-  border-color: #f56c6c;
-}
-
-/* 调试模式样式 */
-.debug-switch {
-  margin-right: 10px;
-}
-
-.debug-info {
-  font-family: monospace;
-  background-color: #f8f8f8;
-  padding: 10px;
-  border-radius: 4px;
-  font-size: 12px;
-}
-
-.debug-info p {
-  margin: 5px 0;
-}
-
-.debug-info ul {
-  margin: 5px 0;
-  padding-left: 20px;
-}
-
-.debug-info li {
-  margin: 2px 0;
-}
-
-/* 增强显示效果 */
-.no-thinking-yet {
-  padding: 10px;
-  background-color: #f9f9f9;
-  border-radius: 4px;
-  
-  .stage-note {
-    color: #67c23a;
-    font-weight: bold;
-    margin: 5px 0;
-  }
+.pulse-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #67c23a;
+  margin-left: 6px;
+  animation: pulse 1.5s infinite;
 }
 
 /* 思考过程区域样式 */
@@ -1229,58 +1388,24 @@ onUnmounted(() => {
   margin-left: 5px;
 }
 
-.progress-container {
-  margin-bottom: 15px;
+.thinking-text {
+  padding: 10px;
+  min-height: 60px;
+  border: 1px solid #eaeaea;
+  border-radius: 4px;
+  background: white;
 }
 
-.progress-markers {
-  display: flex;
-  justify-content: space-between;
-  margin-bottom: 5px;
-}
-
-.stage-marker {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  position: relative;
-  flex: 1;
-  opacity: 0.6;
-  transition: all 0.3s ease;
-}
-
-.stage-marker.current {
-  opacity: 1;
-  color: #409eff;
-  font-weight: bold;
-}
-
-.stage-marker.completed {
-  opacity: 1;
-  color: #67c23a;
-}
-
-.marker-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background-color: #dcdfe6;
-  margin-bottom: 5px;
-}
-
-.stage-marker.current .marker-dot {
-  background-color: #409eff;
-  box-shadow: 0 0 0 3px rgba(64, 158, 255, 0.2);
-  animation: pulse 1.5s infinite;
-}
-
-.stage-marker.completed .marker-dot {
-  background-color: #67c23a;
-}
-
-.marker-label {
-  font-size: 12px;
+.no-thinking-yet {
+  color: #909399;
   text-align: center;
+  padding: 20px 0;
+  
+  .stage-note {
+    color: #67c23a;
+    font-weight: bold;
+    margin: 5px 0;
+  }
 }
 
 .progress-bar {
@@ -1298,85 +1423,58 @@ onUnmounted(() => {
   transition: width 0.3s ease;
 }
 
-.thinking-text {
-  padding: 10px;
-  min-height: 60px;
-  border: 1px solid #eaeaea;
-  border-radius: 4px;
-  background: white;
+:deep(.el-progress-bar__inner) {
+  transition: width 0.5s ease-out !important;
 }
 
-.no-thinking-yet {
-  color: #909399;
-  text-align: center;
-  padding: 20px 0;
-}
-
-/* 调试工具栏样式 */
-.debug-toolbar {
-  margin-top: 15px;
-  padding: 10px;
-  border: 1px dashed #e6a23c;
-  border-radius: 4px;
-  background: #fdf6ec;
-}
-
-.debug-actions {
+/* 连接状态和调试样式 */
+.header-actions {
   display: flex;
-  margin-bottom: 10px;
+  gap: 10px;
+  align-items: center;
 }
 
-.debug-button {
+.connection-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.reconnect-btn {
+  padding: 2px;
+  margin-left: 5px;
+}
+
+:deep(.el-tag.el-tag--success) {
+  border-color: #67c23a;
+}
+
+:deep(.el-tag.el-tag--danger) {
+  border-color: #f56c6c;
+}
+
+.debug-switch {
   margin-right: 10px;
-  padding: 5px 10px;
-  background: #f56c6c;
-  color: white;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
 }
 
-.raw-status {
+.debug-info {
   font-family: monospace;
-  font-size: 12px;
-  background: #303133;
-  color: #eee;
-  padding: 10px;
+  background-color: #f8f8f8;
+  padding: 8px;
   border-radius: 4px;
-  overflow-x: auto;
-}
-
-@keyframes pulse {
-  0% {
-    box-shadow: 0 0 0 0 rgba(64, 158, 255, 0.4);
+  font-size: 12px;
+  
+  p {
+    margin: 3px 0;
   }
-  70% {
-    box-shadow: 0 0 0 5px rgba(64, 158, 255, 0);
+  
+  ul {
+    margin: 3px 0;
+    padding-left: 20px;
   }
-  100% {
-    box-shadow: 0 0 0 0 rgba(64, 158, 255, 0);
-  }
-}
-
-.pulse-dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background-color: #67c23a;
-  margin-left: 6px;
-  animation: pulse 1.5s infinite;
-}
-
-@keyframes pulse {
-  0% {
-    box-shadow: 0 0 0 0 rgba(103, 194, 58, 0.7);
-  }
-  70% {
-    box-shadow: 0 0 0 6px rgba(103, 194, 58, 0);
-  }
-  100% {
-    box-shadow: 0 0 0 0 rgba(103, 194, 58, 0);
+  
+  li {
+    margin: 1px 0;
   }
 }
 </style> 

@@ -40,7 +40,9 @@
     
     <!-- 主内容区 -->
     <div class="main-content">
-      <router-view></router-view>
+      <router-view :key="$route.fullPath + ($route.query._t || '')" v-slot="{ Component }">
+        <component :is="Component" />
+      </router-view>
     </div>
     
     <!-- 全局加载状态 -->
@@ -65,16 +67,20 @@ const activeRoute = computed(() => route.path)
 // 菜单选择处理
 function handleSelect(key) {
   console.log('选中菜单:', key)
+  
   // 使用编程式导航，更有控制力
-  if (key !== route.path) {
-    // 为防止导航问题，这里使用try-catch包装路由导航
-    try {
+  try {
+    if (key === route.path) {
+      // 相同路由时强制刷新页面
+      router.go(0)
+    } else {
+      // 不同路由时正常导航
       router.push(key).catch(err => {
         console.warn('路由导航被拒绝:', err)
       })
-    } catch (error) {
-      console.error('路由导航出错:', error)
     }
+  } catch (error) {
+    console.error('路由导航出错:', error)
   }
 }
 
@@ -132,11 +138,16 @@ body {
   flex-direction: column;
   min-height: 100vh;
   
-  // 导航菜单
+  // 导航菜单 - 固定在顶部
   .main-menu {
     padding: 0 20px;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
-    position: relative;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 999;
+    background-color: white; // 确保背景色，避免内容透过
     
     .connection-status {
       position: absolute;
@@ -146,12 +157,13 @@ body {
     }
   }
   
-  // 主内容区
+  // 主内容区 - 添加顶部边距，避免被固定菜单遮挡
   .main-content {
     flex: 1;
     padding: 20px;
     max-width: 100%;
     overflow-x: hidden;
+    margin-top: 60px; // 为固定的导航菜单留出空间，与el-menu的高度一致
   }
 }
 
