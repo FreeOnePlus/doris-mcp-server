@@ -564,6 +564,32 @@ class NL2SQLProcessor:
                     logger.info("成功保存QA示例到元数据库")
                 except Exception as e:
                     logger.warning(f"保存QA示例到元数据库时出错: {str(e)}")
+                
+                # 步骤8: 生成业务分析和可视化建议（新增）
+                try:
+                    logger.info("开始生成业务分析和可视化建议")
+                    
+                    # 获取表信息
+                    tables_info = self._get_tables_info()
+                    
+                    # 调用业务分析方法
+                    business_analysis = self._generate_business_analysis(
+                        query=query,
+                        sql=response["sql"],
+                        result=response["result"],
+                        tables_info=tables_info
+                    )
+                    
+                    # 添加业务分析结果到响应中
+                    response["business_analysis"] = business_analysis
+                    
+                    logger.info("成功生成业务分析和可视化建议")
+                except Exception as e:
+                    logger.warning(f"生成业务分析时出错: {str(e)}")
+                    response["business_analysis"] = {
+                        "error": f"生成业务分析时出错: {str(e)}",
+                        "business_analysis": "无法生成业务分析"
+                    }
 
             # 计算执行时间
             response["execution_time"] = time.time() - start_time
@@ -726,7 +752,7 @@ class NL2SQLProcessor:
                 logger.error(f"保存元数据关键词到数据库出错: {str(e)}")
         else:
             # 已经提取过,直接使用数据库中的关键词
-            business_keywords = [k for k, v in self.metadata_extractor.get_business_keywords_from_database(self.db_name).items()]
+            business_keywords = list(self.metadata_extractor.get_business_keywords_from_database(self.db_name).keys())
 
         for keyword in business_keywords:
             # 只匹配长度大于2的关键词,且不在辅助关键词列表中
@@ -1701,6 +1727,97 @@ class NL2SQLProcessor:
             "error": f"执行SQL失败，已尝试 {max_retries} 次",
             "data": []
         }
+
+    def _generate_business_analysis(self, query: str, sql: str, result: List[Dict], tables_info: str) -> Dict[str, Any]:
+        """
+        生成业务分析和可视化建议
+        
+        Args:
+            query: 用户查询
+            sql: 执行的SQL
+            result: SQL执行结果
+            tables_info: 相关表的元数据信息
+            
+        Returns:
+            Dict: 包含业务分析和可视化建议的字典
+        """
+        try:
+            # 创建业务分析专用的LLM客户端
+            llm_client = get_llm_client(stage="business_analysis")
+            
+            # 准备系统提示
+            system_prompt = """你是数据分析专家，负责将SQL查询结果转化为有价值的业务洞察。
+请根据提供的用户问题、SQL查询、查询结果和表结构信息，提供以下内容：
+1. 对查询结果的业务解读
+2. 数据分析和发现的趋势
+3. 建议的可视化方式
+4. 相关业务建议
+
+返回格式：
+```json
+{
+  "business_analysis": "详细的业务分析...",
+  "trends": ["趋势1", "趋势2", ...],
+  "visualization": {
+    "type": "图表类型，如bar, line, pie等",
+    "title": "图表标题",
+    "x_axis": "X轴字段名",
+    "y_axis": "Y轴字段名",
+    "description": "图表描述"
+  },
+  "recommendations": ["建议1", "建议2", ...]
+}
+```
+
+请确保分析深入、专业，并与业务场景紧密结合。"""
+            
+            # 准备用户提示
+            user_prompt = f"""问题：{query}
+
+执行的SQL：
+```sql
+{sql}
+```
+
+查询结果：
+```json
+{json.dumps(result[:20], ensure_ascii=False, indent=2)}
+```
+
+相关表的元数据信息：
+{tables_info}
+
+请根据以上信息提供业务分析、可视化建议和业务建议。"""
+
+            # 调用LLM
+            messages = [
+                Message("system", system_prompt),
+                Message("user", user_prompt)
+            ]
+            
+            response = llm_client.chat(messages)
+            
+            # 解析LLM响应，提取JSON
+            analysis_result = self._parse_llm_json_response(response.content)
+            
+            # 记录业务分析结果
+            log_data = {
+                "query": query,
+                "function": "_generate_business_analysis",
+                "sql": sql,
+                "result_count": len(result) if result else 0,
+                "analysis_result": analysis_result
+            }
+            log_query_process(log_data, "business_analysis")
+            
+            return analysis_result
+            
+        except Exception as e:
+            logger.error(f"生成业务分析时出错: {str(e)}")
+            return {
+                "error": f"生成业务分析时出错: {str(e)}",
+                "business_analysis": "无法生成业务分析"
+            }
 
     def _fix_sql(self, sql: str, error_msg: str, query: str) -> Optional[str]:
         """

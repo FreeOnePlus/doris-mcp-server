@@ -1037,4 +1037,37 @@ def get_llm_client(provider_name: Optional[str] = None, stage: Optional[str] = N
             return None
     except Exception as e:
         logger.error(f"获取LLM客户端时出错: {str(e)}")
-        return None 
+        return None
+
+def get_llm_providers() -> Dict[str, str]:
+    """
+    获取系统中所有可用的LLM提供商及其默认模型
+    
+    Returns:
+        Dict[str, str]: 提供商名称到默认模型的映射
+    """
+    providers = {}
+    
+    # 检查环境变量中配置的提供商
+    for provider in LLMProvider:
+        env_prefix = provider.value.upper()
+        if os.getenv(f"{env_prefix}_API_KEY") or provider in [LLMProvider.OLLAMA, LLMProvider.MLX]:
+            model = os.getenv(f"{env_prefix}_MODEL")
+            
+            # 如果未设置模型，使用默认值
+            if not model:
+                default_models = {
+                    LLMProvider.OPENAI: "gpt-3.5-turbo",
+                    LLMProvider.DEEPSEEK: "deepseek-chat",
+                    LLMProvider.SIJILIU: "glm-4",
+                    LLMProvider.VOLCENGINE: "volcengine-lm",
+                    LLMProvider.QWEN: "qwen-turbo",
+                    LLMProvider.OLLAMA: "llama3:latest",
+                    LLMProvider.MLX: "Qwen/QwQ-32B"
+                }
+                model = default_models.get(provider, "unknown")
+            
+            # 添加到可用提供商列表
+            providers[provider.value] = model
+    
+    return providers 
