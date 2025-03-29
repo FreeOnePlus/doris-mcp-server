@@ -14,7 +14,7 @@ import json
 import logging
 import time
 import pandas as pd
-from typing import Dict, List, Any, Optional, Tuple, Union
+from typing import Dict, List, Any, Optional, Tuple, Union, Callable
 from dotenv import load_dotenv
 from datetime import datetime
 import uuid
@@ -22,6 +22,7 @@ import pathlib
 import traceback
 import hashlib
 import socket
+import inspect
 
 # 获取项目根目录
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
@@ -126,11 +127,16 @@ class NL2SQLProcessor:
                 "top_p": float(os.getenv("LLM_TOP_P", "0.95")),
                 "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "2048"))
             }
+            
+            # 初始化阶段监听器
+            self._stage_listener = None
+            
         except Exception as e:
             logger.warning(f"LLM客户端初始化失败: {str(e)},将使用关键词匹配作为备选")
             # 确保query_cache和max_retries即使在异常时也被初始化
             self.query_cache = {}
             self.max_retries = 3
+            self._stage_listener = None
 
         # 加载QA示例
         try:
@@ -166,6 +172,16 @@ class NL2SQLProcessor:
             logger.error(f"创建元数据提取器出错: {str(e)}")
             self.metadata_extractor = None
 
+    def set_stage_listener(self, listener):
+        """
+        设置处理阶段监听器
+        
+        Args:
+            listener: 一个可调用对象，接收stage, description, progress三个参数
+        """
+        self._stage_listener = listener
+        logger.info("已设置处理阶段监听器")
+        
     def process(self, query: str) -> Dict[str, Any]:
         """
         处理自然语言转SQL查询
@@ -197,8 +213,34 @@ class NL2SQLProcessor:
             "message": "",
             "similar_example": None,
             "cached": False,
-            "log_id": str(uuid.uuid4())
+            "log_id": str(uuid.uuid4()),
+            "processing_stages": []  # 添加处理阶段记录
         }
+
+        # 记录处理阶段的辅助函数
+        def add_processing_stage(stage, description, progress=0):
+            if "processing_stages" in response:
+                # 记录到日志，便于调试
+                logger.info(f"添加处理阶段: {stage} - {description} ({progress}%)")
+                
+                stage_info = {
+                    "stage": stage,
+                    "description": description,
+                    "progress": progress,
+                    "timestamp": time.time() - start_time
+                }
+                
+                response["processing_stages"].append(stage_info)
+                
+                # 通知外部监听器
+                if self._stage_listener:
+                    try:
+                        self._stage_listener(stage, description, progress)
+                    except Exception as e:
+                        logger.error(f"调用阶段监听器时出错: {str(e)}")
+
+        # 添加初始阶段
+        add_processing_stage("start", "开始处理查询", 5)
 
         # 尝试从缓存中获取结果
         cache_key = hashlib.md5(query.encode('utf-8')).hexdigest()
@@ -232,6 +274,7 @@ class NL2SQLProcessor:
         try:
             # 步骤1: 检查是否为业务查询（使用三级匹配策略）
             # 1.1 首先使用本地关键词匹配
+            add_processing_stage("analyzing", "分析查询类型", 10)
             is_business_query, confidence = self._check_if_business_query(query)
 
             response["is_business_query"] = is_business_query
@@ -332,9 +375,13 @@ class NL2SQLProcessor:
                 }
                 log_query_process(log_data)
 
+                # 添加完成阶段（即使有错误）
+                add_processing_stage("complete", "查询处理完成", 100)
+
                 return response
 
             # 步骤2: 查找相似示例
+            add_processing_stage("similar_example", "查找相似查询示例", 30)
             similar_example = self._find_similar_example(query)
             response["similar_example"] = similar_example
 
@@ -348,45 +395,8 @@ class NL2SQLProcessor:
             log_query_process(log_data)
 
             # 步骤3: 获取业务元数据
-            business_metadata = {}
-
-            # 如果找到了相似示例,直接使用示例中的表信息
-            if similar_example and "tables" in similar_example:
-                from src.utils.metadata_extractor import MetadataExtractor
-                extractor = MetadataExtractor()
-
-                # 获取示例中涉及的表的元数据
-                for table_info in similar_example["tables"]:
-                    db_name = table_info.get("database", "")
-                    table_name = table_info.get("table", "")
-
-                    if db_name and table_name:
-                        # 获取表级业务元数据
-                        table_metadata = extractor.get_business_metadata_for_table(db_name, table_name)
-                        if table_metadata:
-                            if "tables" not in business_metadata:
-                                business_metadata["tables"] = {}
-
-                            if db_name not in business_metadata["tables"]:
-                                business_metadata["tables"][db_name] = {}
-
-                            business_metadata["tables"][db_name][table_name] = table_metadata
-            else:
-                # 如果没有找到相似示例,获取所有数据库级别的元数据
-                logger.info("没有找到相似示例,获取所有数据库级别的元数据")
-
-                from src.utils.metadata_extractor import MetadataExtractor
-                extractor = MetadataExtractor()
-
-                # 获取所有数据库的业务元数据
-                business_metadata["databases"] = {}
-                for db_name in extractor.get_all_target_databases():
-                    db_metadata = extractor.get_business_metadata_from_database(db_name)
-                    if db_metadata:
-                        business_metadata["databases"][db_name] = db_metadata
-
-                # 获取表层级模式
-                business_metadata["table_hierarchy"] = extractor._load_table_hierarchy_patterns()
+            add_processing_stage("business_metadata", "分析业务领域元数据", 40)
+            business_metadata = self._get_business_metadata(query)
 
             # 记录查询过程第三步
             log_data = {
@@ -398,6 +408,7 @@ class NL2SQLProcessor:
             log_query_process(log_data)
 
             # 步骤4: 生成SQL
+            add_processing_stage("generating", "生成SQL", 50)
             sql_generation = self._generate_sql(query, similar_example, business_metadata)
 
             # 更新响应
@@ -434,9 +445,13 @@ class NL2SQLProcessor:
                 }
                 log_query_process(log_data)
 
+                # 添加完成阶段（即使有错误）
+                add_processing_stage("complete", "查询处理完成", 100)
+
                 return response
 
             # 步骤5: 执行SQL
+            add_processing_stage("executing", "执行SQL", 75)
             execution_result = self._execute_sql_with_retry(response["sql"], query)
 
             # 更新响应
@@ -619,6 +634,9 @@ class NL2SQLProcessor:
             except Exception as e:
                 logger.warning(f"缓存查询结果时出错: {str(e)}")
 
+            # 添加完成阶段（即使有错误）
+            add_processing_stage("complete", "查询处理完成", 100)
+
             return response
 
         except Exception as e:
@@ -642,6 +660,9 @@ class NL2SQLProcessor:
                 "execution_time": response["execution_time"]
             }
             log_query_process(log_data)
+
+            # 添加完成阶段（即使有错误）
+            add_processing_stage("complete", "查询处理完成", 100)
 
             return response
 
@@ -1263,16 +1284,16 @@ class NL2SQLProcessor:
                       business_metadata: Optional[Dict[str, Any]] = None, 
                       previous_error: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        使用LLM生成SQL
-        
+        生成SQL查询
+
         Args:
             query: 自然语言查询
-            similar_example: 相似示例（可选）
-            business_metadata: 业务元数据（可选）
-            previous_error: 之前的错误信息（可选）
-            
+            similar_example: 相似的示例(可选)
+            business_metadata: 业务元数据(可选)
+            previous_error: 上一次出现的错误(可选)
+
         Returns:
-            Dict: 包含SQL和相关信息的字典
+            Dict: 包含生成的SQL和元数据的字典
         """
         provider = os.getenv("LLM_PROVIDER_SQL_GENERATION", os.getenv("LLM_PROVIDER", "openai"))
         model = os.getenv(f"LLM_MODEL_SQL_GENERATION", os.getenv(f"{provider.upper()}_MODEL", None))
@@ -1358,13 +1379,24 @@ class NL2SQLProcessor:
 
                 # 检查响应是否为None或为空
                 if not response or not hasattr(response, 'content') or not response.content:
-                    raise ValueError("LLM返回了空响应")
-
-                # 检查响应是否只包含<think>标签
-                if response.content.strip() == "<think>" or response.content.strip() == "\\<think\\>":
-                    logger.warning(f"LLM返回只包含<think>标签,使用简化提示重新生成SQL")
-
-                    # 构建更简单直接的提示
+                    logger.warning("LLM返回了空响应，尝试降级处理")
+                    
+                    need_retry = True
+                    retry_reason = "empty_response"
+                
+                # 检查响应是否只包含<think>标签或无效内容
+                elif response.content.strip() == "<think>" or response.content.strip() == "\\<think\\>" or (
+                    len(response.content.strip()) < 10 and not "select" in response.content.lower()):
+                    logger.warning(f"LLM返回的响应无效: {response.content}")
+                    
+                    need_retry = True
+                    retry_reason = "invalid_response"
+                else:
+                    need_retry = False
+                    
+                # 如果需要重试，使用更简单的提示
+                if need_retry:
+                    # 构建更简单直接的提示进行重试
                     retry_system_prompt = """你是SQL生成专家。请直接生成Apache Doris SQL代码,不要包含思考过程。
 请严格按以下格式输出:
 ```sql
@@ -1381,14 +1413,27 @@ class NL2SQLProcessor:
 
 直接返回SQL代码,不需要解释或分析。"""
 
-                    # 重试
+                    # 重试，使用更简单的提示
                     try:
+                        logger.info(f"检测到{retry_reason}，使用简化提示重试生成SQL")
                         retry_messages = [
                             Message.system(retry_system_prompt),
                             Message.user(retry_user_prompt)
                         ]
 
+                        # 可能需要尝试不同的模型或设置
+                        different_model = os.getenv("FALLBACK_LLM_MODEL", None)
+                        if different_model:
+                            logger.info(f"尝试使用备用模型: {different_model}")
+                            original_model = llm_client.config.model
+                            llm_client.config.model = different_model
+                            
                         retry_response = llm_client.chat(retry_messages)
+                        
+                        # 如果有使用不同模型，恢复原来的模型
+                        if different_model:
+                            llm_client.config.model = original_model
+                            
                         if retry_response and hasattr(retry_response, 'content') and retry_response.content:
                             logger.info(f"重试生成SQL成功,获得响应: {retry_response.content[:100]}...")
 
@@ -1396,11 +1441,34 @@ class NL2SQLProcessor:
                             response = retry_response
                             # 更新日志
                             llm_log["retry_used"] = True
+                            llm_log["retry_successful"] = True
+                            llm_log["retry_reason"] = retry_reason
                         else:
                             logger.error("重试生成SQL失败,仍无法获得有效响应")
-                    except Exception as e:
-                        logger.error(f"重试生成SQL时出错: {str(e)}")
-
+                            llm_log["retry_used"] = True
+                            llm_log["retry_successful"] = False
+                            llm_log["retry_reason"] = retry_reason
+                            
+                            # 返回一个友好的错误消息
+                            return {
+                                'success': False,
+                                'message': '无法生成SQL查询，LLM服务返回无效响应。请稍后重试或使用更具体的查询描述。',
+                                'query': query
+                            }
+                    except Exception as retry_error:
+                        logger.error(f"重试生成SQL时出错: {str(retry_error)}")
+                        llm_log["retry_used"] = True
+                        llm_log["retry_successful"] = False
+                        llm_log["retry_reason"] = retry_reason
+                        llm_log["retry_error"] = str(retry_error)
+                        
+                        # 返回一个友好的错误消息
+                        return {
+                            'success': False,
+                            'message': f'无法生成SQL查询，重试也失败: {str(retry_error)}',
+                            'query': query
+                        }
+                
                 # 记录LLM响应
                 llm_log["llm_response"] = response.content
                 llm_log["execution_time"] = execution_time
@@ -1440,7 +1508,7 @@ class NL2SQLProcessor:
                         'query': query
                     }
                 else:
-                    logger.warning(f"无法从LLM响应中提取SQL: {response.content[:100]}...")
+                    logger.warning("无法从LLM响应中提取SQL")
                     return {
                         'success': False,
                         'message': '无法从生成的结果中提取有效的SQL。',
@@ -2276,6 +2344,59 @@ class NL2SQLProcessor:
             "user": user_prompt
         }
 
+    def _get_business_metadata(self, query: str) -> Dict[str, Any]:
+        """
+        获取业务元数据
+        
+        Args:
+            query: 自然语言查询
+            
+        Returns:
+            Dict: 业务元数据
+        """
+        business_metadata = {}
+        
+        # 如果找到了相似示例,直接使用示例中的表信息
+        similar_example = self._find_similar_example(query)
+        if similar_example and "tables" in similar_example:
+            from src.utils.metadata_extractor import MetadataExtractor
+            extractor = MetadataExtractor()
+            
+            # 获取示例中涉及的表的元数据
+            for table_info in similar_example["tables"]:
+                db_name = table_info.get("database", "")
+                table_name = table_info.get("table", "")
+                
+                if db_name and table_name:
+                    # 获取表级业务元数据
+                    table_metadata = extractor.get_business_metadata_for_table(db_name, table_name)
+                    if table_metadata:
+                        if "tables" not in business_metadata:
+                            business_metadata["tables"] = {}
+                        
+                        if db_name not in business_metadata["tables"]:
+                            business_metadata["tables"][db_name] = {}
+                        
+                        business_metadata["tables"][db_name][table_name] = table_metadata
+        else:
+            # 如果没有找到相似示例,获取所有数据库级别的元数据
+            logger.info("没有找到相似示例,获取所有数据库级别的元数据")
+            
+            from src.utils.metadata_extractor import MetadataExtractor
+            extractor = MetadataExtractor()
+            
+            # 获取所有数据库的业务元数据
+            business_metadata["databases"] = {}
+            for db_name in extractor.get_all_target_databases():
+                db_metadata = extractor.get_business_metadata_from_database(db_name)
+                if db_metadata:
+                    business_metadata["databases"][db_name] = db_metadata
+            
+            # 获取表层级模式
+            business_metadata["table_hierarchy"] = extractor._load_table_hierarchy_patterns()
+            
+        return business_metadata
+
 def calculate_similarity(text1: str, text2: str) -> float:
     """
     计算两段文本的相似度
@@ -2349,3 +2470,336 @@ def execute_sql(sql: str):
     """
     from src.utils.db import execute_query
     return execute_query(sql)
+
+    async def _generate_sql_stream(self, query: str, 
+                             similar_example: Optional[Dict[str, Any]] = None, 
+                             business_metadata: Optional[Dict[str, Any]] = None, 
+                             previous_error: Optional[Dict[str, Any]] = None,
+                             stream_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None) -> Dict[str, Any]:
+        """
+        流式生成SQL查询，并通过回调函数返回中间思考过程
+
+        Args:
+            query: 自然语言查询
+            similar_example: 相似的示例(可选)
+            business_metadata: 业务元数据(可选)
+            previous_error: 上一次出现的错误(可选)
+            stream_callback: 流式回调函数，接收中间思考过程和状态信息
+
+        Returns:
+            Dict: 包含生成的SQL和元数据的字典
+        """
+        result = {
+            "success": False,
+            "sql": "",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "thinking_process": "",
+            "process_steps": []
+        }
+        
+        # 检查回调函数是否为异步函数
+        is_async_callback = stream_callback and inspect.iscoroutinefunction(stream_callback)
+        
+        # 适配器函数，根据回调函数是否为异步来调用
+        async def call_stream_callback(message: str, metadata: Dict[str, Any]):
+            if not stream_callback:
+                return
+                
+            if is_async_callback:
+                await stream_callback(message, metadata)
+            else:
+                stream_callback(message, metadata)
+        
+        try:
+            # 如果有回调函数，先发送思考开始信号
+            await call_stream_callback("开始分析查询需求...", {
+                "step": "start",
+                "progress": 10
+            })
+            
+            # 获取表信息 - 发送进度
+            tables_info = self._get_tables_info()
+            await call_stream_callback("正在获取数据库表结构信息...", {
+                "step": "metadata",
+                "progress": 20
+            })
+            
+            # 收集用于生成的上下文信息
+            context_info = []
+            
+            # 添加表信息到上下文
+            context_info.append(f"数据库表结构信息:\n{tables_info}")
+            
+            # 添加相似示例到上下文
+            if similar_example:
+                context_info.append(f"相似问题: {similar_example.get('query', '')}")
+                context_info.append(f"对应SQL: {similar_example.get('sql', '')}")
+                await call_stream_callback(f"找到相似查询示例: {similar_example.get('query', '')}", {
+                    "step": "similar_example",
+                    "progress": 30
+                })
+            else:
+                await call_stream_callback(f"未找到相似查询示例，将直接生成SQL", {
+                    "step": "similar_example",
+                    "progress": 30
+                })
+            
+            # 添加业务元数据到上下文
+            if business_metadata:
+                business_info = json.dumps(business_metadata, ensure_ascii=False, indent=2)
+                context_info.append(f"业务元数据:\n{business_info}")
+                await call_stream_callback("分析业务领域元数据...", {
+                    "step": "business_metadata",
+                    "progress": 40
+                })
+            else:
+                await call_stream_callback("未找到相关业务元数据", {
+                    "step": "business_metadata",
+                    "progress": 40
+                })
+            
+            # 如果有之前的错误,添加到上下文
+            if previous_error:
+                error_info = f"上一次执行错误: {previous_error.get('message', '')}"
+                context_info.append(error_info)
+                await call_stream_callback(f"处理上一次执行错误: {previous_error.get('message', '')}", {
+                    "step": "previous_error",
+                    "progress": 50
+                })
+            
+            # 构建提示
+            context = "\n\n".join(context_info)
+            system_prompt = NL2SQL_PROMPTS["SYSTEM_PROMPT"].format(context=context)
+            user_prompt = NL2SQL_PROMPTS["USER_PROMPT"].format(query=query)
+            
+            log_query_process({
+                "type": "generate_sql_request",
+                "query": query,
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "similar_example": similar_example,
+                "business_metadata": business_metadata if isinstance(business_metadata, dict) else None,
+                "previous_error": previous_error
+            }, "llm_calls")
+            
+            # 初始化LLM客户端
+            from src.utils.llm_client import get_llm_client, Message
+            client = get_llm_client(stage="sql_generation")
+            
+            # 流式思考过程
+            thinking_buffer = ""
+            
+            async def stream_content_callback(content_chunk: str):
+                nonlocal thinking_buffer
+                # 追加到思考缓冲区
+                thinking_buffer += content_chunk
+                # 调用外部回调
+                # 计算当前进度 - 流式思考过程视为60-90%区间
+                progress = min(90, 60 + int(len(thinking_buffer) / 100))
+                await call_stream_callback(content_chunk, {
+                    "step": "thinking",
+                    "progress": progress
+                })
+            
+            # 发送流式思考信号
+            await call_stream_callback("思考如何将自然语言转换为SQL...", {
+                "step": "thinking_start",
+                "progress": 60
+            })
+            
+            # 使用流式调用
+            messages = [
+                Message.system(system_prompt),
+                Message.user(user_prompt)
+            ]
+            
+            try:
+                # 流式调用LLM
+                response = await client.chat(
+                    messages=messages,
+                    temperature=float(os.getenv("SQL_GENERATION_TEMPERATURE", "0.2")),
+                    max_tokens=int(os.getenv("SQL_GENERATION_MAX_TOKENS", "2048")),
+                    stream=True,
+                    stream_callback=stream_content_callback
+                )
+                
+                # 获取最终内容
+                content = thinking_buffer
+                
+                # 记录最终结果
+                log_query_process({
+                    "type": "generate_sql_response",
+                    "content": content
+                }, "llm_calls")
+                
+                # 从响应中提取SQL
+                logger.info(f"LLM响应内容前100个字符: {content[:100]}")
+                sql = self._extract_sql(content)
+                
+                if sql:
+                    logger.info(f"成功生成SQL: {sql[:100]}")
+                    result["success"] = True
+                    result["sql"] = sql
+                    result["raw_response"] = content
+                    result["thinking_process"] = thinking_buffer
+                    
+                    # 发送SQL生成完成信号
+                    if stream_callback:
+                        stream_callback(f"已生成SQL查询:\n{sql}", {
+                            "step": "sql_generated",
+                            "progress": 95,
+                            "sql": sql
+                        })
+                else:
+                    logger.warning("无法从LLM响应中提取SQL")
+                    result["error"] = {
+                        "message": "无法从LLM响应中提取SQL",
+                        "detail": "请检查LLM响应格式是否正确"
+                    }
+                    result["raw_response"] = content
+                    result["thinking_process"] = thinking_buffer
+                    
+                    # 发送SQL生成失败信号
+                    if stream_callback:
+                        stream_callback("无法从LLM响应中提取SQL，请检查响应格式", {
+                            "step": "error",
+                            "progress": 95,
+                            "error": "无法从LLM响应中提取SQL"
+                        })
+                
+                # 添加令牌统计信息
+                if hasattr(response, 'usage') and response.usage:
+                    result["prompt_tokens"] = response.usage.get("prompt_tokens", 0)
+                    result["completion_tokens"] = response.usage.get("completion_tokens", 0)
+                    result["total_tokens"] = response.usage.get("total_tokens", 0)
+                
+            except Exception as e:
+                logger.error(f"生成SQL时出错: {str(e)}")
+                result["error"] = {
+                    "message": f"生成SQL时出错: {str(e)}",
+                    "detail": traceback.format_exc()
+                }
+                result["thinking_process"] = thinking_buffer
+                
+                # 发送错误信号
+                if stream_callback:
+                    stream_callback(f"生成SQL时出错: {str(e)}", {
+                        "step": "error",
+                        "progress": 100,
+                        "error": str(e)
+                    })
+            
+            # 发送处理完成信号
+            if stream_callback:
+                stream_callback("SQL生成过程完成", {
+                    "step": "complete",
+                    "progress": 100
+                })
+                
+            return result
+            
+        except Exception as e:
+            logger.error(f"流式生成SQL处理过程出错: {str(e)}\n{traceback.format_exc()}")
+            result["error"] = {
+                "message": f"流式生成SQL处理过程出错: {str(e)}",
+                "detail": traceback.format_exc()
+            }
+            
+            # 发送错误信号
+            if stream_callback:
+                stream_callback(f"流式生成SQL处理过程出错: {str(e)}", {
+                    "step": "error",
+                    "progress": 100,
+                    "error": str(e)
+                })
+                
+            return result
+            
+    async def process_stream(self, query: str, stream_callback: Callable[[str, Dict[str, Any]], None]) -> Dict[str, Any]:
+        """
+        流式处理自然语言转SQL查询，并通过回调函数返回中间结果
+
+        Args:
+            query: 自然语言查询
+            stream_callback: 流式回调函数，接收中间结果和状态信息
+
+        Returns:
+            Dict: 包含SQL、执行结果和元数据的字典
+        """
+        start_time = time.time()
+
+        # 准备响应结构
+        response = {
+            "query": query,
+            "is_business_query": False,
+            "sql": "",
+            "result": None,
+            "column_names": [],
+            "error": None,
+            "execution_time": 0,
+            "message": "",
+            "similar_example": None,
+            "cached": False,
+            "log_id": str(uuid.uuid4()),
+            "thinking_process": "",
+            "success": True
+        }
+        
+        # 检查回调函数是否为异步函数
+        is_async_callback = inspect.iscoroutinefunction(stream_callback)
+        
+        # 适配器函数，根据回调函数是否为异步来调用
+        async def call_stream_callback(message: str, metadata: Dict[str, Any]):
+            # 添加消息到思考过程
+            if "thinking_process" in response:
+                response["thinking_process"] += message + "\n"
+                
+            if is_async_callback:
+                await stream_callback(message, metadata)
+            else:
+                stream_callback(message, metadata)
+        
+        # 发送开始信号
+        try:
+            await call_stream_callback("开始处理查询...", {
+                "step": "start",
+                "progress": 5
+            })
+            
+            # 简化版流式处理 - 直接使用同步的process方法并模拟流式
+            await call_stream_callback("分析查询类型...", {
+                "step": "analyzing",
+                "progress": 10
+            })
+            
+            # 处理查询
+            result = self.process(query)
+            
+            # 添加思考过程
+            result["thinking_process"] = response["thinking_process"]
+            
+            # 发送完成信号
+            await call_stream_callback("查询处理完成", {
+                "step": "complete",
+                "progress": 100
+            })
+            
+            return result
+            
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"流式处理查询时出错: {error_msg}")
+            
+            # 发送错误信号
+            await call_stream_callback(f"处理出错: {error_msg}", {
+                "step": "error",
+                "progress": 100
+            })
+            
+            response["error"] = error_msg
+            response["success"] = False
+            response["message"] = f"处理查询时出错: {error_msg}"
+            
+            return response

@@ -13,6 +13,9 @@ import json
 from dotenv import load_dotenv
 import datetime
 from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+from fastapi import Response, Request
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -53,6 +56,10 @@ service = NL2SQLService()
 
 # 初始化SQL优化器
 sql_optimizer = SQLOptimizer()
+
+# 初始化流式处理器实例，用于处理状态跟踪
+from src.nl2sql_stream_processor import StreamNL2SQLProcessor
+stream_processor = StreamNL2SQLProcessor()
 
 @mcp.resource("doris://database/info")
 def doris_database_info():
@@ -129,6 +136,77 @@ def nl2sql_query(query: str):
         return {
             "success": False,
             "message": f"处理查询时出错: {error_msg}",
+            "query": query
+        }
+
+@mcp.tool()
+async def nl2sql_query_stream(query: str):
+    """
+    将自然语言查询转换为SQL，并使用流式响应返回结果。
+    提供实时的思考过程和进度更新。
+    
+    参数:
+        query: 自然语言查询
+    
+    返回:
+        查询结果，包含SQL、执行结果等
+    """
+    try:
+        # 记录开始处理请求
+        start_time = datetime.datetime.now()
+        request_id = hash(f"{query}_{start_time.isoformat()}")
+        
+        # 记录请求到审计日志
+        audit_data = {
+            "timestamp": start_time.isoformat(),
+            "request_id": str(request_id),
+            "action": "nl2sql_query_stream",
+            "query": query,
+            "status": "processing"
+        }
+        audit_logger.audit(json.dumps(audit_data))
+        
+        # 使用全局流式处理器实例
+        global stream_processor
+        
+        # 创建一个哑回调函数，因为真正的回调会由adapter提供
+        async def dummy_callback(content: str, metadata: dict):
+            pass
+        
+        # 使用流式处理查询
+        result = await stream_processor.process_stream(query, dummy_callback)
+        
+        # 记录处理结果到审计日志
+        end_time = datetime.datetime.now()
+        duration_ms = (end_time - start_time).total_seconds() * 1000
+        
+        audit_data.update({
+            "end_timestamp": end_time.isoformat(),
+            "duration_ms": duration_ms,
+            "status": "completed" if not result.get("error") else "failed",
+            "sql": result.get("sql", ""),
+            "error": result.get("error", None)
+        })
+        audit_logger.audit(json.dumps(audit_data))
+        
+        # 返回结果
+        return result
+    except Exception as e:
+        # 记录错误到审计日志和错误日志
+        error_msg = str(e)
+        logger.error(f"处理流式查询时出错: {error_msg}")
+        
+        # 错误审计
+        if 'audit_data' in locals():
+            audit_data.update({
+                "status": "error",
+                "error": error_msg
+            })
+            audit_logger.audit(json.dumps(audit_data))
+        
+        return {
+            "success": False,
+            "message": f"处理流式查询时出错: {error_msg}",
             "query": query
         }
 
@@ -313,6 +391,30 @@ def fix_sql(sql: str, error_message: str, requirements: str = ""):
         }
 
 @mcp.tool()
+def get_nl2sql_status():
+    """
+    获取当前NL2SQL处理状态
+    
+    返回:
+        当前处理阶段、进度和阶段历史
+    """
+    try:
+        # 使用全局流式处理器获取当前状态
+        status = stream_processor.get_current_processing_status()
+        return {
+            "success": True,
+            "current_status": status,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"获取处理状态时出错: {str(e)}")
+        return {
+            "success": False,
+            "message": f"获取处理状态时出错: {str(e)}",
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+
+@mcp.tool()
 def list_llm_providers():
     """
     列出可用的LLM提供商
@@ -365,50 +467,39 @@ def set_llm_provider(provider_name: str):
 @mcp.tool()
 def health():
     """
-    健康检查工具，用于检查服务器是否正常运行。
+    健康检查工具
     
-    Returns:
-        Dict: 包含服务器健康状态的字典
+    返回服务的健康状态
     """
-    try:
-        return {
-            "status": "healthy",
-            "timestamp": datetime.datetime.now().isoformat(),
-            "version": "1.0.0"
-        }
-    except Exception as e:
-        logger.error(f"健康检查失败: {str(e)}")
-        return {
-            "status": "unhealthy",
-            "error": str(e),
-            "timestamp": datetime.datetime.now().isoformat()
-        }
+    return {
+        "status": "healthy",
+        "timestamp": datetime.datetime.now().isoformat(),
+        "version": "1.0.0"
+    }
 
 @mcp.tool()
 def status():
     """
-    获取服务器详细状态信息，包括服务器配置、LLM提供商状态等。
-    
-    Returns:
-        Dict: 包含服务器详细状态的字典
+    获取服务器状态
     """
     try:
-        import os
         import psutil
         import platform
-        from src.utils.llm_client import get_llm_providers
         
         process = psutil.Process(os.getpid())
         
         # 获取LLM提供商状态
         llm_providers = []
         try:
+            from src.utils.llm_client import get_llm_providers
             providers = get_llm_providers()
             llm_providers = list(providers.keys()) if providers else []
         except Exception as e:
             logger.warning(f"获取LLM提供商信息失败: {str(e)}")
+            # 提供一个默认列表，避免前端错误
+            llm_providers = ["openai", "local"]
         
-        return {
+            return {
             "service": {
                 "status": "running",
                 "uptime": datetime.datetime.now().timestamp() - process.create_time(),
@@ -439,7 +530,7 @@ def status():
                 "default_provider": os.getenv("LLM_PROVIDER", "openai"),
                 "default_model": os.getenv(f"{os.getenv('LLM_PROVIDER', 'openai').upper()}_MODEL", "unknown")
             }
-        }
+            }
     except Exception as e:
         logger.error(f"获取服务器状态失败: {str(e)}")
         return {
@@ -593,6 +684,46 @@ def list_prompts():
                 "message": f"获取提示模板列表时出错: {str(e)}"
             }
         }
+    
+def add_sse_endpoints(app):
+    """添加自定义SSE端点和测试端点"""
+    async def sse_test(request):
+        """SSE测试端点，返回一个简单的JSON表明SSE服务已正确配置"""
+        return JSONResponse({
+            "status": "ok", 
+            "message": "SSE服务器正常运行", 
+            "timestamp": datetime.datetime.now().isoformat()
+        })
+    
+    async def health_check(request):
+        """健康检查端点，使前端可以直接检查服务器状态"""
+        return JSONResponse({
+            "status": "healthy",
+            "timestamp": datetime.datetime.now().isoformat()
+        })
+    
+    async def test_session(request):
+        """测试会话端点，测试会话ID处理"""
+        session_id = request.path_params.get("session_id", "unknown")
+        return JSONResponse({
+            "status": "ok",
+            "session_id": session_id,
+            "message": f"会话 {session_id} 有效",
+            "timestamp": datetime.datetime.now().isoformat()
+        })
+    
+    # 使用Starlette的路由方式添加路由
+    routes = [
+        Route("/sse-test", sse_test),
+        Route("/health", health_check),
+        Route("/test-session/{session_id}", test_session)
+    ]
+    
+    # 将路由添加到应用
+    for route in routes:
+        app.routes.append(route)
+    
+    return app
 
 def main():
     """
@@ -601,11 +732,8 @@ def main():
     # 设置环境变量，禁用控制台日志输出
     os.environ["CONSOLE_LOGGING"] = "false"
     
-    # 创建服务
-    service = NL2SQLService()
-    
     # 记录服务启动
-    logger.info("启动Doris MCP NL2SQL服务")
+    logger.info("启动Doris MCP NL2SQL服务 (SSE模式)")
     logger.info(f"当前工作目录: {os.getcwd()}")
     logger.info(f"Python版本: {sys.version}")
     logger.info(f"日志配置: LOG_DIR={os.getenv('LOG_DIR', 'logs')}, LOG_LEVEL={os.getenv('LOG_LEVEL', 'INFO')}")
@@ -616,7 +744,8 @@ def main():
     mcp_port = int(os.getenv("MCP_PORT", "3000"))
     
     # 获取允许的客户端源，默认为前端开发服务器
-    allowed_origins = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:3100").split(",")]
+    allowed_origins = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:3100,http://localhost:5173").split(",")]
+    
     # 添加'*'以允许所有源（仅用于测试）
     if '*' in allowed_origins:
         allowed_origins = ["*"]
@@ -624,51 +753,48 @@ def main():
     else:
         logger.info(f"允许的跨域源: {allowed_origins}")
     
-    # 检查FastMCP版本是否支持CORS配置
-    # 如果支持，可以直接设置；如果不支持，需要使用中间件方式
-    
-    # 在这里，我们创建FastMCP的应用，然后添加CORS中间件
-    
-    # 设置CORS相关的环境变量（FastMCP库可能会读取这些变量）
+    # 设置CORS相关的环境变量
     os.environ["MCP_ALLOWED_ORIGINS"] = ",".join(allowed_origins)
-    os.environ["MCP_ALLOW_CREDENTIALS"] = "0"  # 禁用凭证要求，避免跨域问题
+    os.environ["MCP_ALLOW_CREDENTIALS"] = "false"  # 禁用凭证要求，避免跨域问题
     os.environ["MCP_ALLOW_METHODS"] = "GET,POST,OPTIONS"
     os.environ["MCP_ALLOW_HEADERS"] = "*"
     
-    # 准备好FastMCP实例，但暂时不启动
+    # 确保FastMCP使用SSE模式
+    # 创建SSE应用
     app = mcp.sse_app()
+    
+    # 添加自定义端点
+    app = add_sse_endpoints(app)
+    
+    # 导入并添加MCP协议适配中间件
+    from src.mcp_adapter import MCPAdapterMiddleware
+    app.add_middleware(MCPAdapterMiddleware)
+    logger.info("已添加MCP协议适配中间件，支持旧版客户端格式")
     
     # 添加CORS中间件
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
-        allow_credentials=False,  # 禁用凭证要求，避免跨域问题
+        allow_credentials=False,  # 禁用凭证要求，避免CORS问题
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["*"],  # 允许所有请求头
-        expose_headers=["*"],  # 暴露所有响应头
+        allow_headers=["*"],
+        expose_headers=["*"],
         max_age=86400,  # 预检请求缓存时间（24小时）
     )
     
-    # 使用修改后的应用启动服务
-    import uvicorn
-    logger.info(f"启动MCP服务器，端口: {mcp_port}")
+    # 日志显示启动信息
+    logger.info(f"MCP SSE服务器准备启动于 {host}:{mcp_port}")
+    logger.info(f"CORS配置: allow_origins={allowed_origins}, allow_credentials=False")
+    logger.info("测试端点: /health, /sse-test")
     
-    # 使用uvicorn服务器直接运行，而不是通过FastMCP的run方法
+    # 使用uvicorn启动服务
+    import uvicorn
     uvicorn.run(
         app,
         host=host,
         port=mcp_port,
         log_level=os.getenv("LOG_LEVEL", "info").lower()
     )
-    
-    # 注意：不再调用 mcp.run() 方法，我们直接使用uvicorn运行添加了CORS中间件的应用
-    
-    # 注意：MCP客户端需要通过SSE协议连接到此服务器
-    # 客户端应使用正确的MCP客户端库（如官方的MCP-Client）连接，而不是直接使用HTTP API
-    # 连接流程：
-    # 1. 客户端首先连接到SSE端点（通常是/sse）
-    # 2. 服务器返回一个会话ID和消息端点URL
-    # 3. 客户端通过POST请求该消息端点来发送请求（如prompts/list, resources/read等）
 
 if __name__ == "__main__":
     main() 

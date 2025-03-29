@@ -228,43 +228,323 @@ class LLMClient:
         
         # 其他提供商使用requests直接调用API
     
-    def chat(self, messages: List[Union[Message, Dict[str, str]]], stream: bool = False) -> LLMResponse:
+    async def chat_stream(self, messages: List[Message], callback: Callable[[str], None], temperature: float = 0.7, max_tokens: Optional[int] = None, top_p: float = 1.0) -> dict:
         """
-        调用LLM进行聊天
-        
+        流式调用LLM聊天API
+
         Args:
             messages: 消息列表
-            stream: 是否使用流式输出
-            
+            callback: 流式输出回调函数，接收每个输出块
+            temperature: 温度
+            max_tokens: 最大token数
+            top_p: 核采样
+
         Returns:
-            LLMResponse: LLM响应
+            最终完整的LLM响应
         """
-        # 转换消息格式
-        formatted_messages = []
-        for message in messages:
-            if isinstance(message, Message):
-                formatted_messages.append(message.to_dict())
-            else:
-                formatted_messages.append(message)
+        provider = self.config.provider.value.lower()
         
-        # 验证并修复消息序列,防止连续的用户或助手消息（DeepSeek模型不支持）
-        formatted_messages = self._validate_message_sequence(formatted_messages)
+        try:
+            # 准备请求参数
+            if provider == "openai":
+                try:
+                    from openai import AsyncOpenAI, OpenAIError
+                    
+                    # 为异步客户端设置超时
+                    import httpx
+                    async_timeout = httpx.Timeout(connect=5.0, read=300.0, write=60.0, pool=10.0)
+                    
+                    client = AsyncOpenAI(
+                        api_key=self.config.api_key, 
+                        base_url=self.config.base_url,
+                        timeout=async_timeout,
+                        max_retries=5
+                    )
+                    
+                    # 转换消息格式
+                    formatted_messages = []
+                    for msg in messages:
+                        content = msg.content
+                        formatted_messages.append({"role": msg.role, "content": content})
+                    
+                    # 设置请求参数
+                    kwargs = {
+                        "model": self.config.model,
+                        "messages": formatted_messages,
+                        "temperature": float(temperature),
+                        "top_p": float(top_p),
+                        "stream": True
+                    }
+                    
+                    if max_tokens:
+                        kwargs["max_tokens"] = int(max_tokens)
+                    
+                    # 流式处理
+                    response_text = ""
+                    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                    
+                    try:
+                        # 创建并发送流式请求
+                        stream = await client.chat.completions.create(**kwargs)
+                        
+                        async for chunk in stream:
+                            if hasattr(chunk, 'choices') and chunk.choices:
+                                # 提取增量内容
+                                delta = chunk.choices[0].delta
+                                if hasattr(delta, 'content') and delta.content:
+                                    content_chunk = delta.content
+                                    response_text += content_chunk
+                                    # 回调处理每个块
+                                    callback(content_chunk)
+                        
+                        # 设置使用情况估计
+                        if hasattr(stream, 'usage') and stream.usage:
+                            usage = stream.usage
+                        else:
+                            # 估计token用量
+                            import tiktoken
+                            enc = tiktoken.encoding_for_model(self.config.model)
+                            prompt_tokens = sum(len(enc.encode(msg.content)) for msg in messages)
+                            completion_tokens = len(enc.encode(response_text))
+                            usage = {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": prompt_tokens + completion_tokens
+                            }
+                        
+                        # 构建最终响应
+                        return {
+                            "content": response_text,
+                            "model": self.config.model,
+                            "usage": usage
+                        }
+                    
+                    except OpenAIError as e:
+                        error_msg = f"OpenAI API调用出错: {str(e)}"
+                        logger.error(error_msg)
+                        raise Exception(error_msg)
+                    
+                except ImportError:
+                    error_msg = "未安装OpenAI库"
+                    logger.error(error_msg)
+                    raise Exception(error_msg)
+                    
+            elif provider == "deepseek":
+                try:
+                    import httpx
+                    
+                    # 准备DeepSeek API请求
+                    api_url = f"{self.config.base_url}/chat/completions"
+                    headers = {
+                        "Authorization": f"Bearer {self.config.api_key}",
+                        "Content-Type": "application/json"
+                    }
+                    
+                    # 转换消息格式
+                    formatted_messages = []
+                    for msg in messages:
+                        content = msg.content
+                        formatted_messages.append({"role": msg.role, "content": content})
+                    
+                    # 构建请求JSON
+                    request_data = {
+                        "model": self.config.model,
+                        "messages": formatted_messages,
+                        "temperature": float(temperature),
+                        "top_p": float(top_p),
+                        "stream": True
+                    }
+                    
+                    if max_tokens:
+                        request_data["max_tokens"] = int(max_tokens)
+                    
+                    # 流式处理
+                    response_text = ""
+                    
+                    try:
+                        async with httpx.AsyncClient(timeout=120.0) as client:
+                            async with client.stream("POST", api_url, json=request_data, headers=headers) as response:
+                                if response.status_code != 200:
+                                    error_msg = f"DeepSeek API返回错误: {response.status_code} - {await response.text()}"
+                                    logger.error(error_msg)
+                                    raise Exception(error_msg)
+                                
+                                # 处理SSE流
+                                async for line in response.aiter_lines():
+                                    if not line.strip() or line.startswith(':'):
+                                        continue
+                                        
+                                    # 去除"data: "前缀
+                                    if line.startswith('data: '):
+                                        line = line[6:]
+                                    
+                                    # 处理[DONE]标记
+                                    if line.strip() == '[DONE]':
+                                        break
+                                    
+                                    try:
+                                        chunk = json.loads(line)
+                                        if 'choices' in chunk and chunk['choices']:
+                                            delta = chunk['choices'][0].get('delta', {})
+                                            content_chunk = delta.get('content', '')
+                                            if content_chunk:
+                                                response_text += content_chunk
+                                                # 回调处理每个块
+                                                callback(content_chunk)
+                                    except json.JSONDecodeError:
+                                        logger.warning(f"无法解析DeepSeek响应: {line}")
+                    
+                    except Exception as e:
+                        error_msg = f"DeepSeek流式API调用出错: {str(e)}"
+                        logger.error(error_msg)
+                        logger.error(traceback.format_exc())
+                        raise Exception(error_msg)
+                    
+                    # 估计token用量
+                    usage = {}
+                    try:
+                        import tiktoken
+                        enc = tiktoken.encoding_for_model("gpt-3.5-turbo")  # 使用兼容的分词器
+                        prompt_tokens = sum(len(enc.encode(msg.content)) for msg in messages)
+                        completion_tokens = len(enc.encode(response_text))
+                        usage = {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": prompt_tokens + completion_tokens
+                        }
+                    except ImportError:
+                        pass
+                    
+                    # 构建最终响应
+                    return {
+                        "content": response_text,
+                        "model": self.config.model,
+                        "usage": usage
+                    }
+                    
+                except Exception as e:
+                    error_msg = f"DeepSeek流式API调用出错: {str(e)}"
+                    logger.error(error_msg)
+                    logger.error(traceback.format_exc())
+                    raise Exception(error_msg)
+            
+            else:
+                error_msg = f"不支持的提供商 {provider} 的流式调用"
+                logger.error(error_msg)
+                raise Exception(error_msg)
                 
-        # 根据不同提供商调用不同的方法
-        if self.config.provider in [LLMProvider.OPENAI, LLMProvider.DEEPSEEK]:
-            return self._chat_openai_compatible(formatted_messages, stream)
-        elif self.config.provider == LLMProvider.SIJILIU:
-            return self._chat_sijiliu(formatted_messages, stream)
-        elif self.config.provider == LLMProvider.VOLCENGINE:
-            return self._chat_volcengine(formatted_messages, stream)
-        elif self.config.provider == LLMProvider.QWEN:
-            return self._chat_qwen(formatted_messages, stream)
-        elif self.config.provider == LLMProvider.OLLAMA:
-            return self._chat_ollama(formatted_messages, stream)
-        elif self.config.provider == LLMProvider.MLX:
-            return self._chat_mlx(formatted_messages, stream)
-        else:
-            raise ValueError(f"不支持的LLM提供商: {self.config.provider}")
+        except Exception as e:
+            error_msg = f"流式调用出错: {str(e)}"
+            logger.error(error_msg)
+            logger.error(traceback.format_exc())
+            raise Exception(error_msg)
+    
+    def chat(self, messages: List[Message], temperature: float = None, max_tokens: int = None, top_p: float = None, stream: bool = False, stream_callback: Optional[Callable[[str], None]] = None) -> LLMResponse:
+        """
+        调用LLM聊天API
+
+        Args:
+            messages: 消息列表
+            temperature: 温度
+            max_tokens: 最大token数
+            top_p: 核采样
+            stream: 是否使用流式输出
+            stream_callback: 流式输出回调函数
+
+        Returns:
+            LLM响应
+        """
+        # 如果启用流式输出且提供了回调，则使用流式调用
+        if stream and stream_callback:
+            import asyncio
+            try:
+                # 尝试获取当前事件循环
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # 如果已经有一个运行中的事件循环，创建一个新的事件循环来运行协程
+                    new_loop = asyncio.new_event_loop()
+                    try:
+                        return new_loop.run_until_complete(self.chat_stream(messages, stream_callback, temperature or self.config.temperature, max_tokens or self.config.max_tokens, top_p or self.config.top_p))
+                    finally:
+                        new_loop.close()
+                else:
+                    # 如果没有运行中的事件循环，使用当前事件循环
+                    return loop.run_until_complete(self.chat_stream(messages, stream_callback, temperature or self.config.temperature, max_tokens or self.config.max_tokens, top_p or self.config.top_p))
+            except RuntimeError as e:
+                logger.error(f"无法使用事件循环运行流式调用: {str(e)}")
+                # 返回一个空响应
+                return LLMResponse(
+                    content="",
+                    model=self.config.model,
+                    usage={},
+                    finish_reason="error",
+                    raw_response=None
+                )
+        
+        # 常规非流式调用
+        provider = self.config.provider.value.lower()
+        
+        # 使用指定的参数覆盖默认配置
+        temp = temperature if temperature is not None else self.config.temperature
+        tokens = max_tokens if max_tokens is not None else self.config.max_tokens
+        p = top_p if top_p is not None else self.config.top_p
+        
+        # 暂存原始配置
+        original_temp = self.config.temperature
+        original_tokens = self.config.max_tokens
+        original_p = self.config.top_p
+        
+        # 临时更新配置
+        self.config.temperature = temp
+        self.config.max_tokens = tokens
+        self.config.top_p = p
+        
+        try:
+            # 根据提供商调用不同的方法
+            if provider == "openai" or provider == "deepseek":
+                # 使用兼容OpenAI接口的方式调用DeepSeek和OpenAI
+                response = self._chat_openai_compatible(messages, stream)
+            elif provider == "sijiliu":
+                # 硅基流动
+                response = self._chat_sijiliu([m.to_dict() for m in messages], stream)
+            elif provider == "volcengine":
+                # 火山引擎
+                response = self._chat_volcengine([m.to_dict() for m in messages], stream)
+            elif provider == "qwen":
+                # 阿里云Qwen
+                response = self._chat_qwen([m.to_dict() for m in messages], stream)
+            elif provider == "ollama":
+                # Ollama本地模型
+                response = self._chat_ollama([m.to_dict() for m in messages], stream)
+            elif provider == "mlx":
+                # MLX本地模型
+                response = self._chat_mlx([m.to_dict() for m in messages], stream)
+            else:
+                error_msg = f"不支持的提供商: {provider}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+                
+            # 恢复原始配置
+            self.config.temperature = original_temp
+            self.config.max_tokens = original_tokens
+            self.config.top_p = original_p
+            
+            return response
+        except Exception as e:
+            logger.error(f"LLM调用出错: {str(e)}")
+            # 恢复原始配置
+            self.config.temperature = original_temp
+            self.config.max_tokens = original_tokens
+            self.config.top_p = original_p
+            
+            # 返回一个空响应，而不是引发异常
+            return LLMResponse(
+                content="",
+                model=self.config.model,
+                usage={},
+                finish_reason="error",
+                raw_response=None
+            )
     
     def _validate_message_sequence(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """
@@ -317,15 +597,130 @@ class LLMClient:
             
         return fixed_messages
     
-    def _chat_openai_compatible(self, messages: List[Dict[str, str]], stream: bool = False) -> LLMResponse:
-        """
-        调用OpenAI兼容接口（OpenAI和DeepSeek）
-        """
+    def _chat_openai_compatible(self, messages: List[Message], stream: bool = False) -> LLMResponse:
+        """使用兼容OpenAI接口的方式调用DeepSeek和OpenAI"""
+        logger.info(f"使用{self.config.provider.value}供应商的模型: {self.config.model}")
+        
+        # 确保_client已经初始化
+        if not self._client:
+            try:
+                from openai import OpenAI
+                # 如果是DeepSeek, 需要自定义URL
+                if self.config.provider == LLMProvider.DEEPSEEK:
+                    # 修正DeepSeek的API端点，删除/api/v1前缀
+                    self._client = OpenAI(
+                        api_key=self.config.api_key,
+                        base_url=self.config.base_url  # 直接使用base_url，不需要附加路径
+                    )
+                else:
+                    # OpenAI和其他供应商
+                    self._client = OpenAI(
+                        api_key=self.config.api_key,
+                        base_url=self.config.base_url
+                    )
+            except ImportError:
+                logger.error("未安装openai库，无法使用OpenAI或DeepSeek")
+                return LLMResponse(
+                    content="",
+                    model=self.config.model,
+                    usage={},
+                    finish_reason="error",
+                    raw_response=None
+                )
+        
+        # 将Message对象转换为字典
+        messages_dict = [m.to_dict() for m in messages]
+        
+        # 如果是DeepSeek，尝试直接使用requests调用
+        if self.config.provider == LLMProvider.DEEPSEEK:
+            try:
+                import requests
+                import json
+                
+                # 准备请求
+                url = f"{self.config.base_url}/chat/completions"
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.config.api_key}"
+                }
+                
+                # 构建请求体
+                data = {
+                    "model": self.config.model,
+                    "messages": messages_dict,
+                    "temperature": self.config.temperature,
+                    "top_p": self.config.top_p,
+                    "stream": stream
+                }
+                
+                if self.config.max_tokens:
+                    data["max_tokens"] = self.config.max_tokens
+                
+                # 添加额外参数
+                data.update(self.config.additional_params)
+                
+                # 记录调用细节用于调试
+                logger.debug(f"DeepSeek请求URL: {url}")
+                logger.debug(f"DeepSeek请求体: {json.dumps(data)}")
+                
+                # 发送请求
+                response = requests.post(url, headers=headers, json=data, timeout=300)
+                
+                # 检查响应状态
+                if response.status_code != 200:
+                    logger.error(f"DeepSeek API返回错误: {response.status_code} - {response.text}")
+                    return LLMResponse(
+                        content="",
+                        model=self.config.model,
+                        usage={},
+                        finish_reason="error",
+                        raw_response=response.text
+                    )
+                
+                # 解析JSON响应
+                result = response.json()
+                
+                # 从响应中提取内容
+                if 'choices' in result and len(result['choices']) > 0:
+                    content = result['choices'][0]['message']['content']
+                    
+                    # 构建响应对象
+                    return LLMResponse(
+                        content=content,
+                        model=result.get('model', self.config.model),
+                        usage=result.get('usage', {}),
+                        finish_reason=result['choices'][0].get('finish_reason'),
+                        raw_response=result
+                    )
+                else:
+                    logger.error(f"DeepSeek响应缺少choices字段: {result}")
+                    return LLMResponse(
+                        content="",
+                        model=self.config.model,
+                        usage={},
+                        finish_reason="error",
+                        raw_response=result
+                    )
+                    
+            except Exception as e:
+                logger.error(f"使用requests直接调用DeepSeek API时出错: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
+                # 返回空响应而不是引发异常
+                return LLMResponse(
+                    content="",
+                    model=self.config.model,
+                    usage={},
+                    finish_reason="error",
+                    raw_response=None
+                )
+        
+        # 对于OpenAI和其他提供商，使用标准OpenAI客户端
         try:
             # 构建请求参数
             params = {
                 "model": self.config.model,
-                "messages": messages,
+                "messages": messages_dict,
                 "temperature": self.config.temperature,
                 "top_p": self.config.top_p,
                 "stream": stream
@@ -366,7 +761,14 @@ class LLMClient:
                 )
         except Exception as e:
             logger.error(f"调用OpenAI兼容接口时出错: {str(e)}")
-            raise
+            # 返回空响应而不是引发异常
+            return LLMResponse(
+                content="",
+                model=self.config.model,
+                usage={},
+                finish_reason="error",
+                raw_response=None
+            )
     
     def _chat_mlx(self, messages: List[Dict[str, str]], stream: bool = False) -> LLMResponse:
         """
@@ -516,7 +918,7 @@ class LLMClient:
             # 发送请求
             if stream:
                 # 流式响应
-                response = requests.post(url, headers=headers, json=data, stream=True, timeout=self.config.timeout)
+                response = requests.post(url, headers=headers, json=data, stream=True, timeout=300)
                 response.raise_for_status()
                 
                 content = ""
@@ -544,7 +946,7 @@ class LLMClient:
                 )
             else:
                 # 非流式响应
-                response = requests.post(url, headers=headers, json=data, timeout=self.config.timeout)
+                response = requests.post(url, headers=headers, json=data, timeout=300)
                 response.raise_for_status()
                 
                 # 解析响应
@@ -596,7 +998,7 @@ class LLMClient:
             # 发送请求
             if stream:
                 # 流式响应
-                response = requests.post(url, headers=headers, json=data, stream=True, timeout=self.config.timeout)
+                response = requests.post(url, headers=headers, json=data, stream=True, timeout=300)
                 response.raise_for_status()
                 
                 content = ""
@@ -624,7 +1026,7 @@ class LLMClient:
                 )
             else:
                 # 非流式响应
-                response = requests.post(url, headers=headers, json=data, timeout=self.config.timeout)
+                response = requests.post(url, headers=headers, json=data, timeout=300)
                 response.raise_for_status()
                 
                 # 解析响应
@@ -682,7 +1084,7 @@ class LLMClient:
             # 发送请求
             if stream:
                 # 流式响应
-                response = requests.post(url, headers=headers, json=data, stream=True, timeout=self.config.timeout)
+                response = requests.post(url, headers=headers, json=data, stream=True, timeout=300)
                 response.raise_for_status()
                 
                 content = ""
@@ -706,7 +1108,7 @@ class LLMClient:
                 )
             else:
                 # 非流式响应
-                response = requests.post(url, headers=headers, json=data, timeout=self.config.timeout)
+                response = requests.post(url, headers=headers, json=data, timeout=300)
                 response.raise_for_status()
                 
                 # 解析响应
