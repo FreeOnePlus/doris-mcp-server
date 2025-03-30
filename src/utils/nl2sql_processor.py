@@ -35,7 +35,13 @@ sys.path.insert(0, PROJECT_ROOT)
 from src.utils.db import execute_query, execute_query_df, get_db_connection, get_db_name, ENABLE_MULTI_DATABASE
 from src.utils.llm_client import get_llm_client, Message
 from src.utils.metadata_extractor import MetadataExtractor
-from src.prompts.prompts import NL2SQL_PROMPTS, SQL_FIX_PROMPTS, BUSINESS_REASONING_PROMPTS
+from src.prompts.prompts import (
+    NL2SQL_PROMPTS, 
+    SQL_FIX_PROMPTS, 
+    BUSINESS_REASONING_PROMPTS,
+    SEMANTIC_SIMILARITY_PROMPTS,
+    BUSINESS_ANALYSIS_PROMPTS
+)
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -940,39 +946,10 @@ class NL2SQLProcessor:
                 return result
 
             # 准备LLM请求
-            system_prompt = """你是一个专业的业务数据分析师,负责判断用户查询是否是业务查询。
-            
-业务查询是指与公司运营、销售、财务、库存、客户、市场、产品等业务指标相关的查询。
-以下是业务查询的一些例子：
-- "上个月的销售额是多少"
-- "最畅销的商品有哪些"
-- "客户满意度趋势如何"
-- "库存周转率是多少"
-- "近期的营收情况"
-- "各区域销售业绩对比"
-- "产品退货率分析"
-
-非业务查询的例子：
-- "今天天气怎么样"
-- "月球上的重力是多少"
-- "世界上最高的山是什么"
-- "如何烹饪意大利面"
-- "明天是星期几"
-
-请根据提供的查询内容仔细分析是否为业务查询,并提供你的判断、置信度和推理过程。
-如果是业务查询,请同时提取出查询中的具体业务关键词（不要包括"今天"、"统计"、"对比"等非业务明确含义的词）。
-
-回答格式应为JSON,包含以下字段：
-{
-    "is_business_query": true/false,
-    "confidence": 0.0-1.0之间的值,
-    "reasoning": "你的推理过程",
-    "keywords": ["关键词1", "关键词2", ...]
-}
-"""
+            system_prompt = BUSINESS_REASONING_PROMPTS["detailed_system"]
 
             # 用户查询的提示
-            user_prompt = f"请判断以下查询是否是业务查询：\n\n{query}"
+            user_prompt = BUSINESS_REASONING_PROMPTS["simple_user"].format(query=query)
 
             # 记录LLM请求
             provider = os.getenv("LLM_PROVIDER", "默认")
@@ -1101,15 +1078,7 @@ class NL2SQLProcessor:
             }
 
             # 准备系统提示
-            system_prompt = """你是一个语义比较专家,负责评估两个问题的相似度。
-请根据提供的问题和示例,计算它们的语义相似度,并确定它们是否在询问相同或非常相似的内容。
-
-请以JSON格式返回结果,包含以下字段:
-- similarity: 0到1之间的数字,表示相似度
-- is_similar: 如果相似度大于0.7,则为true,否则为false
-- explanation: 简短的解释,说明为什么认为它们相似或不相似
-
-直接返回JSON,不要加任何额外解释。"""
+            system_prompt = SEMANTIC_SIMILARITY_PROMPTS["system"]
 
             best_match = None
             best_similarity = 0
@@ -1120,11 +1089,14 @@ class NL2SQLProcessor:
                 batch = self.qa_examples[i:i+batch_size]
 
                 # 构建用户提示
-                user_prompt = f"当前问题: {query}\n\n示例问题:\n"
+                examples = ""
                 for j, example in enumerate(batch):
-                    user_prompt += f"{j+1}. {example['question']}\n"
-
-                user_prompt += "\n请逐一评估当前问题与每个示例问题的相似度。"
+                    examples += f"{j+1}. {example['question']}\n"
+                    
+                user_prompt = SEMANTIC_SIMILARITY_PROMPTS["user"].format(
+                    query=query,
+                    examples=examples
+                )
 
                 # 使用审计日志记录LLM请求
                 llm_request_log = {
@@ -1155,7 +1127,10 @@ class NL2SQLProcessor:
                 if response.content.strip() == "<think>" or response.content.strip() == "\\<think\\>":
                     logger.warning(f"LLM返回只包含<think>标签,使用简化提示重试")
                     # 简化提示,使用更直接的方式请求相似度评估
-                    simplified_prompt = f"当前问题: {query}\n\n示例问题:\n"
+                    simplified_prompt = SEMANTIC_SIMILARITY_PROMPTS["simple_user"].format(
+                        query=query,
+                        examples=examples
+                    )
                     for j, example in enumerate(batch):
                         simplified_prompt += f"{j+1}. {example['question']}\n"
                     simplified_prompt += "\n请直接计算当前问题与每个示例问题的相似度,返回0-1之间的数值。格式为：\n1. 相似度: 0.X\n2. 相似度: 0.X\n以此类推。"
@@ -1163,7 +1138,7 @@ class NL2SQLProcessor:
                     # 尝试使用简化提示重试
                     try:
                         simple_messages = [
-                            Message.system("你是一个语义比较专家,负责计算问题的相似度。请直接返回相似度数值,不要添加其他内容。"),
+                            Message.system(SEMANTIC_SIMILARITY_PROMPTS["simple_system"]),
                             Message.user(simplified_prompt)
                         ]
                         simple_response = llm_client.chat(simple_messages)
@@ -1309,36 +1284,25 @@ class NL2SQLProcessor:
                 logger.warning("无法获取表结构信息,SQL生成可能不准确")
 
             # 准备查询上下文
-            system_prompt = f"""你是一个专业的SQL查询生成助手,擅长将自然语言转换为精确的SQL查询。
-
-根据用户的问题和提供的数据库结构信息,生成准确的SQL查询。请遵循以下指导：
-
-1. 尽可能使用复杂的SQL查询来满足用户需求,包括多表JOIN、子查询、分组、聚合等。
-2. 确保SQL语法准确,使用正确的字段名和表名。
-3. 根据问题确定合适的表和字段,即使用户没有明确指定。
-4. 考虑表之间的关系,使用适当的JOIN条件。
-5. 注意日期和数值类型的正确处理。
-6. 返回格式为JSON,包含生成的SQL和详细说明。
-7. 按需添加SQL注释说明查询目的或关键步骤。
-8. 返回的JSON格式为：
-{{
-  "sql": "你的SQL语句",
-  "explanation": "SQL的详细解释,包括表选择理由、字段用途等"
-}}
-
-{f"除非必要,优先查询精细层（如ads、dim）而非粗粒度层（如dwd、ods）。" if self.metadata_extractor.enable_table_hierarchy else ""}
-{f"支持跨数据库查询。在涉及多个数据库的表时,使用完整的 database_name.table_name 格式。" if self.enable_multi_database else ""}"""
-
+            # 构建上下文信息
+            context_info = []
+            if self.metadata_extractor.enable_table_hierarchy:
+                context_info.append("除非必要,优先查询精细层（如ads、dim）而非粗粒度层（如dwd、ods）。")
+            if self.enable_multi_database:
+                context_info.append("支持跨数据库查询。在涉及多个数据库的表时,使用完整的 database_name.table_name 格式。")
+            
             # 如果有之前执行的SQL错误信息,添加到系统提示中
             if previous_error:
                 previous_sql = previous_error.get('sql', '')
                 error_message = previous_error.get('error', '')
-                system_prompt += f"""
-
+                context_info.append(f"""
 注意：之前生成的SQL执行失败,请生成修复后的SQL。
 之前的SQL: {previous_sql}
 错误信息: {error_message}
-分析错误原因并生成正确的SQL,避免重复之前的错误。特别注意表名、字段名、语法以及表关联条件是否正确。"""
+分析错误原因并生成正确的SQL,避免重复之前的错误。特别注意表名、字段名、语法以及表关联条件是否正确。""")
+                
+            context = "\n".join(context_info)
+            system_prompt = NL2SQL_PROMPTS["system_with_context"].format(context=context)
 
             messages = [Message("system", system_prompt)]
 
@@ -1397,21 +1361,12 @@ class NL2SQLProcessor:
                 # 如果需要重试，使用更简单的提示
                 if need_retry:
                     # 构建更简单直接的提示进行重试
-                    retry_system_prompt = """你是SQL生成专家。请直接生成Apache Doris SQL代码,不要包含思考过程。
-请严格按以下格式输出:
-```sql
--- 你的SQL查询代码
-```
-不要包含任何其他文本、分析或<think>标签。"""
+                    retry_system_prompt = NL2SQL_PROMPTS["retry_system"]
 
-                    retry_user_prompt = f"""为以下问题生成SQL查询:
-
-查询: {query}
-
-数据库表结构:
-{tables_info}
-
-直接返回SQL代码,不需要解释或分析。"""
+                    retry_user_prompt = NL2SQL_PROMPTS["retry_user"].format(
+                        query=query,
+                        tables_info=tables_info
+                    )
 
                     # 重试，使用更简单的提示
                     try:
@@ -1814,48 +1769,15 @@ class NL2SQLProcessor:
             llm_client = get_llm_client(stage="business_analysis")
             
             # 准备系统提示
-            system_prompt = """你是数据分析专家，负责将SQL查询结果转化为有价值的业务洞察。
-请根据提供的用户问题、SQL查询、查询结果和表结构信息，提供以下内容：
-1. 对查询结果的业务解读
-2. 数据分析和发现的趋势
-3. 建议的可视化方式
-4. 相关业务建议
-
-返回格式：
-```json
-{
-  "business_analysis": "详细的业务分析...",
-  "trends": ["趋势1", "趋势2", ...],
-  "visualization": {
-    "type": "图表类型，如bar, line, pie等",
-    "title": "图表标题",
-    "x_axis": "X轴字段名",
-    "y_axis": "Y轴字段名",
-    "description": "图表描述"
-  },
-  "recommendations": ["建议1", "建议2", ...]
-}
-```
-
-请确保分析深入、专业，并与业务场景紧密结合。"""
+            system_prompt = BUSINESS_ANALYSIS_PROMPTS["system"]
             
             # 准备用户提示
-            user_prompt = f"""问题：{query}
-
-执行的SQL：
-```sql
-{sql}
-```
-
-查询结果：
-```json
-{json.dumps(result[:20], ensure_ascii=False, indent=2)}
-```
-
-相关表的元数据信息：
-{tables_info}
-
-请根据以上信息提供业务分析、可视化建议和业务建议。"""
+            user_prompt = BUSINESS_ANALYSIS_PROMPTS["user"].format(
+                query=query,
+                sql=sql,
+                result=json.dumps(result[:20], ensure_ascii=False, indent=2),
+                tables_info=tables_info
+            )
 
             # 调用LLM
             messages = [
@@ -2315,29 +2237,17 @@ class NL2SQLProcessor:
         error_type = error_analysis(error_message)
         
         # 系统提示
-        system_prompt = f"""你是SQL专家，专门修复SQL错误。你需要解决以下类型的SQL错误：{error_type}。
-具体错误信息: {error_message}
-
-你的任务是:
-1. 分析错误原因
-2. 修改SQL以解决错误
-3. 确保修改后的SQL正确且完整
-4. 保持原始SQL的意图和功能不变
-
-请只返回修复后的SQL语句，不要包含任何解释或额外信息。确保返回的SQL语句格式正确，可以直接执行。"""
+        system_prompt = SQL_FIX_PROMPTS["error_type_system"].format(
+            error_type=error_type,
+            error_message=error_message
+        )
 
         # 用户提示
-        user_prompt = f"""需要修复的SQL:
-```sql
-{sql}
-```
-
-原始问题: {query}
-
-数据库表结构信息:
-{table_info}
-
-请修复此SQL并只返回修复后的SQL语句。不要包含解释，只返回可执行的SQL代码。"""
+        user_prompt = SQL_FIX_PROMPTS["error_fix_user"].format(
+            sql=sql,
+            query=query,
+            table_info=table_info
+        )
 
         return {
             "system": system_prompt,
