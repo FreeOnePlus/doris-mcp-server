@@ -1,8 +1,8 @@
 <template>
   <div class="home-container">
     <div class="welcome-section">
-      <h1>Apache Doris MCP 客户端</h1>
-      <p class="subtitle">基于MCP协议的智能分析工具</p>
+      <h1>{{ t('home.title') }}</h1>
+      <p class="subtitle">{{ t('home.subtitle') }}</p>
       
       <div class="features">
         <el-row :gutter="20">
@@ -12,13 +12,13 @@
                 <div class="card-header">
                   <h3>
                     <el-icon><ChatDotRound /></el-icon>
-                    NL2SQL 自然语言查询
+                    {{ t('home.features.nl2sql.title') }}
                   </h3>
                 </div>
               </template>
               <div class="card-content">
-                <p>使用自然语言描述您的数据需求，系统将自动转换为SQL查询并执行，同时提供业务分析和可视化建议。</p>
-                <el-button type="primary" @click="$router.push('/nl2sql')">开始使用</el-button>
+                <p>{{ t('home.features.nl2sql.description') }}</p>
+                <el-button type="primary" @click="$router.push('/nl2sql')">{{ t('home.features.nl2sql.button') }}</el-button>
               </div>
             </el-card>
           </el-col>
@@ -29,13 +29,13 @@
                 <div class="card-header">
                   <h3>
                     <el-icon><MagicStick /></el-icon>
-                    SQL 智能优化分析
+                    {{ t('home.features.sqlOptimize.title') }}
                   </h3>
                 </div>
               </template>
               <div class="card-content">
-                <p>提交您的SQL查询，系统将自动分析性能瓶颈，提供优化建议，并生成改进后的SQL语句。</p>
-                <el-button type="primary" @click="$router.push('/sql-optimize')">开始使用</el-button>
+                <p>{{ t('home.features.sqlOptimize.description') }}</p>
+                <el-button type="primary" @click="$router.push('/sql-optimize')">{{ t('home.features.sqlOptimize.button') }}</el-button>
               </div>
             </el-card>
           </el-col>
@@ -46,13 +46,13 @@
                 <div class="card-header">
                   <h3>
                     <el-icon><Setting /></el-icon>
-                    LLM 配置管理
+                    {{ t('home.features.llmConfig.title') }}
                   </h3>
                 </div>
               </template>
               <div class="card-content">
-                <p>自定义各处理阶段使用的大语言模型(LLM)，为不同的任务选择合适的模型和参数配置。</p>
-                <el-button type="primary" @click="$router.push('/config')">管理配置</el-button>
+                <p>{{ t('home.features.llmConfig.description') }}</p>
+                <el-button type="primary" @click="$router.push('/llm-config')">{{ t('home.features.llmConfig.button') }}</el-button>
               </div>
             </el-card>
           </el-col>
@@ -61,18 +61,18 @@
     </div>
     
     <div class="system-status" v-if="mcpStore.isConnected">
-      <h2>系统状态</h2>
+      <h2>{{ t('home.systemStatus.title') }}</h2>
       <el-descriptions border>
-        <el-descriptions-item label="连接状态">
-          <el-tag type="success">已连接</el-tag>
+        <el-descriptions-item :label="t('home.systemStatus.connectionStatus')">
+          <el-tag type="success">{{ t('common.connected') }}</el-tag>
         </el-descriptions-item>
-        <el-descriptions-item label="服务器地址">
+        <el-descriptions-item :label="t('home.systemStatus.serverAddress')">
           {{ mcpHost }}:{{ mcpPort }}
         </el-descriptions-item>
-        <el-descriptions-item label="协议">
+        <el-descriptions-item :label="t('home.systemStatus.protocol')">
           {{ mcpProtocol.toUpperCase() }}
         </el-descriptions-item>
-        <el-descriptions-item label="LLM提供商数量">
+        <el-descriptions-item :label="t('home.systemStatus.llmProviderCount')">
           {{ llmProviders.length }}
         </el-descriptions-item>
       </el-descriptions>
@@ -80,51 +80,51 @@
     
     <div class="connection-error" v-else>
       <el-alert
-        title="未连接到MCP服务器"
+        :title="t('home.connectionError.title')"
         type="warning"
         :closable="false"
         show-icon
       >
-        <p>请检查服务器是否已启动，然后点击下方按钮尝试连接。</p>
+        <p>{{ t('home.connectionError.description') }}</p>
         <el-button type="primary" :loading="mcpStore.isConnecting" @click="connect">
-          {{ mcpStore.isConnecting ? '连接中...' : '连接服务器' }}
+          {{ mcpStore.isConnecting ? t('home.connectionError.connecting') : t('home.connectionError.button') }}
         </el-button>
       </el-alert>
     </div>
     
     <div class="server-debug" v-if="!mcpStore.isConnected">
-      <el-divider content-position="center">服务器连接调试</el-divider>
+      <el-divider content-position="center">{{ t('home.serverDebug.title') }}</el-divider>
       
       <div class="debug-actions">
         <el-button type="primary" @click="checkServer" :loading="isChecking">
-          检查服务器状态
+          {{ t('home.serverDebug.checkButton') }}
         </el-button>
         <el-button type="success" @click="connect" :loading="mcpStore.isConnecting">
-          手动连接
+          {{ t('home.serverDebug.connectButton') }}
         </el-button>
       </div>
       
       <div class="debug-results" v-if="checkResults.length > 0">
-        <h3>服务器检查结果:</h3>
+        <h3>{{ t('home.serverDebug.results') }}</h3>
         <el-table :data="checkResults" border stripe>
           <el-table-column prop="endpoint" label="端点" />
           <el-table-column label="状态">
             <template #default="scope">
-              <span v-if="scope.row.ok" class="text-success">✓ 成功 ({{ scope.row.status }})</span>
-              <span v-else-if="scope.row.status" class="text-danger">✗ 失败 ({{ scope.row.status }}: {{ scope.row.statusText }})</span>
-              <span v-else class="text-warning">✗ 错误: {{ scope.row.error }}</span>
+              <span v-if="scope.row.ok" class="text-success">{{ t('home.serverDebug.success') }} ({{ scope.row.status }})</span>
+              <span v-else-if="scope.row.status" class="text-danger">{{ t('home.serverDebug.failed') }} ({{ scope.row.status }}: {{ scope.row.statusText }})</span>
+              <span v-else class="text-warning">{{ t('home.serverDebug.error') }} {{ scope.row.error }}</span>
             </template>
           </el-table-column>
         </el-table>
         
         <div class="debug-tips">
-          <p>调试提示:</p>
+          <p>{{ t('home.serverDebug.tips.title') }}</p>
           <ol>
-            <li>检查MCP服务器是否已启动 (<code>python src/main.py</code>)</li>
-            <li>确认服务器运行在端口 <b>{{ mcpPort }}</b> 上</li>
-            <li>检查环境变量配置是否正确 (.env 文件)</li>
-            <li>检查网络连接和防火墙设置</li>
-            <li>尝试在MCP服务器控制台查看日志输出</li>
+            <li>{{ t('home.serverDebug.tips.checkServer') }} (<code>python src/main.py</code>)</li>
+            <li>{{ t('home.serverDebug.tips.confirmPort') }} <b>{{ mcpPort }}</b></li>
+            <li>{{ t('home.serverDebug.tips.checkEnv') }}</li>
+            <li>{{ t('home.serverDebug.tips.checkNetwork') }}</li>
+            <li>{{ t('home.serverDebug.tips.checkLogs') }}</li>
           </ol>
         </div>
       </div>
@@ -138,8 +138,11 @@ import { ElMessage } from 'element-plus';
 import { ref, watch } from 'vue';
 // 导入Element Plus图标
 import { ChatDotRound, MagicStick, Setting } from '@element-plus/icons-vue';
+// 导入国际化函数
+import { useI18n } from '../i18n';
 
 const mcpStore = useMCPStore();
+const { t, currentLang } = useI18n();
 
 // 获取MCP服务器配置
 const mcpHost = import.meta.env.VITE_MCP_HOST || 'localhost';
@@ -175,13 +178,13 @@ watch(() => mcpStore.isConnected, async (newValue) => {
 async function connect() {
   // 如果已经在连接中，则防止重复点击
   if (isConnecting.value) {
-    ElMessage.info('正在连接中，请稍候...');
+    ElMessage.info(currentLang.value === 'en' ? 'Connecting, please wait...' : '正在连接中，请稍候...');
     return;
   }
   
   // 如果已经连接成功，直接返回
   if (mcpStore.isConnected) {
-    ElMessage.success('已经连接成功');
+    ElMessage.success(currentLang.value === 'en' ? 'Already connected' : '已经连接成功');
     return;
   }
   
@@ -195,14 +198,14 @@ async function connect() {
     setTimeout(() => {
       if (isConnecting.value) {
         isConnecting.value = false;
-        ElMessage.error('连接操作超时，请检查服务器或重试');
+        ElMessage.error(currentLang.value === 'en' ? 'Connection operation timed out, please check the server or try again' : '连接操作超时，请检查服务器或重试');
       }
     }, 10000);
     
     const success = await mcpStore.connect();
     
     if (success) {
-      ElMessage.success('连接成功');
+      ElMessage.success(currentLang.value === 'en' ? 'Connection successful' : '连接成功');
       try {
         // 尝试检查服务器状态，但不要等待太久
         const checkPromise = checkServer();
@@ -212,11 +215,13 @@ async function connect() {
         console.warn('自动检查服务器状态失败', e);
       }
     } else {
-      ElMessage.error(mcpStore.connectionError || '连接失败，请检查服务器状态');
+      ElMessage.error(mcpStore.connectionError || (currentLang.value === 'en' ? 'Connection failed, please check the server status' : '连接失败，请检查服务器状态'));
     }
   } catch (error) {
     console.error('连接处理出错:', error);
-    ElMessage.error(`连接处理出错: ${error.message || '未知错误'}`);
+    ElMessage.error(currentLang.value === 'en' 
+      ? `Connection processing error: ${error.message || 'Unknown error'}` 
+      : `连接处理出错: ${error.message || '未知错误'}`);
   } finally {
     // 确保无论如何都会重置连接状态
     isConnecting.value = false;
@@ -226,7 +231,7 @@ async function connect() {
 // 服务器检查方法
 async function checkServer() {
   if (isChecking.value) {
-    ElMessage.info('检查已在进行中...');
+    ElMessage.info(currentLang.value === 'en' ? 'Check already in progress...' : '检查已在进行中...');
     return;
   }
   
@@ -239,11 +244,11 @@ async function checkServer() {
       if (isChecking.value) {
         isChecking.value = false;
         checkResults.value.push({
-          endpoint: '总体检查',
+          endpoint: currentLang.value === 'en' ? 'Overall Check' : '总体检查',
           status: 'error',
-          message: '检查超时，请重试'
+          message: currentLang.value === 'en' ? 'Check timed out, please try again' : '检查超时，请重试'
         });
-        ElMessage.warning('服务器检查超时');
+        ElMessage.warning(currentLang.value === 'en' ? 'Server check timed out' : '服务器检查超时');
       }
     }, 20000);
     
@@ -253,7 +258,7 @@ async function checkServer() {
         // 设置短超时，避免长时间阻塞
         const connectPromise = mcpStore.connect();
         const timeoutPromise = new Promise((_, reject) => {
-          setTimeout(() => reject(new Error('连接超时')), 5000);
+          setTimeout(() => reject(new Error(currentLang.value === 'en' ? 'Connection timed out' : '连接超时')), 5000);
         });
         
         await Promise.race([connectPromise, timeoutPromise]);
@@ -261,13 +266,13 @@ async function checkServer() {
         checkResults.value.push({
           endpoint: 'MCP连接',
           status: 'success',
-          message: '连接成功'
+          message: currentLang.value === 'en' ? 'Connection successful' : '连接成功'
         });
       } catch (error) {
         checkResults.value.push({
           endpoint: 'MCP连接',
           status: 'error',
-          message: `连接失败: ${error.message}`
+          message: `${currentLang.value === 'en' ? 'Connection failed' : '连接失败'}: ${error.message}`
         });
         clearTimeout(checkTimeout);
         isChecking.value = false;
@@ -284,13 +289,13 @@ async function checkServer() {
           checkResults.value.push({
             endpoint: 'health',
             status: 'success',
-            message: `状态: ${health.status}, 版本: ${health.version}`
+            message: `${currentLang.value === 'en' ? 'Status' : '状态'}: ${health.status}, ${currentLang.value === 'en' ? 'Version' : '版本'}: ${health.version}`
           });
         } catch (error) {
           checkResults.value.push({
             endpoint: 'health',
             status: 'error',
-            message: `调用失败: ${error.message}`
+            message: `${currentLang.value === 'en' ? 'Call failed' : '调用失败'}: ${error.message}`
           });
         }
       })(),
@@ -302,22 +307,22 @@ async function checkServer() {
           checkResults.value.push({
             endpoint: 'status',
             status: 'success',
-            message: `服务状态: ${status.service?.status}, 版本: ${status.service?.version}`
+            message: `${currentLang.value === 'en' ? 'Service status' : '服务状态'}: ${status.service?.status}, ${currentLang.value === 'en' ? 'Version' : '版本'}: ${status.service?.version}`
           });
           
           // 显示LLM提供商信息
           if (status.llm && status.llm.providers) {
             checkResults.value.push({
-              endpoint: 'LLM提供商',
+              endpoint: currentLang.value === 'en' ? 'LLM Providers' : 'LLM提供商',
               status: 'success',
-              message: `可用提供商: ${status.llm.providers.join(', ')}`
+              message: `${currentLang.value === 'en' ? 'Available providers' : '可用提供商'}: ${status.llm.providers.join(', ')}`
             });
           }
         } catch (error) {
           checkResults.value.push({
             endpoint: 'status',
             status: 'error',
-            message: `调用失败: ${error.message}`
+            message: `${currentLang.value === 'en' ? 'Call failed' : '调用失败'}: ${error.message}`
           });
         }
       })(),
@@ -329,13 +334,13 @@ async function checkServer() {
           checkResults.value.push({
             endpoint: 'Tools',
             status: 'success',
-            message: `可用工具: ${tools.length}个`
+            message: `${currentLang.value === 'en' ? 'Available tools' : '可用工具'}: ${tools.length}${currentLang.value === 'en' ? ' items' : '个'}`
           });
         } catch (error) {
           checkResults.value.push({
             endpoint: 'Tools',
             status: 'error',
-            message: `获取失败: ${error.message}`
+            message: `${currentLang.value === 'en' ? 'Acquisition failed' : '获取失败'}: ${error.message}`
           });
         }
       })()
@@ -345,9 +350,9 @@ async function checkServer() {
   } catch (error) {
     console.error('服务器检查出错:', error);
     checkResults.value.push({
-      endpoint: '总体检查',
+      endpoint: currentLang.value === 'en' ? 'Overall Check' : '总体检查',
       status: 'error',
-      message: `检查过程出错: ${error.message}`
+      message: `${currentLang.value === 'en' ? 'Error in inspection process' : '检查过程出错'}: ${error.message}`
     });
   } finally {
     isChecking.value = false;

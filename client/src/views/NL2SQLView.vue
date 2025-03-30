@@ -3,12 +3,13 @@
     <!-- 将卡片头部移出卡片，固定在顶部 -->
     <div class="fixed-card-header">
       <div class="header">
-        <h2><span class="title-decoration"></span>NL2SQL 自然语言查询</h2>
+        <h2><span class="title-decoration"></span>{{ t('common.appTitle') }}</h2>
         <div class="header-actions">
           <el-switch
             v-model="debugMode"
             class="debug-switch"
-            active-text="调试模式"
+            active-text=""
+            :active-text="t('common.debugMode')"
             inactive-text=""
             size="small"
           />
@@ -17,14 +18,14 @@
             size="small" 
             class="connection-status"
           >
-            {{ mcpStore.isConnected ? '已连接' : '未连接' }}
+            {{ mcpStore.isConnected ? t('common.connected') : t('common.disconnected') }}
             <el-button 
               v-if="!mcpStore.isConnected && !mcpStore.isConnecting" 
               type="primary" 
               size="small" 
               circle 
               @click="reconnect" 
-              title="重新连接"
+              :title="t('common.reconnect')"
               class="reconnect-btn"
             >
               <el-icon><Refresh /></el-icon>
@@ -32,7 +33,7 @@
             <el-icon v-else-if="mcpStore.isConnecting" class="is-loading"><Loading /></el-icon>
           </el-tag>
           <el-button type="primary" plain @click="clearChat" :disabled="chatMessages.length === 0">
-            清空对话
+            {{ t('common.clearChat') }}
           </el-button>
         </div>
       </div>
@@ -44,10 +45,10 @@
       <el-collapse v-if="debugMode">
         <el-collapse-item title="调试信息">
           <div class="debug-info">
-            <p><strong>当前阶段:</strong> {{ mcpStore.currentStage }} ({{ mcpStore.getStageName(mcpStore.currentStage) }})</p>
-            <p><strong>进度:</strong> {{ mcpStore.queryProgress }}%</p>
-            <p><strong>思考状态:</strong> {{ mcpStore.isThinking ? '思考中' : '空闲' }}</p>
-            <p><strong>阶段历史:</strong></p>
+            <p><strong>{{ t('status.currentStage') }}:</strong> {{ mcpStore.currentStage }} ({{ mcpStore.getStageName(mcpStore.currentStage) }})</p>
+            <p><strong>{{ t('status.progress') }}:</strong> {{ mcpStore.queryProgress }}%</p>
+            <p><strong>{{ t('status.processingStatus') }}:</strong> {{ mcpStore.isThinking ? t('status.processing') : t('status.idle') }}</p>
+            <p><strong>{{ t('status.stageHistory') }}:</strong></p>
             <ul>
               <li v-for="(stage, index) in mcpStore.stageHistory" :key="index">
                 {{ stage }} ({{ mcpStore.getStageName(stage) }})
@@ -67,19 +68,19 @@
         style="margin-bottom: 15px;"
       >
         <template #default>
-          <p>建议检查：</p>
+          <p>{{ t('connection.checkSuggestions') }}</p>
           <ol>
-            <li>服务器是否已启动</li>
-            <li>WebSocket URL配置是否正确</li>
-            <li>网络连接是否正常</li>
+            <li>{{ t('connection.serverStarted') }}</li>
+            <li>{{ t('connection.configCorrect') }}</li>
+            <li>{{ t('connection.networkConnection') }}</li>
           </ol>
-          <el-button type="primary" size="small" @click="reconnect">重新连接</el-button>
+          <el-button type="primary" size="small" @click="reconnect">{{ t('connection.reconnect') }}</el-button>
         </template>
       </el-alert>
       
       <div class="chat-messages" ref="messagesContainer" @scroll="handleScrollEvent">
         <div v-if="chatMessages.length === 0" class="empty-chat">
-          <el-empty description="开始对话，输入您的自然语言查询">
+          <el-empty :description="t('common.startChat')">
           </el-empty>
         </div>
         
@@ -104,9 +105,9 @@
                 <!-- 思考过程 -->
                 <div v-if="message.thinking_process" class="thinking-section">
                   <div class="section-header">
-                    <span>思考过程</span>
+                    <span>{{ t('query.thinking') }}</span>
                     <el-button type="text" @click="message.thinkingCollapsed = !message.thinkingCollapsed">
-                      {{ message.thinkingCollapsed ? '展开' : '折叠' }}
+                      {{ message.thinkingCollapsed ? t('query.expand') : t('query.collapse') }}
                     </el-button>
                   </div>
                   <div v-show="!message.thinkingCollapsed" class="thinking-content">
@@ -117,8 +118,8 @@
                 <!-- SQL查询 -->
                 <div v-if="message.sql" class="sql-section">
                   <div class="section-header">
-                    <span>SQL查询</span>
-                    <el-button size="small" @click="copySql(message.sql)">复制</el-button>
+                    <span>{{ t('query.sql') }}</span>
+                    <el-button size="small" @click="copySql(message.sql)">{{ t('query.copy') }}</el-button>
                   </div>
                   <div class="markdown-code-block">
                     <pre class="sql-code"><code>{{ message.sql }}</code></pre>
@@ -128,7 +129,7 @@
                 <!-- 查询结果 - 增强样式 -->
                 <div v-if="message.result && message.result.length > 0" class="result-section">
                   <div class="section-header">
-                    <span>查询结果 ({{ message.result.length }}条记录)</span>
+                    <span>{{ t('query.queryResults') }} ({{ message.result.length }} {{ t('query.records') }})</span>
                   </div>
                   <el-table 
                     :data="message.result" 
@@ -150,7 +151,7 @@
                 <!-- 业务分析 -->
                 <div v-if="message.business_analysis" class="analysis-section">
                   <div class="section-header">
-                    <span>业务分析</span>
+                    <span>{{ t('query.businessAnalysis') }}</span>
                   </div>
                   <div v-html="formatText(message.business_analysis.business_analysis)" class="analysis-text formatted-content"></div>
                   
@@ -163,14 +164,14 @@
                   
                   <!-- 趋势和建议 -->
                   <div v-if="message.business_analysis.trends && message.business_analysis.trends.length" class="trends formatted-content">
-                    <h4>主要趋势</h4>
+                    <h4>{{ t('query.trends') }}</h4>
                     <ul class="styled-list">
                       <li v-for="(trend, i) in message.business_analysis.trends" :key="i">{{ trend }}</li>
                     </ul>
                   </div>
                   
                   <div v-if="message.business_analysis.recommendations && message.business_analysis.recommendations.length" class="recommendations formatted-content">
-                    <h4>业务建议</h4>
+                    <h4>{{ t('query.recommendations') }}</h4>
                     <ul class="styled-list">
                       <li v-for="(rec, i) in message.business_analysis.recommendations" :key="i">{{ rec }}</li>
                     </ul>
@@ -181,24 +182,24 @@
                 <div v-if="message.error" class="error-section">
                   <el-alert
                     type="error"
-                    :title="message.error.message || '查询执行出错'"
+                    :title="message.error.message || t('query.queryProcessingError')"
                     :closable="false"
                     show-icon
                   />
                   <div v-if="message.error.details" class="error-details">
-                    <p>详细信息：{{ message.error.details }}</p>
+                    <p>{{ t('query.errorDetails') }}：{{ message.error.details }}</p>
                   </div>
                   
                   <!-- 服务器实现问题诊断 -->
                   <div v-if="message.error.message && message.error.message.includes('服务器未正确处理')" class="server-diagnosis">
-                    <h4>服务器问题诊断</h4>
-                    <p>服务器返回了无效的响应格式，问题可能是：</p>
+                    <h4>{{ t('query.serverDiagnosis') }}</h4>
+                    <p>{{ t('query.serverError') }}</p>
                     <ul>
                       <li>服务器端 <code>nl2sql_query</code> 工具没有完全实现</li>
                       <li>NL2SQL处理服务没有正确启动或配置</li>
                       <li>服务器端的数据库连接问题</li>
                     </ul>
-                    <p>解决建议：</p>
+                    <p>{{ t('query.suggestions') }}</p>
                     <ul>
                       <li>检查服务器日志中的错误信息</li>
                       <li>确认服务器的 <code>nl2sql_processor.py</code> 模块正确实现并返回标准格式</li>
@@ -223,7 +224,7 @@
             <div class="content">
               <div class="thinking-section" v-if="mcpStore.currentStage && mcpStore.currentStage !== 'waiting'">
                 <div class="thinking-header">
-                  <span class="thinking-title">思考过程</span>
+                  <span class="thinking-title">{{ t('query.thinking') }}</span>
                   <span class="thinking-status">
                     - {{ getStageName(mcpStore.currentStage) }} ({{ mcpStore.queryProgress }}%)
                     <span v-if="mcpStore.is_processing" class="pulse-dot"></span>
@@ -250,14 +251,14 @@
                   
                   <div class="thinking-text">
                     <div v-if="!mcpStore.currentStage || mcpStore.currentStage === 'waiting'" class="no-thinking-yet">
-                      正在分析您的查询...
+                      {{ t('query.processing') }}
                     </div>
                     <div v-else>
-                      <p>当前阶段: {{ getStageName(mcpStore.currentStage) || '处理中' }}</p>
-                      <p>处理状态: {{ mcpStore.is_processing ? '处理中' : '空闲' }}</p>
-                      <p>进度: {{ mcpStore.queryProgress }}%</p>
-                      <p v-if="mcpStore.current_query">查询: {{ mcpStore.current_query }}</p>
-                      <p>历史阶段: {{ mcpStore.stageHistory.map(stage => getStageName(stage)).join(' → ') }}</p>
+                      <p>{{ t('status.currentStage') }}: {{ getStageName(mcpStore.currentStage) || t('status.processing') }}</p>
+                      <p>{{ t('status.processingStatus') }}: {{ mcpStore.is_processing ? t('status.processing') : t('status.idle') }}</p>
+                      <p>{{ t('status.progress') }}: {{ mcpStore.queryProgress }}%</p>
+                      <p v-if="mcpStore.current_query">{{ t('status.query') }}: {{ mcpStore.current_query }}</p>
+                      <p>{{ t('status.stageHistory') }}: {{ mcpStore.stageHistory.map(stage => getStageName(stage)).join(' → ') }}</p>
                     </div>
                   </div>
                 </div>
@@ -275,7 +276,7 @@
           v-model="inputMessage"
           type="textarea"
           :rows="3"
-          placeholder="输入您的自然语言查询，例如：'2023年第一季度销售额最高的三个产品是什么？'"
+          :placeholder="t('query.inputPlaceholder')"
           :disabled="isLoading || !mcpStore.available"
           @keydown.enter.prevent="sendMessage"
           ref="inputRef"
@@ -286,13 +287,13 @@
           @click="sendMessage"
           class="center-button"
         >
-          发送
+          {{ t('common.send') }}
         </el-button>
       </div>
     </div>
     
     <!-- 全屏结果对话框 -->
-    <el-dialog v-model="fullResultsVisible" title="完整查询结果" width="80%">
+    <el-dialog v-model="fullResultsVisible" :title="t('common.fullResults')" width="80%">
       <el-table :data="fullResultsData" style="width: 100%" border height="500px">
         <el-table-column
           v-for="column in fullResultsColumns"
@@ -306,7 +307,7 @@
     <!-- 修改滚动到底部按钮，使其更明显 -->
     <div class="scroll-to-bottom-btn" @click="scrollToBottom">
       <el-icon><ArrowDown /></el-icon> 
-      <span>滚动到底部</span>
+      <span>{{ t('common.scrollToBottom') }}</span>
     </div>
   </div>
 </template>
@@ -318,8 +319,12 @@ import { ElMessage } from 'element-plus';
 import * as echarts from 'echarts';
 import { UserFilled, Refresh, Loading, ArrowDown } from '@element-plus/icons-vue';
 import logoUrl from '../assets/logo.svg';
+import { useI18n } from '../i18n';
+import LanguageSwitcher from '../components/LanguageSwitcher.vue';
 
 const mcpStore = useMCPStore();
+const { t, currentLang } = useI18n(); // 引入国际化函数
+
 const chatMessages = ref([]);
 const inputMessage = ref('');
 const isLoading = ref(false);
@@ -350,13 +355,13 @@ const fullResultsColumns = ref([]);
 // 阶段标记定义 - 移除不需要的阶段并修复重复
 const dynamicStageMarkers = computed(() => [
   // 移除等待输入和开始阶段
-  { value: 'analyzing', label: '分析' },
-  { value: 'similar_example', label: '示例分析' },
-  { value: 'business_metadata', label: '业务分析' },
+  { value: 'analyzing', label: currentLang.value === 'en' ? 'Analyzing' : '分析' },
+  { value: 'similar_example', label: currentLang.value === 'en' ? 'Example Analysis' : '示例分析' },
+  { value: 'business_metadata', label: currentLang.value === 'en' ? 'Business Analysis' : '业务分析' },
   // 移除模式推理阶段
   // 保留一个SQL生成阶段，将两个变体都映射到同一个标记
-  { value: 'generating', label: 'SQL生成' },
-  { value: 'executing', label: 'SQL执行' }
+  { value: 'generating', label: currentLang.value === 'en' ? 'SQL Generation' : 'SQL生成' },
+  { value: 'executing', label: currentLang.value === 'en' ? 'SQL Execution' : 'SQL执行' }
 ]);
 
 // 添加stage映射函数，处理可能的变体
@@ -676,8 +681,8 @@ function handleScrollEvent(event) {
 // 复制SQL
 function copySql(sql) {
   navigator.clipboard.writeText(sql)
-    .then(() => ElMessage.success('SQL已复制到剪贴板'))
-    .catch(() => ElMessage.error('复制失败'));
+    .then(() => ElMessage.success(t('query.copySuccess')))
+    .catch(() => ElMessage.error(t('query.copyFailed')));
 }
 
 // 显示完整结果
@@ -1060,7 +1065,35 @@ function getStageName(stage) {
   // 先映射阶段，处理可能的变体
   const mappedStage = mapStageToDisplay(stage);
   const marker = dynamicStageMarkers.value.find(m => m.value === mappedStage);
-  return marker ? marker.label : mcpStore.getStageName(stage) || `阶段 ${stage}`;
+  
+  if (marker) {
+    return marker.label;
+  }
+  
+  // 如果在标记中找不到，使用从mcpStore获取的名称或提供默认值
+  const storeStage = mcpStore.getStageName(stage);
+  
+  if (storeStage) {
+    // 根据当前语言选择适当的翻译
+    if (currentLang.value === 'en') {
+      // 英文版的阶段名称映射
+      const enStageMap = {
+        '分析': 'Analyzing',
+        '示例分析': 'Example Analysis',
+        '业务分析': 'Business Analysis',
+        'SQL生成': 'SQL Generation',
+        'SQL执行': 'SQL Execution',
+        '等待输入': 'Waiting for Input',
+        '开始': 'Start',
+        '完成': 'Complete'
+      };
+      return enStageMap[storeStage] || storeStage;
+    } else {
+      return storeStage;
+    }
+  }
+  
+  return currentLang.value === 'en' ? `Stage ${stage}` : `阶段 ${stage}`;
 }
 
 // 重置思考状态
@@ -1228,10 +1261,6 @@ function typeThinkingText(newContent) {
         display: flex;
         align-items: center;
         gap: 12px;
-        
-        .debug-switch {
-          margin-right: 10px;
-        }
         
         .connection-status {
           padding: 0 10px;

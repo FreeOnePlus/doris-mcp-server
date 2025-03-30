@@ -3,13 +3,13 @@
     <el-card class="main-card">
       <template #header>
         <div class="header">
-          <h2>SQL 智能优化分析</h2>
+          <h2>{{ t('sqlOptimize.title') }}</h2>
         </div>
       </template>
       
       <div class="content">
         <el-form :model="optimizeForm" label-position="top">
-          <el-form-item label="SQL语句" required>
+          <el-form-item :label="t('sqlOptimize.form.sqlStatement')" required>
             <monaco-editor
               v-model="optimizeForm.sql"
               language="sql"
@@ -18,12 +18,12 @@
             />
           </el-form-item>
           
-          <el-form-item label="优化需求">
+          <el-form-item :label="t('sqlOptimize.form.optimizationRequirements')">
             <el-input
               v-model="optimizeForm.requirements"
               type="textarea"
               :rows="2"
-              placeholder="请输入您的特定优化需求，例如：'需要减少JOIN操作的耗时' 或 '希望优化GROUP BY操作的内存使用'"
+              :placeholder="t('sqlOptimize.form.placeholder')"
             />
           </el-form-item>
           
@@ -34,37 +34,37 @@
               :loading="isProcessing"
               :disabled="!optimizeForm.sql.trim() || !mcpStore.available"
             >
-              分析优化
+              {{ t('sqlOptimize.form.analyze') }}
             </el-button>
             <el-button 
               @click="resetForm"
               :disabled="isProcessing"
             >
-              重置
+              {{ t('sqlOptimize.form.reset') }}
             </el-button>
           </el-form-item>
         </el-form>
         
         <!-- 优化结果 -->
         <div v-if="optimizeResult" class="optimize-result">
-          <el-divider content-position="center">优化分析结果</el-divider>
+          <el-divider content-position="center">{{ t('sqlOptimize.result.title') }}</el-divider>
           
           <!-- 错误修复结果 -->
           <div v-if="optimizeResult.status === 'fixed'" class="fix-result">
             <el-alert
               type="warning"
-              :title="optimizeResult.error || 'SQL执行出错，已尝试修复'"
+              :title="optimizeResult.error || t('sqlOptimize.result.fixResult.title')"
               :closable="false"
               show-icon
             />
             
             <div class="result-section">
-              <h3>错误分析</h3>
+              <h3>{{ t('sqlOptimize.result.fixResult.errorAnalysis') }}</h3>
               <div v-html="formatText(optimizeResult.fix_result.error_analysis)" class="section-content"></div>
             </div>
             
             <div class="result-section">
-              <h3>修复后的SQL</h3>
+              <h3>{{ t('sqlOptimize.result.fixResult.fixedSQL') }}</h3>
               <div class="sql-wrapper">
                 <monaco-editor
                   v-model="optimizeResult.fix_result.fixed_sql"
@@ -78,18 +78,18 @@
                   class="copy-btn"
                   @click="copySQL(optimizeResult.fix_result.fixed_sql)"
                 >
-                  复制
+                  {{ t('sqlOptimize.result.copy') }}
                 </el-button>
               </div>
             </div>
             
             <div class="result-section">
-              <h3>业务含义</h3>
+              <h3>{{ t('sqlOptimize.result.fixResult.businessMeaning') }}</h3>
               <div v-html="formatText(optimizeResult.fix_result.business_meaning)" class="section-content"></div>
             </div>
             
             <div class="result-section">
-              <h3>SQL逻辑说明</h3>
+              <h3>{{ t('sqlOptimize.result.fixResult.sqlLogic') }}</h3>
               <div v-html="formatText(optimizeResult.fix_result.sql_logic)" class="section-content"></div>
             </div>
             
@@ -98,24 +98,24 @@
               @click="useFixedSQL"
               :disabled="isProcessing"
             >
-              使用修复后的SQL重新分析
+              {{ t('sqlOptimize.result.fixResult.reuseFixed') }}
             </el-button>
           </div>
           
           <!-- 优化分析结果 -->
           <div v-else-if="optimizeResult.status === 'success'" class="success-result">
             <div class="result-section">
-              <h3>业务分析</h3>
+              <h3>{{ t('sqlOptimize.result.success.businessAnalysis') }}</h3>
               <div v-html="formatText(optimizeResult.optimization_result.business_analysis)" class="section-content"></div>
             </div>
             
             <div class="result-section">
-              <h3>性能分析</h3>
+              <h3>{{ t('sqlOptimize.result.success.performanceAnalysis') }}</h3>
               <div v-html="formatText(optimizeResult.optimization_result.performance_analysis)" class="section-content"></div>
             </div>
             
             <div class="result-section">
-              <h3>性能瓶颈</h3>
+              <h3>{{ t('sqlOptimize.result.success.bottlenecks') }}</h3>
               <el-tag 
                 v-for="(bottleneck, index) in optimizeResult.optimization_result.bottlenecks" 
                 :key="`bottleneck-${index}`"
@@ -127,7 +127,7 @@
             </div>
             
             <div class="result-section">
-              <h3>优化建议</h3>
+              <h3>{{ t('sqlOptimize.result.success.suggestions') }}</h3>
               <ul class="suggestion-list">
                 <li 
                   v-for="(suggestion, index) in optimizeResult.optimization_result.optimization_suggestions" 
@@ -139,13 +139,13 @@
             </div>
             
             <div class="result-section" v-if="optimizeResult.optimization_result.optimized_queries && optimizeResult.optimization_result.optimized_queries.length">
-              <h3>优化后的SQL</h3>
+              <h3>{{ t('sqlOptimize.result.success.optimizedQueries') }}</h3>
               
               <el-tabs type="border-card">
                 <el-tab-pane 
                   v-for="(query, i) in optimizeResult.optimization_result.optimized_queries" 
                   :key="`query-${i}`"
-                  :label="`优化方案 ${i+1}`"
+                  :label="t('sqlOptimize.result.success.plan') + ' ' + (i+1)"
                 >
                   <div class="sql-wrapper">
                     <monaco-editor
@@ -160,15 +160,15 @@
                       class="copy-btn"
                       @click="copySQL(query.sql)"
                     >
-                      复制
+                      {{ t('sqlOptimize.result.copy') }}
                     </el-button>
                   </div>
                   
                   <div class="query-explanation">
-                    <h4>优化点说明</h4>
+                    <h4>{{ t('sqlOptimize.result.success.optimizationPoints') }}</h4>
                     <div v-html="formatText(query.explanation)" class="explanation-content"></div>
                     
-                    <h4>预期性能提升</h4>
+                    <h4>{{ t('sqlOptimize.result.success.expectedImprovement') }}</h4>
                     <div v-html="formatText(query.expected_improvement)" class="explanation-content"></div>
                     
                     <el-button 
@@ -176,7 +176,7 @@
                       @click="useOptimizedSQL(query.sql)"
                       :disabled="isProcessing"
                     >
-                      使用此优化方案重新分析
+                      {{ t('sqlOptimize.result.success.useOptimized') }}
                     </el-button>
                   </div>
                 </el-tab-pane>
@@ -188,7 +188,7 @@
           <div v-else-if="optimizeResult.status === 'error'" class="error-result">
             <el-alert
               type="error"
-              :title="optimizeResult.message || '处理出错'"
+              :title="optimizeResult.message || t('sqlOptimize.result.error')"
               :closable="false"
               show-icon
             />
@@ -209,8 +209,10 @@ import { ref, computed, onMounted } from 'vue';
 import { useMCPStore } from '../stores/mcp';
 import { ElMessage } from 'element-plus';
 import MonacoEditor from '@/components/MonacoEditor.vue';
+import { useI18n } from '../i18n';
 
 const mcpStore = useMCPStore();
+const { t, currentLang } = useI18n();
 const isProcessing = ref(false);
 const optimizeResult = ref(null);
 
@@ -250,10 +252,12 @@ async function optimizeSQL() {
     
     optimizeResult.value = result;
   } catch (error) {
-    ElMessage.error(`优化分析失败: ${error.message || '未知错误'}`);
+    ElMessage.error(currentLang.value === 'en' 
+      ? `Optimization analysis failed: ${error.message || 'Unknown error'}`
+      : `优化分析失败: ${error.message || '未知错误'}`);
     optimizeResult.value = {
       status: 'error',
-      message: error.message || '处理出错'
+      message: error.message || (currentLang.value === 'en' ? 'Processing error' : '处理出错')
     };
   } finally {
     isProcessing.value = false;
@@ -272,8 +276,8 @@ function resetForm() {
 // 复制SQL
 function copySQL(sql) {
   navigator.clipboard.writeText(sql)
-    .then(() => ElMessage.success('SQL已复制到剪贴板'))
-    .catch(() => ElMessage.error('复制失败'));
+    .then(() => ElMessage.success(t('sqlOptimize.result.copySuccess')))
+    .catch(() => ElMessage.error(t('sqlOptimize.result.copyFailed')));
 }
 
 // 使用修复后的SQL

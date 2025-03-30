@@ -10,7 +10,7 @@
     >
       <el-menu-item index="/">
         <el-icon><HomeFilled /></el-icon>
-        <span>首页</span>
+        <span>{{ getMenuText('home') }}</span>
       </el-menu-item>
       <el-menu-item index="/nl2sql">
         <el-icon><ChatLineSquare /></el-icon>
@@ -18,21 +18,24 @@
       </el-menu-item>
       <el-menu-item index="/sql-optimize">
         <el-icon><MagicStick /></el-icon>
-        <span>SQL优化</span>
+        <span>{{ getMenuText('sqlOptimize') }}</span>
       </el-menu-item>
       <el-menu-item index="/llm-config">
         <el-icon><Setting /></el-icon>
-        <span>配置管理</span>
+        <span>{{ getMenuText('configManagement') }}</span>
       </el-menu-item>
       
       <!-- 显示连接状态 -->
       <div class="connection-status">
+        <!-- 添加语言切换器 -->
+        <LanguageSwitcher class="global-lang-switcher" />
+        
         <el-tooltip
-          :content="mcpStore.isConnected ? '已连接到MCP服务' : '未连接到MCP服务'"
+          :content="mcpStore.isConnected ? getMenuText('connectedTooltip') : getMenuText('disconnectedTooltip')"
           placement="bottom"
         >
           <el-tag :type="mcpStore.isConnected ? 'success' : 'danger'" size="small">
-            {{ mcpStore.isConnected ? '已连接' : '未连接' }}
+            {{ mcpStore.isConnected ? getMenuText('connected') : getMenuText('disconnected') }}
           </el-tag>
         </el-tooltip>
       </div>
@@ -54,15 +57,75 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useMCPStore } from './stores/mcp'
+import { useLangStore } from './stores/langStore'
 import { HomeFilled, ChatLineSquare, MagicStick, Setting } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
+import LanguageSwitcher from './components/LanguageSwitcher.vue'
 
 const route = useRoute()
 const router = useRouter()
 const mcpStore = useMCPStore()
+const langStore = useLangStore()
 
 // 当前路由
 const activeRoute = computed(() => route.path)
+
+// 页面标题
+const pageTitle = computed(() => {
+  const currentRoute = route.name;
+  if (currentRoute === 'nl2sql') {
+    return langStore.currentLang === 'en' ? 'NL2SQL - Natural Language Query' : 'NL2SQL - 自然语言查询';
+  }
+  // 其他页面标题...
+  return langStore.currentLang === 'en' ? 'Doris MCP' : 'Doris MCP 管理平台';
+});
+
+// 监听路由变化，更新页面标题
+watch(() => route.name, () => {
+  document.title = pageTitle.value;
+}, { immediate: true });
+
+// 监听语言变化，更新页面标题
+watch(() => langStore.currentLang, () => {
+  document.title = pageTitle.value;
+});
+
+// 菜单文本国际化
+function getMenuText(key) {
+  const menuTexts = {
+    home: {
+      en: 'Home',
+      zh: '首页'
+    },
+    sqlOptimize: {
+      en: 'SQL Optimization',
+      zh: 'SQL优化'
+    },
+    configManagement: {
+      en: 'Configuration',
+      zh: '配置管理'
+    },
+    connected: {
+      en: 'Connected',
+      zh: '已连接'
+    },
+    disconnected: {
+      en: 'Disconnected',
+      zh: '未连接'
+    },
+    connectedTooltip: {
+      en: 'Connected to MCP Service',
+      zh: '已连接到MCP服务'
+    },
+    disconnectedTooltip: {
+      en: 'Disconnected from MCP Service',
+      zh: '未连接到MCP服务'
+    }
+  };
+
+  const langCode = langStore.currentLang;
+  return menuTexts[key]?.[langCode] || key;
+}
 
 // 菜单选择处理
 function handleSelect(key) {
@@ -87,13 +150,16 @@ function handleSelect(key) {
 // 监听连接状态变化
 watch(() => mcpStore.isConnected, (newValue) => {
   if (newValue) {
-    ElMessage.success('已连接到MCP服务')
+    ElMessage.success(getMenuText('connectedTooltip'))
   } else if (!mcpStore.isConnecting) {
-    ElMessage.error('与MCP服务的连接已断开')
+    ElMessage.error(getMenuText('disconnectedTooltip'))
   }
 })
 
 onMounted(() => {
+  // 从本地存储加载语言设置
+  langStore.initLanguage();
+  
   // 初始化连接，添加超时控制
   if (!mcpStore.isConnected && !mcpStore.isConnecting) {
     // 使用短超时尝试连接，不阻塞应用启动
@@ -154,6 +220,14 @@ body {
       right: 20px;
       top: 50%;
       transform: translateY(-50%);
+      display: flex;
+      align-items: center;
+      gap: 15px;
+      
+      .global-lang-switcher {
+        // 样式调整
+        margin-right: 5px;
+      }
     }
   }
   

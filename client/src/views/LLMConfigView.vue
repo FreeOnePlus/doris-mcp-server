@@ -3,21 +3,21 @@
     <el-card class="main-card">
       <template #header>
         <div class="header">
-          <h2>LLM 配置管理</h2>
+          <h2>{{ t('llmConfig.title') }}</h2>
         </div>
       </template>
       
       <div class="content">
         <!-- 模型状态概览 -->
-        <el-descriptions title="模型状态概览" :column="1" border>
-          <el-descriptions-item label="连接状态">
+        <el-descriptions :title="t('llmConfig.overview.title')" :column="1" border>
+          <el-descriptions-item :label="t('llmConfig.overview.connectionStatus')">
             <el-tag :type="mcpStore.isConnected ? 'success' : 'danger'">
-              {{ mcpStore.isConnected ? '已连接' : '未连接' }}
+              {{ mcpStore.isConnected ? t('common.connected') : t('common.disconnected') }}
             </el-tag>
           </el-descriptions-item>
-          <el-descriptions-item label="服务状态">
+          <el-descriptions-item :label="t('llmConfig.overview.serviceStatus')">
             <el-tag :type="mcpStore.available ? 'success' : 'danger'">
-              {{ mcpStore.available ? '可用' : '不可用' }}
+              {{ mcpStore.available ? t('llmConfig.overview.available') : t('llmConfig.overview.unavailable') }}
             </el-tag>
           </el-descriptions-item>
         </el-descriptions>
@@ -29,13 +29,13 @@
             :loading="mcpStore.isConnecting" 
             @click="reconnect"
           >
-            刷新连接
+            {{ t('llmConfig.overview.refreshConnection') }}
           </el-button>
         </div>
         
         <!-- 主功能选项卡 -->
         <el-tabs v-model="activeTab" type="border-card" class="config-tabs">
-          <el-tab-pane label="现有配置" name="current">
+          <el-tab-pane :label="t('llmConfig.tabs.current')" name="current">
             <div v-if="isLoading" class="loading-indicator">
               <el-skeleton :rows="6" animated />
             </div>
@@ -50,58 +50,58 @@
             </div>
             
             <div v-else-if="!currentConfig" class="no-config">
-              <el-empty description="无法获取当前配置" />
+              <el-empty :description="t('llmConfig.noConfig')" />
             </div>
             
             <div v-else class="config-details">
               <el-collapse accordion>
                 <!-- NL2SQL配置 -->
-                <el-collapse-item title="NL2SQL 配置" name="nl2sql">
+                <el-collapse-item :title="t('llmConfig.sections.nl2sql')" name="nl2sql">
                   <el-descriptions :column="1" border>
-                    <el-descriptions-item label="SQL生成模型">
-                      {{ currentConfig.nl2sql?.sql_generation_model || '未配置' }}
+                    <el-descriptions-item :label="t('llmConfig.fields.sqlGenerationModel')">
+                      {{ currentConfig.nl2sql?.sql_generation_model || t('llmConfig.fields.notConfigured') }}
                     </el-descriptions-item>
-                    <el-descriptions-item label="SQL修复模型">
-                      {{ currentConfig.nl2sql?.sql_fix_model || '未配置' }}
+                    <el-descriptions-item :label="t('llmConfig.fields.sqlFixModel')">
+                      {{ currentConfig.nl2sql?.sql_fix_model || t('llmConfig.fields.notConfigured') }}
                     </el-descriptions-item>
-                    <el-descriptions-item label="业务分析模型">
-                      {{ currentConfig.nl2sql?.business_analysis_model || '未配置' }}
+                    <el-descriptions-item :label="t('llmConfig.fields.businessAnalysisModel')">
+                      {{ currentConfig.nl2sql?.business_analysis_model || t('llmConfig.fields.notConfigured') }}
                     </el-descriptions-item>
-                    <el-descriptions-item label="温度系数">
-                      {{ currentConfig.nl2sql?.temperature || '默认' }}
+                    <el-descriptions-item :label="t('llmConfig.fields.temperature')">
+                      {{ currentConfig.nl2sql?.temperature || t('llmConfig.fields.default') }}
                     </el-descriptions-item>
-                    <el-descriptions-item label="最大tokens">
-                      {{ currentConfig.nl2sql?.max_tokens || '默认' }}
+                    <el-descriptions-item :label="t('llmConfig.fields.maxTokens')">
+                      {{ currentConfig.nl2sql?.max_tokens || t('llmConfig.fields.default') }}
                     </el-descriptions-item>
                   </el-descriptions>
                 </el-collapse-item>
                 
                 <!-- SQL优化配置 -->
-                <el-collapse-item title="SQL优化配置" name="sql_optimize">
+                <el-collapse-item :title="t('llmConfig.sections.sqlOptimize')" name="sql_optimize">
                   <el-descriptions :column="1" border>
-                    <el-descriptions-item label="SQL优化模型">
-                      {{ currentConfig.sql_optimize?.model || '未配置' }}
+                    <el-descriptions-item :label="t('llmConfig.fields.sqlOptimizeModel')">
+                      {{ currentConfig.sql_optimize?.model || t('llmConfig.fields.notConfigured') }}
                     </el-descriptions-item>
-                    <el-descriptions-item label="温度系数">
-                      {{ currentConfig.sql_optimize?.temperature || '默认' }}
+                    <el-descriptions-item :label="t('llmConfig.fields.temperature')">
+                      {{ currentConfig.sql_optimize?.temperature || t('llmConfig.fields.default') }}
                     </el-descriptions-item>
-                    <el-descriptions-item label="最大tokens">
-                      {{ currentConfig.sql_optimize?.max_tokens || '默认' }}
+                    <el-descriptions-item :label="t('llmConfig.fields.maxTokens')">
+                      {{ currentConfig.sql_optimize?.max_tokens || t('llmConfig.fields.default') }}
                     </el-descriptions-item>
                   </el-descriptions>
                 </el-collapse-item>
                 
                 <!-- 系统配置 -->
-                <el-collapse-item title="系统配置" name="system">
+                <el-collapse-item :title="t('llmConfig.sections.system')" name="system">
                   <el-descriptions :column="1" border>
-                    <el-descriptions-item label="最大重试次数">
-                      {{ currentConfig.system?.max_retries || '默认' }}
+                    <el-descriptions-item :label="t('llmConfig.fields.maxRetries')">
+                      {{ currentConfig.system?.max_retries || t('llmConfig.fields.default') }}
                     </el-descriptions-item>
-                    <el-descriptions-item label="超时设置(秒)">
-                      {{ currentConfig.system?.timeout || '默认' }}
+                    <el-descriptions-item :label="t('llmConfig.fields.timeout')">
+                      {{ currentConfig.system?.timeout || t('llmConfig.fields.default') }}
                     </el-descriptions-item>
-                    <el-descriptions-item label="日志级别">
-                      {{ currentConfig.system?.log_level || '默认' }}
+                    <el-descriptions-item :label="t('llmConfig.fields.logLevel')">
+                      {{ currentConfig.system?.log_level || t('llmConfig.fields.default') }}
                     </el-descriptions-item>
                   </el-descriptions>
                 </el-collapse-item>
@@ -109,11 +109,11 @@
             </div>
           </el-tab-pane>
           
-          <el-tab-pane label="修改配置" name="edit">
+          <el-tab-pane :label="t('llmConfig.tabs.edit')" name="edit">
             <div class="edit-config">
               <el-alert
                 type="warning"
-                title="直接修改配置可能影响系统稳定性，请确保了解配置项的作用"
+                :title="t('llmConfig.edit.warning')"
                 :closable="false"
                 show-icon
                 class="warning-alert"
@@ -126,30 +126,30 @@
                 ref="configForm"
               >
                 <!-- NL2SQL配置 -->
-                <el-divider content-position="left">NL2SQL 配置</el-divider>
+                <el-divider content-position="left">{{ t('llmConfig.sections.nl2sql') }}</el-divider>
                 
-                <el-form-item label="SQL生成模型" prop="nl2sql.sql_generation_model">
+                <el-form-item :label="t('llmConfig.fields.sqlGenerationModel')" prop="nl2sql.sql_generation_model">
                   <el-input 
                     v-model="editConfig.nl2sql.sql_generation_model"
                     placeholder="如: claude-3-sonnet-20240229"
                   />
                 </el-form-item>
                 
-                <el-form-item label="SQL修复模型" prop="nl2sql.sql_fix_model">
+                <el-form-item :label="t('llmConfig.fields.sqlFixModel')" prop="nl2sql.sql_fix_model">
                   <el-input 
                     v-model="editConfig.nl2sql.sql_fix_model"
                     placeholder="如: claude-3-sonnet-20240229"
                   />
                 </el-form-item>
                 
-                <el-form-item label="业务分析模型" prop="nl2sql.business_analysis_model">
+                <el-form-item :label="t('llmConfig.fields.businessAnalysisModel')" prop="nl2sql.business_analysis_model">
                   <el-input 
                     v-model="editConfig.nl2sql.business_analysis_model"
                     placeholder="如: claude-3-sonnet-20240229"
                   />
                 </el-form-item>
                 
-                <el-form-item label="温度系数" prop="nl2sql.temperature">
+                <el-form-item :label="t('llmConfig.fields.temperature')" prop="nl2sql.temperature">
                   <el-slider 
                     v-model="editConfig.nl2sql.temperature" 
                     :min="0" 
@@ -159,7 +159,7 @@
                   />
                 </el-form-item>
                 
-                <el-form-item label="最大tokens" prop="nl2sql.max_tokens">
+                <el-form-item :label="t('llmConfig.fields.maxTokens')" prop="nl2sql.max_tokens">
                   <el-input-number 
                     v-model="editConfig.nl2sql.max_tokens" 
                     :min="100" 
@@ -169,16 +169,16 @@
                 </el-form-item>
                 
                 <!-- SQL优化配置 -->
-                <el-divider content-position="left">SQL优化配置</el-divider>
+                <el-divider content-position="left">{{ t('llmConfig.sections.sqlOptimize') }}</el-divider>
                 
-                <el-form-item label="SQL优化模型" prop="sql_optimize.model">
+                <el-form-item :label="t('llmConfig.fields.sqlOptimizeModel')" prop="sql_optimize.model">
                   <el-input 
                     v-model="editConfig.sql_optimize.model"
                     placeholder="如: claude-3-sonnet-20240229"
                   />
                 </el-form-item>
                 
-                <el-form-item label="温度系数" prop="sql_optimize.temperature">
+                <el-form-item :label="t('llmConfig.fields.temperature')" prop="sql_optimize.temperature">
                   <el-slider 
                     v-model="editConfig.sql_optimize.temperature" 
                     :min="0" 
@@ -188,7 +188,7 @@
                   />
                 </el-form-item>
                 
-                <el-form-item label="最大tokens" prop="sql_optimize.max_tokens">
+                <el-form-item :label="t('llmConfig.fields.maxTokens')" prop="sql_optimize.max_tokens">
                   <el-input-number 
                     v-model="editConfig.sql_optimize.max_tokens" 
                     :min="100" 
@@ -198,9 +198,9 @@
                 </el-form-item>
                 
                 <!-- 系统配置 -->
-                <el-divider content-position="left">系统配置</el-divider>
+                <el-divider content-position="left">{{ t('llmConfig.sections.system') }}</el-divider>
                 
-                <el-form-item label="最大重试次数" prop="system.max_retries">
+                <el-form-item :label="t('llmConfig.fields.maxRetries')" prop="system.max_retries">
                   <el-input-number 
                     v-model="editConfig.system.max_retries" 
                     :min="0" 
@@ -209,7 +209,7 @@
                   />
                 </el-form-item>
                 
-                <el-form-item label="超时设置(秒)" prop="system.timeout">
+                <el-form-item :label="t('llmConfig.fields.timeout')" prop="system.timeout">
                   <el-input-number 
                     v-model="editConfig.system.timeout" 
                     :min="1" 
@@ -218,7 +218,7 @@
                   />
                 </el-form-item>
                 
-                <el-form-item label="日志级别" prop="system.log_level">
+                <el-form-item :label="t('llmConfig.fields.logLevel')" prop="system.log_level">
                   <el-select v-model="editConfig.system.log_level">
                     <el-option label="DEBUG" value="DEBUG" />
                     <el-option label="INFO" value="INFO" />
@@ -235,13 +235,13 @@
                     :loading="isSaving"
                     :disabled="!mcpStore.available"
                   >
-                    保存配置
+                    {{ t('llmConfig.edit.save') }}
                   </el-button>
                   <el-button 
                     @click="resetEditForm"
                     :disabled="isSaving"
                   >
-                    重置
+                    {{ t('llmConfig.edit.reset') }}
                   </el-button>
                 </el-form-item>
               </el-form>
@@ -257,8 +257,10 @@
 import { ref, reactive, onMounted, watch } from 'vue';
 import { useMCPStore } from '../stores/mcp';
 import { ElMessage } from 'element-plus';
+import { useI18n } from '../i18n';
 
 const mcpStore = useMCPStore();
+const { t, currentLang } = useI18n();
 const activeTab = ref('current');
 const isLoading = ref(false);
 const isSaving = ref(false);
@@ -290,16 +292,16 @@ const editConfig = reactive({
 // 配置验证规则
 const configRules = {
   'nl2sql.temperature': [
-    { type: 'number', min: 0, max: 1, message: '温度系数必须在0-1之间', trigger: 'change' }
+    { type: 'number', min: 0, max: 1, message: currentLang.value === 'en' ? 'Temperature must be between 0-1' : '温度系数必须在0-1之间', trigger: 'change' }
   ],
   'sql_optimize.temperature': [
-    { type: 'number', min: 0, max: 1, message: '温度系数必须在0-1之间', trigger: 'change' }
+    { type: 'number', min: 0, max: 1, message: currentLang.value === 'en' ? 'Temperature must be between 0-1' : '温度系数必须在0-1之间', trigger: 'change' }
   ],
   'system.max_retries': [
-    { type: 'number', min: 0, max: 10, message: '重试次数必须在0-10之间', trigger: 'change' }
+    { type: 'number', min: 0, max: 10, message: currentLang.value === 'en' ? 'Retry count must be between 0-10' : '重试次数必须在0-10之间', trigger: 'change' }
   ],
   'system.timeout': [
-    { type: 'number', min: 1, max: 300, message: '超时时间必须在1-300秒之间', trigger: 'change' }
+    { type: 'number', min: 1, max: 300, message: currentLang.value === 'en' ? 'Timeout must be between 1-300 seconds' : '超时时间必须在1-300秒之间', trigger: 'change' }
   ]
 };
 
@@ -319,7 +321,9 @@ async function fetchCurrentConfig() {
       updateEditConfig(config);
     }
   } catch (error) {
-    configError.value = `获取配置失败: ${error.message || '未知错误'}`;
+    configError.value = currentLang.value === 'en' 
+      ? `Failed to get configuration: ${error.message || 'Unknown error'}`
+      : `获取配置失败: ${error.message || '未知错误'}`;
     console.error('Failed to fetch config:', error);
   } finally {
     isLoading.value = false;
@@ -368,11 +372,11 @@ async function saveConfig() {
     // 调用API保存配置
     mcpStore.updateLLMConfig(editConfig)
       .then(() => {
-        ElMessage.success('配置保存成功');
+        ElMessage.success(t('llmConfig.edit.success'));
         fetchCurrentConfig(); // 重新获取配置
       })
       .catch((error) => {
-        ElMessage.error(`保存配置失败: ${error.message || '未知错误'}`);
+        ElMessage.error(`${t('llmConfig.edit.failed')} ${error.message || (currentLang.value === 'en' ? 'Unknown error' : '未知错误')}`);
       })
       .finally(() => {
         isSaving.value = false;
@@ -412,10 +416,10 @@ function reconnect() {
   
   mcpStore.connect().then(() => {
     if (mcpStore.isConnected) {
-      ElMessage.success('连接成功');
+      ElMessage.success(currentLang.value === 'en' ? 'Connection successful' : '连接成功');
       fetchCurrentConfig();
     } else {
-      ElMessage.error('连接失败');
+      ElMessage.error(currentLang.value === 'en' ? 'Connection failed' : '连接失败');
     }
   });
 }
