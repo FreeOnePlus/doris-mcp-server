@@ -518,13 +518,19 @@ BUSINESS_ANALYSIS_PROMPTS = {
   "visualization": {
     "type": "图表类型，如bar, line, pie等",
     "title": "图表标题",
-    "x_axis": "X轴字段名",
-    "y_axis": "Y轴字段名",
+    "x_axis": "X轴字段名（必须与查询结果中的列名完全一致）",
+    "y_axis": "Y轴字段名（必须与查询结果中的列名完全一致）",
     "description": "图表描述"
   },
   "recommendations": ["建议1", "建议2", ...]
 }
 ```
+
+重要说明：
+- X轴和Y轴字段名必须与查询结果中的列名完全一致，否则图表无法正常显示
+- type字段必须是以下之一：bar（柱状图）、line（折线图）、pie（饼图）
+- 确保visualization的每个字段都有值，这对于正确渲染图表至关重要
+- 对于时间序列数据，建议使用line类型；对于分类比较，建议使用bar类型；对于占比分析，建议使用pie类型
 
 请确保分析深入、专业，并与业务场景紧密结合。""",
     
@@ -544,5 +550,9 @@ BUSINESS_ANALYSIS_PROMPTS = {
 相关表的元数据信息：
 {tables_info}
 
-请根据以上信息提供业务分析、可视化建议和业务建议。"""
+请根据以上信息提供业务分析、可视化建议和业务建议。请特别注意：
+1. 请确保visualization字段包含所有必要属性
+2. type, x_axis和y_axis必须准确对应查询结果中的可视化需求
+3. x_axis和y_axis必须是查询结果中存在的列名
+"""
 } 

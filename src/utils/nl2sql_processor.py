@@ -1771,8 +1771,15 @@ class NL2SQLProcessor:
             # 准备系统提示
             system_prompt = BUSINESS_ANALYSIS_PROMPTS["system"]
             
-            # 准备用户提示
-            user_prompt = BUSINESS_ANALYSIS_PROMPTS["user"].format(
+            # 提取结果中可用的列名，作为可视化参考
+            column_names = []
+            if result and len(result) > 0:
+                column_names = list(result[0].keys())
+                logger.info(f"查询结果包含以下列: {column_names}")
+            
+            # 准备用户提示，添加列名信息
+            user_prompt_template = BUSINESS_ANALYSIS_PROMPTS["user"]
+            user_prompt = user_prompt_template.format(
                 query=query,
                 sql=sql,
                 result=json.dumps(result[:20], ensure_ascii=False, indent=2),
@@ -1789,6 +1796,125 @@ class NL2SQLProcessor:
             
             # 解析LLM响应，提取JSON
             analysis_result = self._parse_llm_json_response(response.content)
+            logger.info(f"获取到业务分析结果: {analysis_result.keys() if isinstance(analysis_result, dict) else 'None'}")
+            
+            # 确保visualization字段的结构正确
+            if isinstance(analysis_result, dict) and 'visualization' in analysis_result:
+                visualization = analysis_result.get('visualization', {})
+                if not isinstance(visualization, dict):
+                    logger.warning(f"visualization不是字典类型: {visualization}")
+                    analysis_result['visualization'] = {
+                        "type": "bar",
+                        "title": "查询结果可视化",
+                        "x_axis": column_names[0] if column_names else "x",
+                        "y_axis": column_names[1] if len(column_names) > 1 else "y",
+                        "description": "查询结果的默认可视化图表"
+                    }
+                else:
+                    # 验证并修复可视化字段
+                    required_fields = ["type", "title", "x_axis", "y_axis", "description"]
+                    for field in required_fields:
+                        if field not in visualization or not visualization[field]:
+                            logger.warning(f"visualization中缺少字段 {field}")
+                            # 为缺失字段提供默认值
+                            if field == "type":
+                                visualization[field] = "bar"
+                            elif field == "title":
+                                visualization[field] = "查询结果可视化"
+                            elif field == "x_axis":
+                                visualization[field] = column_names[0] if column_names else "x"
+                            elif field == "y_axis":
+                                # 如果y_axis缺失，使用除x轴外的第一个字段，或者x轴字段本身
+                                if len(column_names) > 1:
+                                    y_candidates = [c for c in column_names if c != visualization["x_axis"]]
+                                    if y_candidates:
+                                        visualization[field] = y_candidates[0]
+                                    else:
+                                        visualization[field] = column_names[0]
+                                else:
+                                    visualization[field] = column_names[0] if column_names else "y"
+                            elif field == "description":
+                                visualization[field] = "查询结果的可视化图表"
+                    
+                    # 特殊处理y_axis值为数组的情况，前端已支持数组格式
+                    y_axis = visualization.get("y_axis")
+                    if isinstance(y_axis, list):
+                        # 验证数组中的每个字段是否存在
+                        if column_names:
+                            valid_fields = []
+                            for field in y_axis:
+                                if field in column_names:
+                                    valid_fields.append(field)
+                                else:
+                                    logger.warning(f"y_axis数组中的字段 '{field}' 不在结果列中")
+                        
+                            if not valid_fields and len(column_names) > 1:
+                                # 如果没有有效字段，使用除x轴外的第一个字段
+                                x_axis = visualization.get("x_axis")
+                                for field in column_names:
+                                    if field != x_axis:
+                                        valid_fields.append(field)
+                                        break
+                        
+                            if not valid_fields:
+                                # 如果仍然没有有效字段，使用第一个字段
+                                valid_fields.append(column_names[0])
+                            
+                            visualization["y_axis"] = valid_fields
+                    
+                    # 确保x_axis在结果列名中存在
+                    if column_names and visualization["x_axis"] not in column_names:
+                        logger.warning(f"visualization中的x_axis '{visualization['x_axis']}' 不在结果列中: {column_names}")
+                        visualization["x_axis"] = column_names[0]
+                    
+                    # 确保图表类型有效
+                    valid_types = ["bar", "line", "pie"]
+                    if visualization["type"].lower() not in valid_types:
+                        logger.warning(f"visualization中的type '{visualization['type']}' 无效，有效值: {valid_types}")
+                        visualization["type"] = "bar"
+                    else:
+                        visualization["type"] = visualization["type"].lower()
+                    
+                    analysis_result['visualization'] = visualization
+            else:
+                # 如果没有visualization字段，创建一个默认值
+                logger.warning("业务分析结果中没有visualization字段，创建默认值")
+                if isinstance(analysis_result, dict):
+                    # 选择要展示的Y轴字段
+                    y_fields = []
+                    if len(column_names) > 1:
+                        # 默认使用第一个字段作为X轴，其他数值字段作为Y轴
+                        x_field = column_names[0]
+                        for field in column_names[1:]:
+                            if field != x_field:
+                                y_fields.append(field)
+                                if len(y_fields) >= 3:  # 最多选3个字段作为Y轴
+                                    break
+                
+                    if not y_fields and column_names:
+                        y_fields = [column_names[0]]
+                    
+                    analysis_result['visualization'] = {
+                        "type": "bar",
+                        "title": "查询结果可视化",
+                        "x_axis": column_names[0] if column_names else "x",
+                        "y_axis": y_fields if y_fields else "y",
+                        "description": "查询结果的默认可视化图表"
+                    }
+                else:
+                    logger.error(f"业务分析结果不是一个字典: {analysis_result}")
+                    analysis_result = {
+                        "business_analysis": "无法生成业务分析",
+                        "trends": ["无法识别趋势"],
+                        "visualization": {
+                            "type": "bar",
+                            "title": "查询结果可视化",
+                            "x_axis": column_names[0] if column_names else "x",
+                            "y_axis": column_names[1] if len(column_names) > 1 else "y",
+                            "description": "查询结果的默认可视化图表"
+                        },
+                        "recommendations": ["无法提供建议"]
+                    }
             
             # 记录业务分析结果
             log_data = {
@@ -1804,9 +1930,28 @@ class NL2SQLProcessor:
             
         except Exception as e:
             logger.error(f"生成业务分析时出错: {str(e)}")
+            # 返回带有错误信息的默认分析结果
+            column_names = list(result[0].keys()) if result and len(result) > 0 else ["x", "y"]
+            # 默认选择两个字段作为y轴
+            y_fields = []
+            if len(column_names) > 1:
+                for field in column_names[1:]:
+                    y_fields.append(field)
+                    if len(y_fields) >= 2:  # 最多选2个字段
+                        break
+            
             return {
                 "error": f"生成业务分析时出错: {str(e)}",
-                "business_analysis": "无法生成业务分析"
+                "business_analysis": "无法生成业务分析",
+                "trends": ["无法识别趋势"],
+                "visualization": {
+                    "type": "bar",
+                    "title": "查询结果可视化",
+                    "x_axis": column_names[0] if column_names else "x",
+                    "y_axis": y_fields if y_fields else "y",
+                    "description": "查询结果的默认可视化图表"
+                },
+                "recommendations": ["无法提供建议"]
             }
 
     def _fix_sql(self, sql: str, error_msg: str, query: str) -> Optional[str]:
