@@ -66,12 +66,13 @@ class MCPAdapterMiddleware(BaseHTTPMiddleware):
                     
                     # 如果开启了调试模式，打印完整请求
                     if os.environ.get("MCP_DEBUG_ADAPTER", "").lower() == "true":
-                        print("\n==================== MCP请求 ====================")
-                        print(f"路径: {request.url.path}")
-                        print(f"查询参数: {request.url.query}")
-                        print(f"请求体: {json.dumps(data, ensure_ascii=False, indent=2)}")
-                        print(f"流式响应: {use_stream}")
-                        print("=================================================\n")
+                        # print("\n==================== MCP请求 ====================")
+                        # print(f"路径: {request.url.path}")
+                        # print(f"查询参数: {request.url.query}")
+                        # print(f"请求体: {json.dumps(data, ensure_ascii=False, indent=2)}")
+                        # print(f"流式响应: {use_stream}")
+                        # print("=================================================\n")
+                        pass
                     
                 except json.JSONDecodeError:
                     logger.warning("无法解析JSON请求，跳过处理")
@@ -102,9 +103,10 @@ class MCPAdapterMiddleware(BaseHTTPMiddleware):
                         }
                         
                         if os.environ.get("MCP_DEBUG_ADAPTER", "").lower() == "true":
-                            print("\n================ 生成的工具列表响应 ================")
-                            print(json.dumps(response_data, ensure_ascii=False, indent=2))
-                            print("=================================================\n")
+                            # print("\n================ 生成的工具列表响应 ================")
+                            # print(json.dumps(response_data, ensure_ascii=False, indent=2))
+                            # print("=================================================\n")
+                            pass
                         
                         return JSONResponse(content=response_data)
                     
@@ -128,9 +130,10 @@ class MCPAdapterMiddleware(BaseHTTPMiddleware):
                         }
                         
                         if os.environ.get("MCP_DEBUG_ADAPTER", "").lower() == "true":
-                            print("\n================ 手动生成的健康检查响应 ================")
-                            print(json.dumps(response_data, ensure_ascii=False, indent=2))
-                            print("=================================================\n")
+                            # print("\n================ 手动生成的健康检查响应 ================")
+                            # print(json.dumps(response_data, ensure_ascii=False, indent=2))
+                            # print("=================================================\n")
+                            pass
                         
                         return JSONResponse(content=response_data)
 
@@ -171,10 +174,10 @@ class MCPAdapterMiddleware(BaseHTTPMiddleware):
                                 
                                 # 调用工具函数
                                 if is_async:
-                                    logger.info(f"异步调用工具: {tool_name}")
+                                    # logger.info(f"异步调用工具: {tool_name}")
                                     result = await tool_func(**params)
                                 else:
-                                    logger.info(f"同步调用工具: {tool_name}")
+                                    # logger.info(f"同步调用工具: {tool_name}")
                                     result = tool_func(**params)
                                 
                                 # 构建成功响应
@@ -186,9 +189,11 @@ class MCPAdapterMiddleware(BaseHTTPMiddleware):
                                 }
                                 
                                 if os.environ.get("MCP_DEBUG_ADAPTER", "").lower() == "true":
-                                    print(f"\n============== {tool_name}工具调用响应 ==============")
-                                    print(json.dumps(response_data, ensure_ascii=False, indent=2))
-                                    print("=================================================\n")
+                                    # print(f"\n============== {tool_name}工具调用响应 ==============")
+                                    # print(json.dumps(response_data, ensure_ascii=False, indent=2))
+                                    # print("=================================================\n")
+                                    # logger.info(f"工具调用响应: {response_data}")
+                                    pass
                                 
                                 return JSONResponse(content=response_data)
                             else:

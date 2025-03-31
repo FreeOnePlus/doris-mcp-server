@@ -18,7 +18,7 @@ export default defineConfig({
     // 如果后端API在不同端口，可以添加代理配置
     proxy: {
       '/api': {
-        target: 'http://localhost:3000',
+        target: 'http://192.168.31.13:3000',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, '')
       }
