@@ -361,7 +361,7 @@ const dynamicStageMarkers = computed(() => [
   // 移除模式推理阶段
   // 保留一个SQL生成阶段，将两个变体都映射到同一个标记
   { value: 'generating', label: currentLang.value === 'en' ? 'SQL Generation' : 'SQL生成' },
-  { value: 'executing', label: currentLang.value === 'en' ? 'SQL Execution' : 'SQL执行' }
+  { value: 'executing', label: currentLang.value === 'en' ? 'SQL Execution' : '总结分析' }
 ]);
 
 // 添加stage映射函数，处理可能的变体

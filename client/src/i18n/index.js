@@ -241,7 +241,7 @@ const zhLocale = {
     exampleAnalysis: '示例分析',
     businessAnalysis: '业务分析',
     sqlGeneration: 'SQL生成',
-    sqlExecution: 'SQL执行',
+    sqlExecution: '总结分析',
     processing: '处理中',
     idle: '空闲'
   },

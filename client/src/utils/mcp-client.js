@@ -6,7 +6,7 @@
 export class MCPClient {
   constructor(options = {}) {
     this.host = options.host || 'localhost';
-    this.port = options.port || 5000;
+    this.port = options.port || 3000;
     this.protocol = options.protocol || 'http';
     this.baseUrl = `${this.protocol}://${this.host}:${this.port}`;
     this.maxRetries = options.maxRetries || 1;
@@ -59,8 +59,8 @@ export class MCPClient {
       
       // 首先尝试健康检查
       try {
-        console.log(`尝试健康检查: ${this.baseUrl}/health`);
-        const healthResponse = await fetch(`${this.baseUrl}/health`, {
+        console.log(`尝试健康检查: ${this.baseUrl}/status`);
+        const healthResponse = await fetch(`${this.baseUrl}/status`, {
           method: 'GET',
           headers: { 'Content-Type': 'application/json' },
           signal: AbortSignal.timeout(3000), // 限制健康检查时间为3秒
@@ -78,7 +78,7 @@ export class MCPClient {
       }
       
       // 使用SSE传输初始化连接
-      const sseUrl = `${this.baseUrl}/sse`;
+      const sseUrl = `${this.baseUrl}/mcp`;
       console.log(`尝试建立SSE连接: ${sseUrl}`);
       
       // 使用Promise.race实现整体超时控制
@@ -116,6 +116,9 @@ export class MCPClient {
               // 保存EventSource以便后续使用
               this.eventSource = eventSource;
               
+              // 发送初始化请求
+              this._sendInitializeRequest();
+              
               resolve(true);
             } catch (error) {
               console.error('处理endpoint事件出错:', error);
@@ -127,6 +130,12 @@ export class MCPClient {
           // 处理常规消息
           eventSource.onmessage = (event) => {
             console.log('收到SSE消息:', event.data);
+            try {
+              const message = JSON.parse(event.data);
+              this._handleMessage(message);
+            } catch (error) {
+              console.error('处理SSE消息出错:', error);
+            }
           };
           
           // 处理错误
@@ -176,7 +185,52 @@ export class MCPClient {
       throw error;
     }
   }
-  
+
+  /**
+   * 发送初始化请求
+   * @private
+   */
+  async _sendInitializeRequest() {
+    const initializeMessage = {
+      jsonrpc: "2.0",
+      id: ++this.callId,
+      method: "initialize",
+      params: {}
+    };
+    
+    try {
+      const response = await fetch(this.messageEndpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(initializeMessage),
+        mode: 'cors',
+        credentials: 'omit'
+      });
+      
+      if (response.ok) {
+        console.log('初始化请求发送成功');
+      } else {
+        console.warn('初始化请求失败:', response.status);
+      }
+    } catch (error) {
+      console.error('发送初始化请求出错:', error);
+    }
+  }
+
+  /**
+   * 处理接收到的消息
+   * @private
+   */
+  _handleMessage(message) {
+    if (message.method === 'notifications/initialized') {
+      console.log('收到初始化完成通知');
+      // 发送工具列表请求
+      this.listTools();
+    }
+  }
+
   /**
    * 调用MCP服务方法（tool、resource或prompt）
    * @param {string} method - 方法名称
