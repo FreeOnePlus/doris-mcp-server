@@ -12,6 +12,7 @@ import time
 from typing import Dict, List, Any, Optional, Tuple
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
+import logging
 
 # 导入统一日志配置
 from src.utils.logger import get_logger
@@ -20,7 +21,7 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 # 加载环境变量
-load_dotenv()
+load_dotenv(override=True)
 
 # 导入本地模块
 from src.utils.db import execute_query_df, execute_query, get_db_connection, ENABLE_MULTI_DATABASE, MULTI_DATABASE_NAMES

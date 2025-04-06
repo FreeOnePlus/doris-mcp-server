@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 # 加载环境变量
-load_dotenv()
+load_dotenv(override=True)
 
 class Message:
     """聊天消息"""

@@ -37,6 +37,10 @@ export class MCPClient {
     
     // 流式响应回调函数
     this.streamCallbacks = new Map();
+    
+    // 状态更新和工具结果监听器
+    this.statusListeners = [];
+    this.toolResultListeners = new Map();
   }
 
   _generateClientId() {
@@ -396,6 +400,9 @@ export class MCPClient {
       // 调用工具
       const result = await this.call(toolName, params);
       
+      // 触发工具结果监听器通知
+      this._notifyToolResultListeners(toolName, result);
+      
       // 检查是否收到了工具调用的实际响应，而不仅仅是请求确认
       if (result && result.result && typeof result.result === 'object') {
         if (result.result.message && result.result.message.includes('收到消息')) {
@@ -672,7 +679,8 @@ export class MCPClient {
         session_id: this.sessionId,
         type: 'tool',
         tool: toolName,
-        params: params
+        params: params,
+        stream: true  // 在请求正文中明确指定流式响应
       };
       
       console.log(`发送流式请求到: ${streamUrl}`, requestBody);
@@ -724,117 +732,132 @@ export class MCPClient {
         
         // 解码本次接收的数据
         const chunk = decoder.decode(value, { stream: true });
-        console.log('收到WebSocket数据块:', chunk);
+        console.log('收到流式数据块:', chunk.length, '字节');
+        console.log('数据块内容预览:', chunk.substring(0, 100));
         buffer += chunk;
         
-        // 解析出完整的SSE事件
-        const events = buffer.split('\n\n');
-        buffer = events.pop() || ''; // 最后一个可能不完整，留在buffer中
-        
-        console.log(`处理 ${events.length} 个SSE事件`);
-        
-        // 处理每个完整事件
-        for (const event of events) {
-          if (!event.trim().startsWith('data:')) {
-            console.log('跳过非数据事件:', event);
-            continue;
-          }
+        try {
+          // 尝试直接解析整个响应
+          const response = JSON.parse(buffer);
+          console.log('成功解析完整JSON响应:', response);
           
-          try {
-            // 提取data部分并解析JSON
-            const dataStr = event.trim().substring(5).trim();
-            console.log('解析事件数据:', dataStr);
-            const eventData = JSON.parse(dataStr);
+          // 检查是否有正确的结果结构
+          if (response.result && response.id === id.toString()) {
+            // 这是最终结果
+            if (callbacks.onFinal) {
+              console.log('调用onFinal回调处理最终结果');
+              callbacks.onFinal(response);
+            }
+            // 清空缓冲区
+            buffer = '';
+            break;
+          }
+        } catch (e) {
+          // 如果不能解析完整JSON，可能是流还未完成，继续处理
+          // 解析出完整的SSE事件
+          console.log('无法解析为完整JSON，尝试解析SSE事件格式');
+          const events = buffer.split('\n\n');
+          buffer = events.pop() || ''; // 最后一个可能不完整，留在buffer中
+          
+          console.log(`检测到 ${events.length} 个可能的SSE事件`);
+          
+          // 处理每个完整事件
+          for (const event of events) {
+            console.log('处理SSE事件:', event.substring(0, 100));
             
-            console.log('收到流式事件类型:', eventData.type);
-            
-            // 根据事件类型调用对应回调
-            const data = eventData.data;
-            
-            // 对所有事件数据进行预处理，确保规范化的字段
-            if (data && data.result) {
-              // 调试原始事件数据
-              console.log('事件原始数据:', JSON.stringify(data.result));
-              
-              // 处理阶段和进度字段
-              const result = data.result;
-              
-              // 确保type和step字段的一致性
-              if (result.step && !result.type) {
-                result.type = result.step;
-                console.log('从step设置type:', result.type);
-              } else if (result.type && !result.step) {
-                result.step = result.type;
-                console.log('从type设置step:', result.step);
-              }
-              
-              // 确保阶段有描述性名称
-              if (result.step && !result.message) {
-                result.message = `处理阶段: ${result.step}`;
-                console.log('设置默认消息:', result.message);
-              }
-              
-              // 如果指定了进度，确保是数字
-              if (result.progress !== undefined) {
-                // 确保进度是数字
-                const origProgress = result.progress;
-                result.progress = Number(result.progress);
-                // 如果是NaN，设置默认值
-                if (isNaN(result.progress)) {
-                  console.log('进度值无效，使用默认值0:', origProgress);
-                  result.progress = 0;
-                }
-                // 限制范围在0-100
-                result.progress = Math.max(0, Math.min(100, result.progress));
-                console.log('设置进度值:', result.progress);
-              }
-              
-              console.log('规范化后的事件数据:', JSON.stringify(result));
-            } else {
-              console.warn('事件数据缺少result字段或为空:', data);
+            if (!event.trim().startsWith('data:')) {
+              console.log('跳过非数据事件，事件类型:', event.split('\n')[0]);
+              continue;
             }
             
-            // 检查回调是否存在并处理事件
-            switch (eventData.type) {
-              case 'thinking':
-                if (callbacks.onThinking) {
-                  if (data.result) {
-                    callbacks.onThinking(data.result);
-                  } else {
-                    console.warn('思考事件缺少result属性:', data);
-                    callbacks.onThinking(data);
+            try {
+              // 提取data部分并解析JSON
+              const dataStr = event.trim().substring(5).trim();
+              console.log('提取的事件数据:', dataStr.substring(0, 100));
+              
+              // 尝试解析JSON
+              try {
+                const eventData = JSON.parse(dataStr);
+                console.log('成功解析事件数据为JSON:', eventData.type || '未知类型');
+                
+                // 如果是jsonrpc 2.0格式的完整响应
+                if (eventData.jsonrpc === "2.0" && eventData.id && eventData.result) {
+                  console.log('收到完整的jsonrpc响应:', eventData.id);
+                  
+                  // 这是最终结果
+                  if (callbacks.onFinal) {
+                    console.log('调用onFinal回调处理jsonrpc响应');
+                    callbacks.onFinal(eventData);
                   }
+                  buffer = '';
+                  break;
                 }
-                break;
-              case 'progress':
-                if (callbacks.onProgress) {
-                  if (data.result) {
-                    callbacks.onProgress(data.result);
-                  } else {
-                    console.warn('进度事件缺少result属性:', data);
-                    callbacks.onProgress(data);
-                  }
+                
+                console.log('收到流式事件类型:', eventData.type || '未指定类型');
+                
+                // 根据事件类型调用对应回调
+                if (!eventData.type) {
+                  console.warn('事件数据缺少type字段:', eventData);
+                  continue;
                 }
-                break;
-              case 'partial':
-                if (callbacks.onPartial) callbacks.onPartial(data);
-                break;
-              case 'final':
-                if (callbacks.onFinal) callbacks.onFinal(data);
-                break;
-              case 'error':
-                if (callbacks.onError) callbacks.onError(data.error || { message: '未知错误' });
-                break;
-              default:
-                console.warn('未知事件类型:', eventData.type);
-            }
-          } catch (error) {
-            console.error('解析事件数据失败:', error, event);
-            if (callbacks.onError) {
-              callbacks.onError({
-                message: '解析服务器响应失败',
-                details: error.message
-              });
+                
+                const data = eventData.data || eventData;
+                
+                // 检查回调是否存在并处理事件
+                switch (eventData.type) {
+                  case 'thinking':
+                    if (callbacks.onThinking) {
+                      console.log('处理thinking事件:', {
+                        type: eventData.stage || 'thinking',
+                        content: eventData.content || '',
+                        progress: eventData.progress || 0,
+                        stage: eventData.stage || 'thinking'
+                      });
+                      
+                      callbacks.onThinking({
+                        type: eventData.stage || 'thinking',
+                        content: eventData.content || '',
+                        progress: eventData.progress || 0,
+                        stage: eventData.stage || 'thinking'
+                      });
+                      
+                      console.log('thinking事件处理完成');
+                    } else {
+                      console.warn('收到thinking事件但未提供onThinking回调');
+                    }
+                    break;
+                  case 'progress':
+                    if (callbacks.onProgress) {
+                      console.log('处理progress事件:', data);
+                      callbacks.onProgress(data);
+                    }
+                    break;
+                  case 'partial':
+                    if (callbacks.onPartial) {
+                      console.log('处理partial事件:', data);
+                      callbacks.onPartial(data);
+                    }
+                    break;
+                  case 'final':
+                    if (callbacks.onFinal) {
+                      console.log('处理final事件:', data);
+                      callbacks.onFinal(data);
+                    }
+                    break;
+                  case 'error':
+                    if (callbacks.onError) {
+                      console.log('处理error事件:', data.error || { message: '未知错误' });
+                      callbacks.onError(data.error || { message: '未知错误' });
+                    }
+                    break;
+                  default:
+                    console.warn('未知事件类型:', eventData.type);
+                }
+              } catch (parseError) {
+                console.error(`解析事件数据失败: ${parseError}`);
+              }
+            } catch (error) {
+              console.error(`处理SSE事件时出错: ${error}`);
             }
           }
         }
@@ -853,6 +876,364 @@ export class MCPClient {
       }
     } finally {
       this.abortControllers.delete(id);
+    }
+  }
+
+  /**
+   * 添加状态更新监听器
+   * @param {Function} listener - 状态更新监听器函数，接收(type, data)参数
+   * @returns {Function} 移除监听器的函数
+   */
+  addStatusListener(listener) {
+    if (typeof listener !== 'function') {
+      console.error('状态监听器必须是函数');
+      return () => {};
+    }
+    
+    this.statusListeners.push(listener);
+    console.log(`添加状态监听器，当前监听器数量: ${this.statusListeners.length}`);
+    
+    // 返回移除监听器的函数
+    return () => {
+      const index = this.statusListeners.indexOf(listener);
+      if (index !== -1) {
+        this.statusListeners.splice(index, 1);
+        console.log(`移除状态监听器，剩余监听器数量: ${this.statusListeners.length}`);
+      }
+    };
+  }
+  
+  /**
+   * 添加工具结果监听器
+   * @param {string} toolName - 要监听的工具名称
+   * @param {Function} listener - 结果监听器函数，接收(result)参数
+   * @returns {Function} 移除监听器的函数
+   */
+  addToolResultListener(toolName, listener) {
+    if (typeof listener !== 'function') {
+      console.error('工具结果监听器必须是函数');
+      return () => {};
+    }
+    
+    if (!this.toolResultListeners.has(toolName)) {
+      this.toolResultListeners.set(toolName, []);
+    }
+    
+    const listeners = this.toolResultListeners.get(toolName);
+    listeners.push(listener);
+    console.log(`添加工具[${toolName}]结果监听器，当前监听器数量: ${listeners.length}`);
+    
+    // 返回移除监听器的函数
+    return () => {
+      const listeners = this.toolResultListeners.get(toolName);
+      if (!listeners) return;
+      
+      const index = listeners.indexOf(listener);
+      if (index !== -1) {
+        listeners.splice(index, 1);
+        console.log(`移除工具[${toolName}]结果监听器，剩余监听器数量: ${listeners.length}`);
+      }
+    };
+  }
+  
+  /**
+   * 触发状态更新通知
+   * @private
+   */
+  _notifyStatusListeners(type, data) {
+    for (const listener of this.statusListeners) {
+      try {
+        listener(type, data);
+      } catch (error) {
+        console.error('调用状态监听器出错:', error);
+      }
+    }
+  }
+  
+  /**
+   * 触发工具结果通知
+   * @private
+   */
+  _notifyToolResultListeners(toolName, result) {
+    // 通知特定工具的监听器
+    const listeners = this.toolResultListeners.get(toolName);
+    if (listeners && listeners.length > 0) {
+      for (const listener of listeners) {
+        try {
+          listener(result);
+        } catch (error) {
+          console.error(`调用工具[${toolName}]结果监听器出错:`, error);
+        }
+      }
+    }
+  }
+
+  /**
+   * 处理SSE事件数据（streaming模式）
+   * @param {string} chunk - SSE事件数据
+   */
+  handleSSEChunk(chunk) {
+    try {
+      // 检查chunk是否为空
+      if (!chunk || chunk.trim() === '') {
+        console.log('收到空的SSE数据块，忽略');
+        return;
+      }
+
+      console.log(`收到WebSocket数据块: ${chunk}`);
+
+      // 解析SSE事件，处理多个事件
+      const events = this._parseSSEEvents(chunk);
+      console.log(`处理 ${events.length} 个SSE事件`);
+
+      // 处理每个事件
+      events.forEach(event => {
+        // 解析事件数据为JSON
+        try {
+          let eventData = null;
+          try {
+            eventData = JSON.parse(event);
+            console.log(`解析事件数据: ${JSON.stringify(eventData)}`);
+          } catch (parseError) {
+            console.error(`解析SSE事件数据失败: ${parseError}`);
+            return; // 跳过此事件
+          }
+          
+          // 检查事件类型
+          const eventType = eventData.type;
+          console.log(`收到流式事件类型: ${eventType}`);
+
+          // 根据事件类型处理
+          if (eventType === 'thinking') {
+            // 处理思考过程事件
+            if (this.callbacks.onThinking) {
+              console.log('收到thinking事件:', {
+                type: eventData.stage || 'thinking',
+                content: eventData.content || '',
+                progress: eventData.progress || 0,
+                stage: eventData.stage || 'thinking'
+              });
+              
+              this.callbacks.onThinking({
+                type: eventData.stage || 'thinking',
+                content: eventData.content || '',
+                progress: eventData.progress || 0,
+                stage: eventData.stage || 'thinking'
+              });
+            }
+          } else if (eventType === 'progress') {
+            // 进度更新事件
+            this._handleProgressEvent(eventData);
+          } else if (eventType === 'partial') {
+            // 部分结果事件
+            this._handlePartialEvent(eventData);
+          } else if (eventType === 'final') {
+            // 最终结果事件
+            this._handleFinalEvent(eventData);
+          } else if (eventType === 'error') {
+            // 错误事件
+            this._handleErrorEvent(eventData);
+          } else {
+            console.warn(`未知的事件类型: ${eventType}`);
+          }
+        } catch (error) {
+          console.error(`处理SSE事件时出错: ${error}`);
+        }
+      });
+    } catch (error) {
+      console.error(`处理SSE数据块时出错: ${error}`);
+    }
+  }
+
+  /**
+   * 解析SSE事件数据流
+   * @private
+   * @param {string} chunk - SSE事件数据流
+   * @returns {Array} 解析后的事件数据数组
+   */
+  _parseSSEEvents(chunk) {
+    try {
+      console.log('开始解析SSE事件数据流:', chunk);
+      
+      // 处理不同格式的事件数据
+      if (chunk.startsWith('data:')) {
+        // 标准SSE格式，数据行以data:开头
+        const events = [];
+        const lines = chunk.split('\n');
+        let currentEvent = '';
+        
+        for (const line of lines) {
+          if (line.startsWith('data:')) {
+            // 提取data:后面的内容
+            const data = line.substring(5).trim();
+            currentEvent += data;
+          } else if (line.trim() === '') {
+            // 空行表示事件结束
+            if (currentEvent) {
+              try {
+                events.push(JSON.parse(currentEvent));
+                console.log('解析到SSE事件:', currentEvent);
+              } catch (e) {
+                console.warn('事件数据不是有效的JSON:', currentEvent);
+              }
+              currentEvent = '';
+            }
+          }
+        }
+        
+        // 处理最后一个事件（如果有）
+        if (currentEvent) {
+          try {
+            events.push(JSON.parse(currentEvent));
+            console.log('解析到最后一个SSE事件:', currentEvent);
+          } catch (e) {
+            console.warn('最后一个事件数据不是有效的JSON:', currentEvent);
+          }
+        }
+        
+        console.log(`共解析到 ${events.length} 个SSE事件`);
+        return events;
+      } else {
+        // 尝试直接解析为JSON
+        try {
+          const jsonData = JSON.parse(chunk);
+          console.log('直接解析为JSON成功:', jsonData);
+          return [jsonData];
+        } catch (e) {
+          console.warn('数据块不是有效的JSON，尝试其他解析方式');
+          
+          // 尝试将数据分割为多个JSON对象
+          const jsonObjects = [];
+          let bracketCount = 0;
+          let currentObject = '';
+          
+          for (let i = 0; i < chunk.length; i++) {
+            const char = chunk[i];
+            currentObject += char;
+            
+            if (char === '{') {
+              bracketCount++;
+            } else if (char === '}') {
+              bracketCount--;
+              
+              // 当括号匹配时，可能是一个完整的JSON对象
+              if (bracketCount === 0 && currentObject.trim() !== '') {
+                try {
+                  const jsonObj = JSON.parse(currentObject);
+                  jsonObjects.push(jsonObj);
+                  console.log('解析到JSON对象:', currentObject);
+                  currentObject = '';
+                } catch (e) {
+                  // 不是有效的JSON，继续
+                }
+              }
+            }
+          }
+          
+          if (jsonObjects.length > 0) {
+            console.log(`解析到 ${jsonObjects.length} 个JSON对象`);
+            return jsonObjects;
+          }
+          
+          // 都失败了，返回空数组
+          console.warn('无法解析数据块为任何有效的事件');
+          return [];
+        }
+      }
+    } catch (error) {
+      console.error('解析SSE事件数据流出错:', error);
+      return [];
+    }
+  }
+
+  /**
+   * 处理进度更新事件
+   * @private
+   * @param {Object} eventData - 事件数据
+   */
+  _handleProgressEvent(eventData) {
+    console.log('处理进度更新事件:', eventData);
+    if (this.callbacks.onProgress) {
+      try {
+        const progressData = eventData.data || eventData;
+        this.callbacks.onProgress(progressData);
+        
+        // 同时通知状态监听器
+        this._notifyStatusListeners('status_update', progressData);
+        
+        // 如果这是工具进度更新，通知对应的工具监听器
+        if (eventData.tool) {
+          this._notifyToolResultListeners(eventData.tool, progressData);
+        }
+      } catch (error) {
+        console.error('处理进度事件出错:', error);
+      }
+    }
+  }
+
+  /**
+   * 处理部分结果事件
+   * @private
+   * @param {Object} eventData - 事件数据
+   */
+  _handlePartialEvent(eventData) {
+    console.log('处理部分结果事件:', eventData);
+    if (this.callbacks.onPartial) {
+      try {
+        const partialData = eventData.data || eventData;
+        this.callbacks.onPartial(partialData);
+        
+        // 如果这是工具部分结果，通知对应的工具监听器
+        if (eventData.tool) {
+          this._notifyToolResultListeners(eventData.tool, partialData);
+        }
+      } catch (error) {
+        console.error('处理部分结果事件出错:', error);
+      }
+    }
+  }
+
+  /**
+   * 处理最终结果事件
+   * @private
+   * @param {Object} eventData - 事件数据
+   */
+  _handleFinalEvent(eventData) {
+    console.log('处理最终结果事件:', eventData);
+    if (this.callbacks.onFinal) {
+      try {
+        const finalData = eventData.data || eventData;
+        this.callbacks.onFinal(finalData);
+        
+        // 如果这是工具最终结果，通知对应的工具监听器
+        if (eventData.tool) {
+          this._notifyToolResultListeners(eventData.tool, finalData);
+        }
+      } catch (error) {
+        console.error('处理最终结果事件出错:', error);
+      }
+    }
+  }
+
+  /**
+   * 处理错误事件
+   * @private
+   * @param {Object} eventData - 事件数据
+   */
+  _handleErrorEvent(eventData) {
+    console.log('处理错误事件:', eventData);
+    if (this.callbacks.onError) {
+      try {
+        const errorData = eventData.error || eventData.data || { message: '未知错误' };
+        this.callbacks.onError(errorData);
+        
+        // 如果这是工具错误，通知对应的工具监听器
+        if (eventData.tool) {
+          this._notifyToolResultListeners(eventData.tool, { error: errorData });
+        }
+      } catch (error) {
+        console.error('处理错误事件出错:', error);
+      }
     }
   }
 } 

@@ -65,6 +65,8 @@ class DorisMCPSseServer:
         async def startup_event():
             # 启动会话清理任务
             asyncio.create_task(self.cleanup_idle_sessions())
+            # 启动定时发送状态更新的任务
+            asyncio.create_task(self.send_periodic_updates())
     
     def setup_sse_routes(self):
         """设置SSE相关路由"""
@@ -245,6 +247,183 @@ class DorisMCPSseServer:
                     # 确保会话被移除
                     if session_id in self.client_sessions:
                         del self.client_sessions[session_id]
+    
+    async def send_periodic_updates(self):
+        """定期向所有客户端发送状态更新"""
+        while True:
+            try:
+                # 每5秒发送一次状态更新
+                await asyncio.sleep(5)
+                
+                # 如果没有客户端连接，跳过本次更新
+                if not self.client_sessions:
+                    continue
+                
+                # 获取当前状态
+                status_data = {
+                    "timestamp": time.time(),
+                    "clients_count": len(self.client_sessions),
+                    "server_status": "running"
+                }
+                
+                # 尝试获取NL2SQL状态
+                try:
+                    # 获取MCP实例
+                    mcp = self.app.state.mcp if hasattr(self.app.state, 'mcp') else self.mcp_server
+                    
+                    # 尝试找到get_nl2sql_status工具并调用
+                    nl2sql_status_tool = None
+                    for tool in await mcp.list_tools():
+                        if getattr(tool, 'name', '') == 'mcp_doris_get_nl2sql_status':
+                            nl2sql_status_tool = tool
+                            break
+                    
+                    # 如果找到了工具，调用它获取状态
+                    if nl2sql_status_tool:
+                        logger.info("发送NL2SQL状态更新")
+                        func = nl2sql_status_tool.func if hasattr(nl2sql_status_tool, 'func') else nl2sql_status_tool
+                        nl2sql_status = await func()
+                        
+                        # 如果获取到状态，广播给所有客户端
+                        if nl2sql_status:
+                            # 尝试解析结果
+                            if isinstance(nl2sql_status, str):
+                                try:
+                                    nl2sql_status = json.loads(nl2sql_status)
+                                except:
+                                    pass
+                            
+                            # 构造NL2SQL状态广播消息
+                            nl2sql_status_data = {
+                                "type": "nl2sql_status",
+                                "status": nl2sql_status,
+                                "timestamp": time.time()
+                            }
+                            
+                            # 广播NL2SQL状态
+                            await self.broadcast_tool_result('mcp_doris_get_nl2sql_status', nl2sql_status_data)
+                    else:
+                        logger.debug("未找到mcp_doris_get_nl2sql_status工具，跳过NL2SQL状态更新")
+                except Exception as e:
+                    logger.error(f"获取NL2SQL状态出错: {str(e)}")
+                
+                # 向所有客户端发送状态更新
+                await self.broadcast_status_update(status_data)
+            except Exception as e:
+                logger.error(f"发送周期性更新时出错: {str(e)}")
+                # 出错后稍微等待一下再继续
+                await asyncio.sleep(1)
+    
+    async def broadcast_status_update(self, status_data):
+        """向所有客户端广播状态更新
+        
+        Args:
+            status_data: 状态数据
+        """
+        logger.debug(f"广播状态更新: {status_data}")
+        message = {
+            "jsonrpc": "2.0",
+            "method": "notifications/status",
+            "params": {
+                "type": "status_update",
+                "data": status_data
+            }
+        }
+        await self.broadcast_message(message)
+    
+    async def broadcast_visualization_data(self, visualization_data):
+        """广播可视化数据到所有客户端
+        
+        Args:
+            visualization_data: 可视化数据，应包含type字段
+        """
+        if not visualization_data or not isinstance(visualization_data, dict) or "type" not in visualization_data:
+            logger.warning(f"无效的可视化数据: {visualization_data}")
+            return
+        
+        logger.info(f"广播可视化数据: {visualization_data['type']}")
+        message = {
+            "jsonrpc": "2.0",
+            "method": "notifications/visualization",
+            "params": {
+                "type": "visualization",
+                "data": visualization_data
+            }
+        }
+        await self.broadcast_message(message)
+    
+    async def send_visualization_data(self, session_id, visualization_data):
+        """向特定客户端发送可视化数据
+        
+        Args:
+            session_id: 会话ID
+            visualization_data: 可视化数据，应包含type字段
+        """
+        if not visualization_data or not isinstance(visualization_data, dict) or "type" not in visualization_data:
+            logger.warning(f"无效的可视化数据: {visualization_data}")
+            return
+        
+        if session_id not in self.client_sessions:
+            logger.warning(f"会话不存在: {session_id}")
+            return
+        
+        logger.info(f"向会话 {session_id} 发送可视化数据: {visualization_data['type']}")
+        message = {
+            "jsonrpc": "2.0",
+            "method": "notifications/visualization",
+            "params": {
+                "type": "visualization",
+                "data": visualization_data
+            }
+        }
+        await self.client_sessions[session_id]["queue"].put(message)
+    
+    async def send_tool_result(self, session_id, tool_name, result_data, is_final=True):
+        """向客户端发送工具执行结果
+        
+        Args:
+            session_id: 会话ID
+            tool_name: 工具名称
+            result_data: 结果数据
+            is_final: 是否是最终结果
+        """
+        if session_id not in self.client_sessions:
+            logger.warning(f"会话不存在: {session_id}")
+            return
+        
+        logger.info(f"向会话 {session_id} 发送工具结果: {tool_name}")
+        message = {
+            "jsonrpc": "2.0",
+            "method": "notifications/tool_result",
+            "params": {
+                "type": "tool_result",
+                "tool": tool_name,
+                "result": result_data,
+                "is_final": is_final
+            }
+        }
+        await self.client_sessions[session_id]["queue"].put(message)
+    
+    async def broadcast_message(self, message):
+        """向所有活动会话广播消息
+        
+        Args:
+            message: 要广播的消息
+        """
+        # 如果没有客户端连接，直接返回
+        if not self.client_sessions:
+            return
+        
+        # 创建会话ID列表的副本，以便在迭代过程中可以安全地修改原始字典
+        session_ids = list(self.client_sessions.keys())
+        
+        # 向所有会话发送消息
+        for session_id in session_ids:
+            try:
+                if session_id in self.client_sessions:  # 再次检查，因为可能在迭代过程中有会话被移除
+                    await self.client_sessions[session_id]["queue"].put(message)
+            except Exception as e:
+                logger.error(f"向会话 {session_id} 发送消息时出错: {str(e)}")
     
     async def get_status(self):
         """获取服务器状态"""
@@ -514,6 +693,10 @@ class DorisMCPSseServer:
                                 }
                                 # 将消息放入队列
                                 await self.client_sessions[session_id]["queue"].put(partial_message)
+                                
+                                # 如果包含可视化数据，则广播到所有客户端
+                                if metadata and "visualization" in metadata:
+                                    await self.broadcast_visualization_data(metadata["visualization"])
                             
                             # 构建参数字典
                             kwargs = dict(arguments)
@@ -702,6 +885,10 @@ class DorisMCPSseServer:
                         }
                         # 将消息放入队列
                         await self.client_sessions[session_id]["queue"].put(partial_message)
+                        
+                        # 如果包含可视化数据，则广播到所有客户端
+                        if metadata and "visualization" in metadata:
+                            await self.broadcast_visualization_data(metadata["visualization"])
                     
                     # 构建参数字典
                     kwargs = dict(arguments)
@@ -888,4 +1075,23 @@ class DorisMCPSseServer:
                 await self.client_sessions[session_id]["queue"].put(error_message)
             else:
                 logger.warning(f"流式工具执行失败但会话已关闭 [会话ID: {session_id}]") 
+
+    async def broadcast_tool_result(self, tool_name, result_data):
+        """广播工具调用结果到所有客户端
+        
+        Args:
+            tool_name: 工具名称
+            result_data: 结果数据
+        """
+        logger.info(f"广播工具结果: {tool_name}")
+        message = {
+            "jsonrpc": "2.0",
+            "method": "notifications/tool_result",
+            "params": {
+                "type": "tool_result",
+                "tool": tool_name,
+                "result": result_data
+            }
+        }
+        await self.broadcast_message(message)
 

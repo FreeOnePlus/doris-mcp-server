@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # 加载环境变量
-load_dotenv()
+load_dotenv(override=True)
 
 # 获取项目根目录
 PROJECT_ROOT = Path(__file__).parents[2].absolute()

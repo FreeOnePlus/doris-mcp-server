@@ -15,15 +15,18 @@ export const useMCPStore = defineStore('mcp', () => {
   
   // 流式响应状态
   const thinkingProcess = ref('');
+  const thinkingLines = ref([]); // 添加思考内容分行存储数组
   const queryProgress = ref(0);
   const isThinking = ref(false);
-  const currentStage = ref('');
+  const currentStage = ref('waiting');
   const stageHistory = ref([]);  // 阶段历史记录
   const statusPollingEnabled = ref(false); // 是否启用状态轮询
   const statusPollingInterval = ref(null); // 状态轮询定时器
   const pollingFrequency = 1000; // 轮询频率（毫秒）
   const is_processing = ref(false); // 是否正在处理查询
   const current_query = ref(''); // 当前正在处理的查询
+  const stageTiming = ref({}); // 存储各阶段耗时
+  const stageStartTime = ref({}); // 存储各阶段开始时间
   const stageLabels = {
     'start': '初始化',
     'analyzing': '业务查询判断阶段',
@@ -56,16 +59,58 @@ export const useMCPStore = defineStore('mcp', () => {
   
   // 获取阶段显示名称
   function getStageName(stage) {
-    return stageLabels[stage] || stage || '处理中';
+    // 简化后的阶段映射，每个显示名称只保留一个代表性的阶段ID
+    const stageMap = {
+      'waiting': '等待处理',
+      'start': '开始处理查询',
+      'business_keyword_matching': '分析查询类型',
+      'builtin_keyword_matching': '关键词匹配',
+      'similar_query_search': '查找相似的查询示例',
+      'business_metadata': '获取业务元数据',
+      'sql_generation': '生成SQL查询',
+      'sql_fix': '修复SQL错误',
+      'executing': '执行SQL查询',
+      'result_analysis': '分析查询结果',
+      'sql_execution_complete': 'SQL执行完成',
+      'business_analysis': '业务分析',
+      'visualization': '数据可视化',
+      'complete': '查询处理完成',
+      'error': '处理出错'
+    };
+    
+    // 反向映射表，将多个阶段ID映射到主要阶段ID
+    const reverseMap = {
+      'analyzing': 'business_keyword_matching',
+      'check_business_query': 'business_keyword_matching',
+      'pattern_matching': 'builtin_keyword_matching',
+      'similar_example': 'similar_query_search', 
+      'find_similar_example': 'similar_query_search',
+      'get_business_metadata': 'business_metadata',
+      'generate_sql': 'sql_generation',
+      'generating': 'sql_generation',
+      'thinking': 'sql_generation',
+      'fix_sql': 'sql_fix',
+      'execute_sql': 'executing',
+      'analyze_business': 'business_analysis'
+    };
+    
+    // 先尝试从反向映射表中获取主要阶段ID
+    const mainStage = reverseMap[stage] || stage;
+    
+    // 返回该阶段对应的显示名称，如果没有则显示原始阶段ID
+    return stageMap[mainStage] || `阶段: ${stage}`;
   }
   
   // 清除思考状态
   function clearThinkingState() {
     thinkingProcess.value = '';
+    thinkingLines.value = []; // 清空思考行数组
     queryProgress.value = 0;
     isThinking.value = false;
-    currentStage.value = '';
+    currentStage.value = 'waiting';
     stageHistory.value = [];
+    stageTiming.value = {}; // 清除阶段耗时
+    stageStartTime.value = {}; // 清除阶段开始时间
   }
   
   // 连接到MCP服务器
@@ -154,8 +199,38 @@ export const useMCPStore = defineStore('mcp', () => {
     }
     
     try {
-      const result = await client.value.call('list_tools');
-      tools.value = result.tools || [];
+      const response = await client.value.call('list_tools');
+      console.log('获取到的原始工具列表:', response);
+      
+      // 正确处理嵌套的工具列表
+      let toolsData = null;
+      
+      // 处理不同的返回格式
+      if (response && response.result && response.result.tools && Array.isArray(response.result.tools)) {
+        // 格式1: {id, success, result: {tools: [...]}}
+        toolsData = response.result.tools;
+        console.log('从result.tools中提取工具列表:', toolsData.length);
+      } else if (response && response.tools && Array.isArray(response.tools)) {
+        // 格式2: {tools: [...]}
+        toolsData = response.tools;
+        console.log('从response.tools中提取工具列表:', toolsData.length);
+      } else if (response && Array.isArray(response)) {
+        // 格式3: 直接是数组
+        toolsData = response;
+        console.log('从数组中提取工具列表:', toolsData.length);
+      } else {
+        console.warn('无法识别的工具列表格式:', response);
+        // 确保至少有一个默认工具
+        toolsData = [
+          {name: 'nl2sql_query', description: '将自然语言查询转换为SQL并执行返回结果'},
+          {name: 'nl2sql_query_stream', description: '将自然语言查询转换为SQL并使用流式响应返回结果'}
+        ];
+      }
+      
+      // 更新工具列表
+      tools.value = toolsData;
+      console.log('已保存工具列表:', tools.value.length, '个工具');
+      
       return tools.value;
     } catch (error) {
       console.error('获取工具列表失败:', error);
@@ -195,6 +270,26 @@ export const useMCPStore = defineStore('mcp', () => {
     }
   }
   
+  // 添加思考行内容
+  function addThinkingLine(line) {
+    if (line && line.trim() && !thinkingLines.value.includes(line.trim())) {
+      thinkingLines.value.push(line.trim());
+    }
+  }
+
+  // 处理思考过程内容更新
+  function updateThinkingProcess(content) {
+    if (!content) return;
+    
+    thinkingProcess.value = content;
+    
+    // 处理新增的行
+    const lines = content.split('\n');
+    for (const line of lines) {
+      addThinkingLine(line);
+    }
+  }
+
   // 执行NL2SQL查询 - 流式版本
   async function streamNl2sqlQuery(query, callbacks = {}) {
     if (!available.value) {
@@ -211,16 +306,7 @@ export const useMCPStore = defineStore('mcp', () => {
       // 启动状态轮询
       startStatusPolling();
       
-      // 先检查工具是否可用
-      if (tools.value.length === 0) {
-        try {
-          await fetchTools();
-        } catch (error) {
-          console.warn('获取工具列表失败，但继续尝试调用工具:', error);
-        }
-      }
-      
-      // 定义接收流式数据的回调
+      // 定义流式回调函数
       const streamCallbacks = {
         onThinking: (data) => {
           console.log('收到思考过程事件:', data);
@@ -237,61 +323,16 @@ export const useMCPStore = defineStore('mcp', () => {
               console.log(`添加阶段到历史: ${data.type}, 当前历史:`, stageHistory.value);
             }
             
-            // 如果没有进度信息，根据阶段设置默认进度
-            if (!data.progress && data.type) {
-              const stageIndex = ['start', 'analyzing', 'similar_example', 'business_metadata', 'generating', 'executing', 'complete']
-                .indexOf(data.type);
-              
-              if (stageIndex >= 0) {
-                // 根据阶段序号设置默认进度
-                const oldProgress = queryProgress.value;
-                const defaultProgress = Math.min(Math.round((stageIndex + 1) / 7 * 100), 100);
-                console.log(`为阶段 ${data.type} 设置默认进度: ${oldProgress}% -> ${defaultProgress}%`);
-                queryProgress.value = defaultProgress;
-              }
+            // 更新思考过程
+            if (data.content) {
+              // 使用新的思考内容处理函数
+              updateThinkingProcess(data.content);
             }
           }
           
-          // 同样检查step字段
-          if (data.step && (!data.type || data.step !== data.type)) {
-            const oldStage = currentStage.value;
-            currentStage.value = data.step;
-            console.log(`更新思考阶段(从step): ${oldStage} -> ${data.step}`);
-            
-            // 添加到阶段历史
-            if (!stageHistory.value.includes(data.step)) {
-              stageHistory.value.push(data.step);
-              console.log(`添加阶段到历史: ${data.step}, 当前历史:`, stageHistory.value);
-            }
-          }
-          
-          // 明确设置进度，如果有的话
-          if (data.progress !== undefined) {
-            const oldProgress = queryProgress.value;
-            queryProgress.value = data.progress;
-            console.log(`更新进度(从思考事件): ${oldProgress}% -> ${data.progress}%`);
-          }
-          
-          // 更新思考过程
-          if (data.message) {
-            // 如果是新的思考过程，添加换行符
-            if (thinkingProcess.value && !thinkingProcess.value.endsWith('\n')) {
-              thinkingProcess.value += '\n';
-            }
-            
-            // 添加新的思考内容
-            thinkingProcess.value += data.message;
-            console.log(`添加思考内容: ${data.message.substring(0, 50)}${data.message.length > 50 ? '...' : ''}`);
-            
-            // 调用外部回调
-            if (callbacks.onThinking) {
-              callbacks.onThinking({
-                message: data.message,
-                fullThinking: thinkingProcess.value,
-                type: data.type || data.step || 'thinking',
-                sql: data.sql || ''
-              });
-            }
+          // 调用外部回调
+          if (callbacks.onThinking) {
+            callbacks.onThinking(data);
           }
         },
         
@@ -305,68 +346,9 @@ export const useMCPStore = defineStore('mcp', () => {
             console.log(`更新进度: ${oldProgress}% -> ${data.progress}%`);
           }
           
-          // 更新当前阶段 - 优先使用step字段
-          if (data.step) {
-            const oldStage = currentStage.value;
-            currentStage.value = data.step;
-            console.log(`更新处理阶段: ${oldStage} -> ${data.step}`);
-            
-            // 添加到阶段历史
-            if (!stageHistory.value.includes(data.step)) {
-              stageHistory.value.push(data.step);
-              console.log(`添加阶段到历史: ${data.step}, 当前历史:`, stageHistory.value);
-            }
-          }
-          
-          // 如果没有step但有type，也可以使用type作为阶段
-          if (!data.step && data.type) {
-            const oldStage = currentStage.value;
-            currentStage.value = data.type;
-            console.log(`更新处理阶段(从type): ${oldStage} -> ${data.type}`);
-            
-            // 添加到阶段历史
-            if (!stageHistory.value.includes(data.type)) {
-              stageHistory.value.push(data.type);
-              console.log(`添加阶段到历史: ${data.type}, 当前历史:`, stageHistory.value);
-            }
-          }
-          
-          // 如果没有进度信息，根据阶段设置默认进度
-          if (data.progress === undefined && (data.step || data.type)) {
-            const stage = data.step || data.type;
-            const stageIndex = ['start', 'analyzing', 'similar_example', 'business_metadata', 'generating', 'executing', 'complete']
-              .indexOf(stage);
-            
-            if (stageIndex >= 0) {
-              // 根据阶段序号设置默认进度
-              const oldProgress = queryProgress.value;
-              const defaultProgress = Math.min(Math.round((stageIndex + 1) / 7 * 100), 100);
-              console.log(`为阶段 ${stage} 设置默认进度: ${oldProgress}% -> ${defaultProgress}%`);
-              queryProgress.value = defaultProgress;
-            }
-          }
-          
-          // 添加进度消息到思考过程
-          if (data.message) {
-            // 如果是新的进度消息，添加换行符
-            if (thinkingProcess.value && !thinkingProcess.value.endsWith('\n')) {
-              thinkingProcess.value += '\n';
-            }
-            
-            // 添加带有进度和当前阶段的消息
-            const progressStr = data.progress !== undefined ? `[${data.progress}%]` : '';
-            const stageStr = currentStage.value ? `[${getStageName(currentStage.value)}]` : '';
-            thinkingProcess.value += `${progressStr} ${stageStr} ${data.message}`;
-            
-            // 调用外部回调
-            if (callbacks.onProgress) {
-              callbacks.onProgress({
-                message: data.message,
-                progress: data.progress !== undefined ? data.progress : queryProgress.value,
-                fullThinking: thinkingProcess.value,
-                step: data.step || data.type || currentStage.value
-              });
-            }
+          // 调用外部回调
+          if (callbacks.onProgress) {
+            callbacks.onProgress(data);
           }
         },
         
@@ -417,8 +399,60 @@ export const useMCPStore = defineStore('mcp', () => {
         }
       };
       
-      // 使用流式响应调用工具
-      await client.value.callToolStream('nl2sql_query', { query }, streamCallbacks);
+      // 使用流式响应调用工具 - 优先使用专用的流式查询工具
+      let toolsAvailable = [];
+      
+      try {
+        toolsAvailable = tools.value.map(t => t.name);
+      } catch (e) {
+        console.warn('解析工具列表出错:', e);
+        // 设置默认工具列表
+        toolsAvailable = ["nl2sql_query", "nl2sql_query_stream"];
+      }
+      
+      console.log('可用工具列表:', toolsAvailable);
+      
+      // 确保工具列表获取成功
+      let allTools = toolsAvailable;
+      if (!allTools || allTools.length === 0) {
+        try {
+          await fetchTools();
+          // 重新尝试获取工具列表
+          try {
+            allTools = tools.value.map(t => t.name);
+          } catch (e) {
+            console.warn('重新解析工具列表出错:', e);
+            // 使用安全的默认值
+            allTools = ["nl2sql_query", "nl2sql_query_stream"];
+          }
+          console.log('重新获取工具列表:', allTools);
+        } catch (error) {
+          console.warn('重新获取工具列表失败，使用默认工具列表:', error);
+          // 使用固定的工具名列表作为备选
+          allTools = ["nl2sql_query", "nl2sql_query_stream"];
+        }
+      }
+      
+      // 首选nl2sql_query工具（为了避免流式错误，暂时使用普通工具）
+      if (allTools.includes('nl2sql_query')) {
+        console.log('使用普通nl2sql_query工具进行查询 (暂时避免流式错误)');
+        await client.value.callToolStream('nl2sql_query', { query }, streamCallbacks);
+      }
+      // 其次尝试nl2sql_query_stream工具
+      else if (allTools.includes('nl2sql_query_stream')) {
+        console.log('使用nl2sql_query_stream工具进行流式查询');
+        await client.value.callToolStream('nl2sql_query_stream', { query }, streamCallbacks);
+      }
+      // 最后尝试Doris流式查询工具
+      else if (allTools.includes('mcp_doris_nl2sql_query_stream')) {
+        console.log('使用mcp_doris_nl2sql_query_stream工具进行流式查询');
+        await client.value.callToolStream('mcp_doris_nl2sql_query_stream', { query: query }, streamCallbacks);
+      }
+      // 兜底使用普通查询工具
+      else {
+        console.log('无已知查询工具可用，尝试使用默认nl2sql_query工具');
+        await client.value.callToolStream('nl2sql_query', { query }, streamCallbacks);
+      }
       
     } catch (error) {
       console.error('执行流式NL2SQL查询失败:', error);
@@ -706,13 +740,16 @@ export const useMCPStore = defineStore('mcp', () => {
       if (currentIndex >= 0) {
         // 为每个阶段分配一个进度范围
         const progressRanges = [
-          [0, 10],    // start
-          [10, 30],   // analyzing
-          [30, 40],   // similar_example
-          [40, 50],   // business_metadata
-          [50, 70],   // generating
-          [70, 90],   // executing
-          [90, 100]   // complete
+          [0, 5],    // start
+          [5, 15],   // business_keyword_matching
+          [15, 25],   // builtin_keyword_matching
+          [25, 35],   // similar_query_search
+          [35, 45],   // business_metadata
+          [45, 65],   // sql_generation
+          [65, 90],   // sql_fix
+          [90, 95],   // result_analysis
+          [95, 97],   // sql_execution_complete
+          [97, 100]   // business_analysis
         ];
         
         // 获取当前阶段的进度范围
@@ -749,39 +786,154 @@ export const useMCPStore = defineStore('mcp', () => {
   // 开始状态轮询
   function startStatusPolling() {
     if (statusPollingInterval.value) {
-      console.log('状态轮询已经在运行中');
+      console.log('状态监听已经在运行中');
       return;
     }
     
-    console.log('开始NL2SQL状态轮询');
+    console.log('注册NL2SQL状态更新监听');
     statusPollingEnabled.value = true;
-    isThinking.value = true; // 开始轮询时强制设置思考状态
+    isThinking.value = true; // 开始时强制设置思考状态
     
-    // 立即执行一次状态获取
-    getNl2sqlStatus().catch(err => {
-      console.warn('初始状态获取失败，但不影响轮询:', err);
-    });
+    // 不再进行任何主动轮询，完全依赖服务器推送
+    // 不再主动调用一次状态获取
+    // 仅注册监听器
     
-    // 设置轮询间隔
-    statusPollingInterval.value = setInterval(async () => {
-      if (!statusPollingEnabled.value) {
-        stopStatusPolling();
+    // 注册状态更新监听器
+    if (client.value) {
+      // 使用状态监听器接收服务器推送的状态更新
+      const removeStatusListener = client.value.addStatusListener((type, data) => {
+        console.log('收到状态更新:', type, data);
+        if (type === 'status_update') {
+          // 收到服务器推送的状态更新，无需再轮询请求
+          handleStatusUpdate(data);
+        }
+      });
+      
+      // 使用工具结果监听器接收get_nl2sql_status工具的结果
+      const removeToolListener = client.value.addToolResultListener('get_nl2sql_status', (result) => {
+        console.log('收到工具状态更新:', result);
+        // 处理工具结果中的状态数据
+        if (result) {
+          handleStatusUpdate(result);
+        }
+      });
+      
+      // 专门订阅mcp_doris_get_nl2sql_status工具的结果
+      const removeDorisToolListener = client.value.addToolResultListener('mcp_doris_get_nl2sql_status', (result) => {
+        console.log('收到Doris NL2SQL状态更新:', result);
+        // 处理工具结果中的状态数据
+        if (result) {
+          handleStatusUpdate(result);
+        }
+      });
+      
+      // 存储移除监听器的函数，以便在停止时调用
+      statusPollingInterval.value = {
+        removeStatusListener,
+        removeToolListener,
+        removeDorisToolListener
+      };
+    } else {
+      console.warn('客户端未连接，无法注册状态监听器');
+      statusPollingEnabled.value = false;
+    }
+  }
+  
+  // 处理状态更新数据
+  function handleStatusUpdate(data) {
+    // 解析状态数据
+    let status = data;
+    
+    // 尝试提取嵌套在其他结构中的状态数据
+    if (typeof data === 'string') {
+      try {
+        status = JSON.parse(data);
+      } catch (e) {
+        console.warn('状态数据不是有效的JSON:', data);
         return;
       }
-      
-      try {
-        await getNl2sqlStatus();
-      } catch (error) {
-        console.error('轮询状态出错，但继续轮询:', error);
-      }
-    }, 2000); // 更改为2秒一次
+    }
+    
+    // 尝试从各种可能的响应结构中提取状态
+    if (status.current_status) {
+      status = status.current_status;
+    } else if (status.result && status.result.current_status) {
+      status = status.result.current_status;
+    } else if (status.result) {
+      status = status.result;
+    }
+    
+    console.log('处理状态更新:', status);
+    
+    // 强制触发更新UI
+    const updateTime = new Date().toISOString();
+    console.log(`状态更新时间: ${updateTime}`);
+    
+    // 更新当前阶段
+    if (status.current_stage !== undefined) {
+      currentStage.value = status.current_stage;
+      console.log(`设置当前阶段: ${status.current_stage}`);
+    }
+    
+    // 更新进度
+    if (status.progress !== undefined) {
+      queryProgress.value = status.progress;
+      console.log(`设置进度: ${status.progress}%`);
+    }
+    
+    // 更新阶段历史
+    if (status.stage_history && status.stage_history.length > 0) {
+      stageHistory.value = [...status.stage_history];
+      console.log(`设置阶段历史: ${status.stage_history.join(', ')}`);
+    }
+    
+    // 更新处理状态
+    if (status.is_processing !== undefined) {
+      is_processing.value = status.is_processing;
+      console.log(`设置处理状态: ${status.is_processing ? '处理中' : '空闲'}`);
+    }
+    
+    // 更新当前查询
+    if (status.current_query !== undefined) {
+      current_query.value = status.current_query;
+      console.log(`设置当前查询: ${status.current_query}`);
+    }
+    
+    // 设置思考状态
+    if (status.current_stage && status.current_stage !== 'waiting') {
+      isThinking.value = true;
+      console.log(`设置思考状态为true，因为当前阶段是 ${status.current_stage}`);
+    } 
+    // 只有当确定是waiting状态且非处理中时，才重置思考状态
+    else if (status.current_stage === 'waiting' && status.is_processing === false) {
+      isThinking.value = false;
+      console.log('设置思考状态为false，因为当前阶段是waiting且非处理中');
+    }
+    // 如果is_processing为true，也设置思考状态为true
+    else if (status.is_processing === true) {
+      isThinking.value = true;
+      console.log('设置思考状态为true，因为is_processing为true');
+    }
   }
   
   // 停止状态轮询
   function stopStatusPolling() {
     if (statusPollingInterval.value) {
-      console.log('停止NL2SQL状态轮询');
-      clearInterval(statusPollingInterval.value);
+      console.log('停止NL2SQL状态监听');
+      
+      // 移除监听器
+      if (typeof statusPollingInterval.value.removeStatusListener === 'function') {
+        statusPollingInterval.value.removeStatusListener();
+      }
+      
+      if (typeof statusPollingInterval.value.removeToolListener === 'function') {
+        statusPollingInterval.value.removeToolListener();
+      }
+      
+      if (typeof statusPollingInterval.value.removeDorisToolListener === 'function') {
+        statusPollingInterval.value.removeDorisToolListener();
+      }
+      
       statusPollingInterval.value = null;
     }
     statusPollingEnabled.value = false;
@@ -879,6 +1031,359 @@ export const useMCPStore = defineStore('mcp', () => {
     queryProgress.value = progress;
   }
   
+  // 执行自然语言到SQL的流式查询
+  async function nl2sqlQueryStream(query) {
+    isThinking.value = true;
+    clearThinkingState();
+
+    try {
+      if (!available.value) {
+        console.warn("MCP客户端未连接，尝试连接");
+        await connect();
+      }
+
+      console.log(`执行NL2SQL流式查询: ${query}`);
+
+      // 注册状态轮询
+      startStatusPolling();
+
+      // 开始处理（由服务器端定义具体的8个阶段）
+      currentStage.value = "start";
+      thinkingLines.value.push("开始处理您的查询...");
+      
+      // 构建流式回调
+      const callbacks = {
+        onThinking: (data) => {
+          console.log('收到思考事件:', data);
+          
+          // 提取有用信息
+          const content = data.content || '';
+          const stage = data.stage || data.type || 'thinking';
+          const progress = data.progress || 0;
+          
+          // 更新状态
+          if (stage && stage !== 'thinking') {
+            currentStage.value = stage;
+            console.log(`[Stream] 设置当前阶段: ${stage}`);
+            
+            // 添加到阶段历史
+            if (!stageHistory.value.includes(stage)) {
+              stageHistory.value.push(stage);
+              console.log(`[Stream] 添加到阶段历史: ${stage}, 当前历史: ${stageHistory.value.join(', ')}`);
+            }
+          }
+          
+          if (progress) {
+            queryProgress.value = progress;
+            console.log(`[Stream] 设置进度: ${progress}%`);
+          }
+          
+          // 添加思考内容
+          if (content) {
+            thinkingProcess.value += content + '\n';
+            thinkingLines.value.push(content);
+            console.log(`[Stream] 添加思考内容: ${content}`);
+          }
+        },
+        onProgress: (data) => {
+          console.log('收到进度事件:', data);
+          
+          // 尝试提取阶段和进度信息
+          if (data.current_stage) {
+            currentStage.value = data.current_stage;
+            console.log(`[Stream] 进度事件设置当前阶段: ${data.current_stage}`);
+          }
+          
+          if (data.progress !== undefined) {
+            queryProgress.value = data.progress;
+            console.log(`[Stream] 进度事件设置进度: ${data.progress}%`);
+          }
+          
+          if (data.stage_history && Array.isArray(data.stage_history)) {
+            stageHistory.value = [...data.stage_history];
+            console.log(`[Stream] 进度事件设置阶段历史: ${data.stage_history.join(', ')}`);
+          }
+        },
+        onPartial: (data) => {
+          console.log('收到部分结果:', data);
+        },
+        onFinal: (data) => {
+          console.log('收到最终结果:', data);
+          
+          // 添加到思考记录
+          thinkingLines.value.push("查询处理完成");
+          
+          // 尝试分发事件给前端组件显示结果
+          try {
+            console.log("分发最终事件到前端组件");
+            const finalEvent = new CustomEvent('nl2sql:event', {
+              detail: {
+                type: 'final',
+                data: data
+              }
+            });
+            window.dispatchEvent(finalEvent);
+            console.log("最终事件分发完成");
+          } catch (eventError) {
+            console.error("分发最终事件失败:", eventError);
+          }
+          
+          // 结束思考状态
+          isThinking.value = false;
+          
+          // 停止状态轮询
+          stopStatusPolling();
+        },
+        onError: (error) => {
+          console.error('流式查询出错:', error);
+          
+          // 添加错误到思考记录
+          thinkingLines.value.push(`处理出错: ${error.message || '未知错误'}`);
+          
+          // 结束思考状态
+          isThinking.value = false;
+          
+          // 停止状态轮询
+          stopStatusPolling();
+        }
+      };
+      
+      try {
+        console.log("开始调用流式查询工具 nl2sql_query_stream");
+        const result = await client.value.callToolStream('nl2sql_query_stream', { query }, callbacks);
+        console.log("流式查询工具调用完成", result);
+        return result;
+      } catch (toolError) {
+        console.error("流式查询工具调用失败:", toolError);
+        
+        // 使用通用方式尝试查询
+        console.log("回退到标准查询方式");
+        return await nl2sqlQuery(query);
+      }
+    } catch (error) {
+      console.error('流式查询执行失败:', error);
+
+      // 尝试恢复连接
+      if (error.message && (error.message.includes('未连接') || error.message.includes('连接失败'))) {
+        console.log("检测到连接问题，尝试重新连接");
+        
+        try {
+          await connect();
+          if (isConnected.value) {
+            return nl2sqlQueryStream(query); // 重试流式查询
+          }
+        } catch (connError) {
+          console.error('重新连接失败:', connError);
+        }
+      }
+      
+      // 返回友好的错误信息
+      return {
+        status: 'error',
+        message: '查询处理过程中出错',
+        error: { message: error.message || '执行查询时发生未知错误' }
+      };
+    }
+  }
+  
+  // 添加直接调用NL2SQL流接口的方法
+  async function nl2sqlQueryDirectStream(query) {
+    console.log('调用直接NL2SQL流式接口, 查询:', query);
+    
+    // 准备请求数据 - 使用与服务器端相同的格式
+    const requestData = {
+      query: query,
+      session_id: generateSessionId(), // 生成会话ID或使用现有的
+      timestamp: Date.now()
+    };
+    
+    // 打开一个直接到NL2SQL流接口的SSE连接
+    try {
+      console.log(`发送请求到 /nl2sql/stream: ${JSON.stringify(requestData)}`);
+      
+      const response = await fetch('/nl2sql/stream', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'text/event-stream'
+        },
+        body: JSON.stringify(requestData)
+      });
+
+      if (!response.ok) {
+        console.error('NL2SQL流接口返回错误:', response.status, response.statusText);
+        throw new Error(`服务器返回错误: ${response.status} ${response.statusText}`);
+      }
+
+      // 开始处理思考
+      clearThinkingState();
+      setThinkingState(true);
+      addThinkingLine("开始处理您的查询...");
+
+      // 创建SSE读取器
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      // 读取和处理SSE事件
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          console.log('读取完成');
+          break;
+        }
+
+        // 解码二进制数据并添加到缓冲区
+        buffer += decoder.decode(value, { stream: true });
+        console.log(`收到SSE数据片段, 长度: ${value.length}`);
+
+        // 处理事件
+        const events = buffer.split('\n\n');
+        buffer = events.pop() || ''; // 保留最后一个可能不完整的事件
+
+        for (const event of events) {
+          if (!event.trim()) continue;
+
+          // 解析事件数据
+          const lines = event.split('\n');
+          let eventData = null;
+          let eventType = 'message';
+
+          for (const line of lines) {
+            if (line.startsWith('data:')) {
+              try {
+                const dataContent = line.slice(5).trim();
+                eventData = JSON.parse(dataContent);
+                console.log('解析SSE事件数据成功:', typeof eventData);
+              } catch (e) {
+                console.warn('解析SSE事件数据失败:', line, e);
+              }
+            } else if (line.startsWith('event:')) {
+              eventType = line.slice(6).trim();
+              console.log('事件类型:', eventType);
+            }
+          }
+
+          if (eventData) {
+            // 尝试处理多种可能的数据结构
+            let type = 'thinking';
+            let data = eventData;
+            
+            // 处理不同的数据结构
+            if (eventData.type) {
+              type = eventData.type;
+              data = eventData.data || eventData;
+            } else if (eventData.event) {
+              type = eventData.event;
+              data = eventData.data || eventData;
+            }
+            
+            console.log(`处理事件 [${type}]:`, data);
+            
+            // 处理关闭事件
+            if (eventType === 'close' || type === 'close') {
+              console.log('收到关闭事件，流式处理完成');
+              setThinkingState(false);
+              continue;
+            }
+            
+            // 处理思考事件
+            if (type === 'thinking') {
+              let stage = '';
+              let progress = 0;
+              let content = '';
+              
+              // 尝试从不同的数据结构中提取信息
+              if (typeof data === 'object') {
+                stage = data.stage || '';
+                progress = data.progress || 0;
+                content = data.content || '';
+              } else if (typeof data === 'string') {
+                content = data;
+              }
+              
+              if (stage) {
+                setCurrentStage(stage);
+                console.log(`设置当前阶段: ${stage}`);
+              }
+              
+              if (progress) {
+                setProgress(progress);
+                console.log(`设置进度: ${progress}%`);
+              }
+              
+              if (content) {
+                addThinkingLine(content);
+                console.log(`添加思考内容: ${content}`);
+              }
+            }
+            // 处理进度事件
+            else if (type === 'progress') {
+              console.log('处理进度事件:', data);
+              let stage = '';
+              let progress = 0;
+              
+              if (typeof data === 'object') {
+                stage = data.stage || '';
+                progress = data.progress || 0;
+              }
+              
+              if (stage) {
+                setCurrentStage(stage);
+              }
+              
+              if (progress) {
+                setProgress(progress);
+              }
+            }
+            // 处理最终结果
+            else if (type === 'final') {
+              console.log('处理最终结果:', data);
+              setThinkingState(false);
+            }
+            // 处理错误
+            else if (type === 'error') {
+              console.error('处理错误:', data);
+              let message = '未知错误';
+              
+              if (typeof data === 'object') {
+                message = data.message || data.error || JSON.stringify(data);
+              } else if (typeof data === 'string') {
+                message = data;
+              }
+              
+              addThinkingLine(`错误: ${message}`);
+              setThinkingState(false);
+            }
+            
+            // 触发事件处理
+            const eventDetail = { type, data };
+            const customEvent = new CustomEvent('nl2sql:event', { detail: eventDetail });
+            window.dispatchEvent(customEvent);
+          }
+        }
+      }
+
+      console.log('NL2SQL流式处理完成');
+      return true;
+    } catch (error) {
+      console.error('NL2SQL流式处理错误:', error);
+      // 添加错误到思考记录
+      addThinkingLine(`处理出错: ${error.message || '未知错误'}`);
+      setThinkingState(false);
+      throw error;
+    }
+  }
+  
+  // 生成唯一的会话ID
+  function generateSessionId() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      const r = Math.random() * 16 | 0;
+      const v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  }
+  
   return {
     client,
     isConnected,
@@ -890,6 +1395,7 @@ export const useMCPStore = defineStore('mcp', () => {
     
     // 流式响应状态
     thinkingProcess,
+    thinkingLines,
     queryProgress,
     isThinking,
     currentStage,
@@ -926,6 +1432,10 @@ export const useMCPStore = defineStore('mcp', () => {
     // 新增方法
     setThinkingState,
     setCurrentStage,
-    setProgress
+    setProgress,
+    addThinkingLine,
+    updateThinkingProcess,
+    nl2sqlQueryStream,
+    nl2sqlQueryDirectStream
   };
 }); 

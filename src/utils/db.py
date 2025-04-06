@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Any
 from dotenv import load_dotenv
 
 # 加载环境变量
-load_dotenv()
+load_dotenv(override=True)
 
 # 数据库配置
 DB_CONFIG = {

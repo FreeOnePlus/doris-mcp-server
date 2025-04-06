@@ -29,7 +29,7 @@ from src.utils.nl2sql_processor import NL2SQLProcessor
 from src.utils.db import execute_query, execute_query_df
 
 # 加载环境变量
-load_dotenv()
+load_dotenv(override=True)
 
 class NL2SQLService:
     """
@@ -137,6 +137,12 @@ class NL2SQLService:
         start_time = time.time()
         query_id = hash(f"{query}_{start_time}")
         
+        # 添加高可见度调试日志
+        print(f"======== NL2SQLService.process_query 被调用 ========")
+        print(f"查询内容: '{query}'")
+        print(f"实例ID: {id(self)}")
+        print(f"时间戳: {time.time()}")
+        
         # 记录处理开始到审计日志
         audit_data = {
             "event": "process_query_start",
@@ -149,7 +155,9 @@ class NL2SQLService:
         
         try:
             # 直接处理查询
+            logger.info(f"开始处理查询: {query}")
             result = self.processor.process(query)
+            logger.info(f"查询处理完成，结果: {json.dumps(result, ensure_ascii=False)[:200]}...")
             
             # 记录处理时间
             processing_time = time.time() - start_time

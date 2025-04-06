@@ -515,22 +515,49 @@ BUSINESS_ANALYSIS_PROMPTS = {
 {
   "business_analysis": "详细的业务分析...",
   "trends": ["趋势1", "趋势2", ...],
-  "visualization": {
-    "type": "图表类型，如bar, line, pie等",
-    "title": "图表标题",
-    "x_axis": "X轴字段名（必须与查询结果中的列名完全一致）",
-    "y_axis": "Y轴字段名（必须与查询结果中的列名完全一致）",
-    "description": "图表描述"
+  "visualization_suggestions": "关于如何可视化数据的建议和解释",
+  "echarts_option": {
+    // 完整的echarts配置对象，可直接用于渲染图表
+    "title": {
+      "text": "图表标题"
+    },
+    "tooltip": {},
+    "legend": {
+      "data": ["数据系列名称"]
+    },
+    "xAxis": {
+      "type": "category",
+      "data": [] // 这里必须使用查询结果中的实际数据
+    },
+    "yAxis": {},
+    "series": [{
+      "name": "数据系列名称",
+      "type": "line", // 或 bar, pie, scatter 等echarts支持的图表类型
+      "data": [] // 这里必须使用查询结果中的实际数据
+    }]
   },
   "recommendations": ["建议1", "建议2", ...]
 }
 ```
 
 重要说明：
-- X轴和Y轴字段名必须与查询结果中的列名完全一致，否则图表无法正常显示
-- type字段必须是以下之一：bar（柱状图）、line（折线图）、pie（饼图）
-- 确保visualization的每个字段都有值，这对于正确渲染图表至关重要
-- 对于时间序列数据，建议使用line类型；对于分类比较，建议使用bar类型；对于占比分析，建议使用pie类型
+- echarts_option必须是一个完整的、有效的echarts配置对象，可以直接用于前端渲染
+- 所有数据必须来自查询结果，不要编造数据
+- 优先考虑以下图表类型，但可以根据数据特点选择最合适的类型：
+  1. 时间序列数据：折线图(line)、面积图(area)
+  2. 分类比较：柱状图(bar)、条形图(bar水平方向)
+  3. 占比分析：饼图(pie)、环形图(pie带中心空白)
+  4. 分布分析：散点图(scatter)、热力图(heatmap)
+  5. 复杂关系：桑基图(sankey)、关系图(graph)
+
+- 根据数据特点，可以选择更高级的图表：
+  1. 多维度数据：雷达图(radar)
+  2. 地理数据：地图(map)
+  3. 多系列数据：组合图表(多个series结合)
+
+- echarts_option中必须包含完整的配置，包括title、tooltip、legend、xAxis、yAxis和series等必要组件
+- 确保生成的echarts_option是有效的JSON格式，且可以直接被前端使用
+- 图表设计应该美观、清晰，配色方案专业
 
 请确保分析深入、专业，并与业务场景紧密结合。""",
     
@@ -550,9 +577,10 @@ BUSINESS_ANALYSIS_PROMPTS = {
 相关表的元数据信息：
 {tables_info}
 
-请根据以上信息提供业务分析、可视化建议和业务建议。请特别注意：
-1. 请确保visualization字段包含所有必要属性
-2. type, x_axis和y_axis必须准确对应查询结果中的可视化需求
-3. x_axis和y_axis必须是查询结果中存在的列名
+请根据以上信息提供业务分析、可视化建议和业务建议，并生成echarts图表配置。请特别注意：
+1. 请确保echarts_option是有效的完整配置，可以直接用于前端渲染
+2. 所有数据必须来自查询结果中的实际字段和值
+3. 根据数据特点选择最合适的图表类型
+4. 图表设计应该美观、直观，能够清晰呈现数据特点和趋势
 """
 } 

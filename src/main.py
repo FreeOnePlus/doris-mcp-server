@@ -52,7 +52,7 @@ from src.nl2sql_service import NL2SQLService
 from src.utils.sql_optimizer import SQLOptimizer
 
 # 加载环境变量
-load_dotenv()
+load_dotenv(override=True)
 
 # 读取环境变量决定是否自动刷新元数据
 auto_refresh_metadata = os.getenv("AUTO_REFRESH_METADATA", "false").lower() == "true"
@@ -103,6 +103,12 @@ sql_optimizer = SQLOptimizer()
 # 初始化流式处理器实例，用于处理状态跟踪
 from src.nl2sql_stream_processor import StreamNL2SQLProcessor
 stream_processor = StreamNL2SQLProcessor()
+
+# 导入新的路由注册函数
+from src.mcp_adapter import register_routes
+
+# 应用路由注册
+app = register_routes(app)
 
 @mcp.resource("doris://database/info")
 def doris_database_info():
