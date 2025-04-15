@@ -1110,6 +1110,15 @@ export const useMCPStore = defineStore('mcp', () => {
         onFinal: (data) => {
           console.log('收到最终结果:', data);
           
+          // 确保设置完成阶段
+          currentStage.value = 'complete';
+          if (!stageHistory.value.includes('complete')) {
+            stageHistory.value.push('complete');
+          }
+          
+          // 设置进度为100%
+          queryProgress.value = 100;
+          
           // 添加到思考记录
           thinkingLines.value.push("查询处理完成");
           

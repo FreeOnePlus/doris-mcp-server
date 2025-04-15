@@ -598,177 +598,155 @@ class LLMClient:
         return fixed_messages
     
     def _chat_openai_compatible(self, messages: List[Message], stream: bool = False) -> LLMResponse:
-        """使用兼容OpenAI接口的方式调用DeepSeek和OpenAI"""
-        logger.info(f"使用{self.config.provider.value}供应商的模型: {self.config.model}")
+        """使用OpenAI兼容的API处理对话请求"""
+        messages_dicts = [msg.to_dict() for msg in messages]
         
-        # 确保_client已经初始化
-        if not self._client:
-            try:
-                from openai import OpenAI
-                # 如果是DeepSeek, 需要自定义URL
-                if self.config.provider == LLMProvider.DEEPSEEK:
-                    # 修正DeepSeek的API端点，删除/api/v1前缀
-                    self._client = OpenAI(
-                        api_key=self.config.api_key,
-                        base_url=self.config.base_url  # 直接使用base_url，不需要附加路径
-                    )
-                else:
-                    # OpenAI和其他供应商
-                    self._client = OpenAI(
-                        api_key=self.config.api_key,
-                        base_url=self.config.base_url
-                    )
-            except ImportError:
-                logger.error("未安装openai库，无法使用OpenAI或DeepSeek")
-                return LLMResponse(
-                    content="",
-                    model=self.config.model,
-                    usage={},
-                    finish_reason="error",
-                    raw_response=None
-                )
+        # 验证并合并消息
+        validated_messages = self._validate_message_sequence(messages_dicts)
         
-        # 将Message对象转换为字典
-        messages_dict = [m.to_dict() for m in messages]
+        # 合并环境变量和实例配置的参数
+        temperature = self.config.temperature
+        max_tokens = self.config.max_tokens
+        top_p = self.config.top_p
         
-        # 如果是DeepSeek，尝试直接使用requests调用
-        if self.config.provider == LLMProvider.DEEPSEEK:
-            try:
-                import requests
-                import json
-                
-                # 准备请求
-                url = f"{self.config.base_url}/chat/completions"
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.config.api_key}"
-                }
-                
-                # 构建请求体
-                data = {
-                    "model": self.config.model,
-                    "messages": messages_dict,
-                    "temperature": self.config.temperature,
-                    "top_p": self.config.top_p,
-                    "stream": stream
-                }
-                
-                if self.config.max_tokens:
-                    data["max_tokens"] = self.config.max_tokens
-                
-                # 添加额外参数
-                data.update(self.config.additional_params)
-                
-                # 记录调用细节用于调试
-                logger.debug(f"DeepSeek请求URL: {url}")
-                logger.debug(f"DeepSeek请求体: {json.dumps(data)}")
-                
-                # 发送请求
-                response = requests.post(url, headers=headers, json=data, timeout=300)
-                
-                # 检查响应状态
-                if response.status_code != 200:
-                    logger.error(f"DeepSeek API返回错误: {response.status_code} - {response.text}")
-                    return LLMResponse(
-                        content="",
-                        model=self.config.model,
-                        usage={},
-                        finish_reason="error",
-                        raw_response=response.text
-                    )
-                
-                # 解析JSON响应
-                result = response.json()
-                
-                # 从响应中提取内容
-                if 'choices' in result and len(result['choices']) > 0:
-                    content = result['choices'][0]['message']['content']
-                    
-                    # 构建响应对象
-                    return LLMResponse(
-                        content=content,
-                        model=result.get('model', self.config.model),
-                        usage=result.get('usage', {}),
-                        finish_reason=result['choices'][0].get('finish_reason'),
-                        raw_response=result
-                    )
-                else:
-                    logger.error(f"DeepSeek响应缺少choices字段: {result}")
-                    return LLMResponse(
-                        content="",
-                        model=self.config.model,
-                        usage={},
-                        finish_reason="error",
-                        raw_response=result
-                    )
-                    
-            except Exception as e:
-                logger.error(f"使用requests直接调用DeepSeek API时出错: {str(e)}")
-                import traceback
-                logger.error(traceback.format_exc())
-                # 返回空响应而不是引发异常
-                return LLMResponse(
-                    content="",
-                    model=self.config.model,
-                    usage={},
-                    finish_reason="error",
-                    raw_response=None
-                )
+        # 构建请求体
+        data = {
+            "model": self.config.model,
+            "messages": validated_messages,
+            "temperature": temperature,
+            "top_p": top_p
+        }
         
-        # 对于OpenAI和其他提供商，使用标准OpenAI客户端
+        if max_tokens is not None:
+            data["max_tokens"] = max_tokens
+        
+        # 设置请求头
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.config.api_key}"
+        }
+        
+        # OpenAI兼容的API端点
+        url = f"{self.config.base_url}/chat/completions"
+        
         try:
-            # 构建请求参数
-            params = {
-                "model": self.config.model,
-                "messages": messages_dict,
-                "temperature": self.config.temperature,
-                "top_p": self.config.top_p,
-                "stream": stream
-            }
+            # 检查是否使用OpenAI客户端
+            if hasattr(self, '_client') and self._client:
+                try:
+                    if stream:
+                        stream_resp = self._client.chat.completions.create(
+                            model=self.config.model,
+                            messages=validated_messages,
+                            temperature=temperature,
+                            max_tokens=max_tokens if max_tokens else None,
+                            top_p=top_p,
+                            stream=True
+                        )
+                        content = ""
+                        for chunk in stream_resp:
+                            delta = chunk.choices[0].delta.content
+                            if delta:
+                                content += delta
+                        
+                        return LLMResponse(
+                            content=content,
+                            model=self.config.model,
+                            usage={},
+                            finish_reason="stop"
+                        )
+                    else:
+                        response = self._client.chat.completions.create(
+                            model=self.config.model,
+                            messages=validated_messages,
+                            temperature=temperature,
+                            max_tokens=max_tokens if max_tokens else None,
+                            top_p=top_p
+                        )
+                        
+                        content = response.choices[0].message.content
+                        
+                        return LLMResponse(
+                            content=content,
+                            model=response.model,
+                            usage=response.usage.model_dump() if hasattr(response.usage, 'model_dump') else vars(response.usage),
+                            finish_reason=response.choices[0].finish_reason
+                        )
+                except Exception as e:
+                    logger.error(f"使用OpenAI客户端调用API时出错: {str(e)}")
+                    # 尝试使用requests作为备选方案
             
-            if self.config.max_tokens:
-                params["max_tokens"] = self.config.max_tokens
+            # 使用requests直接调用API
+            logger.info(f"使用requests直接调用{self.config.provider.value}API")
+            
+            # 检查URL中是否包含可能解析失败的域名
+            problematic_domains = ["ark.cn-beijing.volces.com"]
+            needs_dns_check = any(domain in url for domain in problematic_domains)
+            
+            # 如果需要DNS检查，先尝试解析域名
+            if needs_dns_check:
+                import socket
+                try:
+                    for domain in problematic_domains:
+                        if domain in url:
+                            logger.info(f"尝试解析可能有问题的域名: {domain}")
+                            socket.gethostbyname(domain)
+                            logger.info(f"域名 {domain} 解析成功")
+                except socket.gaierror as e:
+                    logger.error(f"域名解析失败: {e}, URL: {url}")
+                    # 使用备选URL
+                    if "ark.cn-beijing.volces.com" in url:
+                        # 替换为备选的DeepSeek API地址
+                        backup_url = url.replace("ark.cn-beijing.volces.com", "api.deepseek.com")
+                        logger.info(f"切换到备选URL: {backup_url}")
+                        url = backup_url
+            
+            response = requests.post(url, headers=headers, json=data, timeout=300)
+            
+            if response.status_code == 200:
+                result = response.json()
+                content = result["choices"][0]["message"]["content"]
                 
-            # 添加额外参数
-            params.update(self.config.additional_params)
-            
-            # 调用API
-            if stream:
-                content = ""
-                for chunk in self._client.chat.completions.create(**params):
-                    if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
-                        delta = chunk.choices[0].delta.content
-                        if delta:
-                            content += delta
-                            
-                # 构建简单响应
                 return LLMResponse(
                     content=content,
-                    model=self.config.model,
-                    raw_response=None
+                    model=result.get("model", self.config.model),
+                    usage=result.get("usage", {}),
+                    finish_reason=result["choices"][0].get("finish_reason", "stop"),
+                    raw_response=result
                 )
             else:
-                # 非流式响应
-                response = self._client.chat.completions.create(**params)
+                logger.error(f"API请求出错: {response.status_code} - {response.text}")
+                raise Exception(f"API请求出错: {response.status_code} - {response.text}")
                 
-                # 构建响应
-                return LLMResponse(
-                    content=response.choices[0].message.content,
-                    model=response.model,
-                    usage=response.usage.model_dump() if hasattr(response, 'usage') else {},
-                    finish_reason=response.choices[0].finish_reason,
-                    raw_response=response
-                )
-        except Exception as e:
-            logger.error(f"调用OpenAI兼容接口时出错: {str(e)}")
-            # 返回空响应而不是引发异常
-            return LLMResponse(
-                content="",
-                model=self.config.model,
-                usage={},
-                finish_reason="error",
-                raw_response=None
-            )
+        except requests.exceptions.ConnectionError as e:
+            # 检查是否为DNS解析错误
+            if "Failed to resolve" in str(e) or "Name resolution" in str(e) or "Temporary failure in name resolution" in str(e):
+                logger.error(f"使用requests直接调用{self.config.provider.value} API时出错: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
+                
+                # 如果是DeepSeek API，尝试使用备选的API地址
+                if "ark.cn-beijing.volces.com" in url:
+                    backup_url = url.replace("ark.cn-beijing.volces.com", "api.deepseek.com")
+                    logger.info(f"尝试使用备选API地址: {backup_url}")
+                    
+                    try:
+                        backup_response = requests.post(backup_url, headers=headers, json=data, timeout=300)
+                        if backup_response.status_code == 200:
+                            result = backup_response.json()
+                            content = result["choices"][0]["message"]["content"]
+                            
+                            return LLMResponse(
+                                content=content,
+                                model=result.get("model", self.config.model),
+                                usage=result.get("usage", {}),
+                                finish_reason=result["choices"][0].get("finish_reason", "stop"),
+                                raw_response=result
+                            )
+                    except Exception as backup_error:
+                        logger.error(f"使用备选API地址也失败: {str(backup_error)}")
+            
+            # 继续抛出原始异常
+            raise
     
     def _chat_mlx(self, messages: List[Dict[str, str]], stream: bool = False) -> LLMResponse:
         """

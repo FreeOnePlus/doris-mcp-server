@@ -1169,6 +1169,18 @@ function getChartOptions(message) {
 function renderChart(element, options) {
   if (!element || !options) return;
   
+  // 修复图表标题和图例重叠问题
+  if (options.title && options.legend) {
+    // 当标题居中且图例位置未明确设置或位置不合理时，调整图例位置
+    if (options.title.left === 'center') {
+      // 如果图例在顶部且未设置明确的top值或top值太小
+      if (!options.legend.bottom && (!options.legend.top || parseInt(options.legend.top) < 30)) {
+        // 将图例移到顶部且与标题保持距离
+        options.legend.top = 30;
+      }
+    }
+  }
+  
   const chart = echarts.init(element);
   chart.setOption(options);
   

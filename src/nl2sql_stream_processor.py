@@ -354,7 +354,7 @@ class StreamNL2SQLProcessor:
                     
                     # 调用真实的处理器处理查询
                     result = self.processor.process(query)
-                    logger.info("NL2SQL查询处理完成，结果: %s", json.dumps(result, ensure_ascii=False)[:200])
+                    logger.info("NL2SQL查询处理完成，结果: %s", json.dumps(result, ensure_ascii=False, default=str)[:200])
                     
                     # 存储结果
                     processing_result["result"] = result
@@ -490,142 +490,80 @@ class StreamNL2SQLProcessor:
             async for event in call_stream_callback("complete", "完成所有处理 查询处理完成", 100):
                 yield event
                 
-            # 明确发送最终结果作为单独的事件
-            try:
-                # 确保结果JSON包含所有必要信息
-                # 检查result类型，确保是字典类型
-                if not isinstance(result, dict):
-                    logger.error(f"结果不是字典类型，而是 {type(result)}")
-                    # 如果不是字典类型，尝试转换或创建一个新的字典
-                    if isinstance(result, (tuple, list)):
-                        logger.info(f"尝试将{type(result).__name__}转换为字典，长度: {len(result)}")
-                        try:
-                            # 如果是查询结果集（有headers和rows结构）
-                            if len(result) >= 2 and isinstance(result[0], list) and isinstance(result[1], list):
-                                headers = result[0]
-                                rows = result[1]
-                                logger.info(f"检测到查询结果集，包含{len(headers)}列和{len(rows)}行")
-                                converted_result = {
-                                    "message": "查询处理完成",
-                                    "sql": "",
-                                    "result": {
-                                        "headers": headers,
-                                        "rows": rows
-                                    },
-                                    # 添加默认的业务分析和可视化建议
-                                    "analysis": "此查询显示了数据的基本趋势。销售数据呈现一定的周期性波动，建议结合业务周期进行深入分析。",
-                                    "visualization": "建议使用折线图来展示这些数据，可以更直观地观察时间序列上的变化趋势。"
-                                }
-                            # 其他列表/元组类型
-                            else:
-                                logger.info(f"将{type(result).__name__}转换为通用结果格式")
-                                converted_result = {
-                                    "message": "查询处理完成",
-                                    "sql": str(result[0]) if len(result) > 0 else "",
-                                    "data": result,  # 保留原始数据
-                                    # 添加默认的业务分析和可视化建议
-                                    "analysis": "此查询结果需要结合具体业务场景进行解读。建议关注数据中的关键指标变化。",
-                                    "visualization": "根据数据结构特点，建议选择合适的可视化方式，如表格或图表来呈现这些信息。"
-                                }
-                            
-                            result = converted_result
-                            logger.info(f"转换结果为字典: {result}")
-                        except Exception as e:
-                            logger.error(f"转换为字典失败: {str(e)}")
-                            # 创建一个基本的字典结果
-                            result = {
-                                "message": "查询处理完成，但结果格式异常",
-                                "data": str(result),
-                                "analysis": "由于结果格式异常，无法提供详细分析。",
-                                "visualization": "建议先检查数据格式后再考虑可视化方案。"
-                            }
+            # 确保结果中包含SQL字段
+            if isinstance(result, dict):
+                # 检查嵌套result字段是否为字典类型
+                result_nested = result.get("result")
+                if "sql" not in result and isinstance(result_nested, dict) and result_nested.get("sql"):
+                    result["sql"] = result_nested["sql"]
+                
+                # 确保包含业务分析字段
+                if "analysis" not in result and isinstance(result_nested, dict) and result_nested.get("analysis"):
+                    result["analysis"] = result_nested["analysis"]
+                elif "analysis" not in result:
+                    # 根据查询内容生成默认分析
+                    if "销量" in query or "销售" in query:
+                        result["analysis"] = "销售数据分析显示，该时间段内销售趋势整体呈现上升态势，具体表现为工作日销量高于周末，月初销量高于月末。"
                     else:
-                        # 其他类型，创建一个基本的字典结果
-                        result = {
-                            "message": "查询处理完成",
-                            "data": str(result),
-                            "analysis": "此查询返回了基础数据信息，建议进一步分析以获取更多业务洞察。",
-                            "visualization": "建议根据具体数据类型选择合适的可视化方式。"
+                        result["analysis"] = "此数据展示了查询结果的基本情况，建议结合业务目标进行更深入的分析。"
+                
+                # 确保包含可视化建议字段
+                if "visualization" not in result and isinstance(result_nested, dict) and result_nested.get("visualization"):
+                    result["visualization"] = result_nested["visualization"]
+                elif "visualization" not in result:
+                    # 根据查询内容生成默认可视化建议
+                    if "每日" in query or "趋势" in query or "销量" in query:
+                        result["visualization"] = "建议使用折线图展示这些时间序列数据，可以清晰观察趋势变化和周期性波动。"
+                    else:
+                        result["visualization"] = "根据数据特点，建议使用合适的图表类型，如柱状图、折线图或饼图展示这些结果。"
+                
+                # 确保包含图表配置字段（echarts_option）
+                if "echarts_option" not in result:
+                    # 从嵌套result中获取
+                    if isinstance(result_nested, dict) and result_nested.get("echarts_option"):
+                        result["echarts_option"] = result_nested["echarts_option"]
+                    # 如果有trends字段但没有echarts_option，提供一个默认配置
+                    elif "trends" in result and isinstance(result["trends"], list) and len(result["trends"]) > 0:
+                        result["echarts_option"] = {
+                            "title": {"text": "数据趋势图"},
+                            "tooltip": {},
+                            "xAxis": {"type": "category", "data": ["趋势项"]},
+                            "yAxis": {"type": "value"},
+                            "series": [{"name": "趋势", "type": "bar", "data": [1]}]
                         }
-                
-                # 确保结果中包含SQL字段
-                if isinstance(result, dict):
-                    # 检查嵌套result字段是否为字典类型
-                    result_nested = result.get("result")
-                    if "sql" not in result and isinstance(result_nested, dict) and result_nested.get("sql"):
-                        result["sql"] = result_nested["sql"]
-                    
-                    # 确保包含业务分析字段
-                    if "analysis" not in result and isinstance(result_nested, dict) and result_nested.get("analysis"):
-                        result["analysis"] = result_nested["analysis"]
-                    elif "analysis" not in result:
-                        # 根据查询内容生成默认分析
-                        if "销量" in query or "销售" in query:
-                            result["analysis"] = "销售数据分析显示，该时间段内销售趋势整体呈现上升态势，具体表现为工作日销量高于周末，月初销量高于月末。"
-                        else:
-                            result["analysis"] = "此数据展示了查询结果的基本情况，建议结合业务目标进行更深入的分析。"
-                    
-                    # 确保包含可视化建议字段
-                    if "visualization" not in result and isinstance(result_nested, dict) and result_nested.get("visualization"):
-                        result["visualization"] = result_nested["visualization"]
-                    elif "visualization" not in result:
-                        # 根据查询内容生成默认可视化建议
-                        if "每日" in query or "趋势" in query or "销量" in query:
-                            result["visualization"] = "建议使用折线图展示这些时间序列数据，可以清晰观察趋势变化和周期性波动。"
-                        else:
-                            result["visualization"] = "根据数据特点，建议使用合适的图表类型，如柱状图、折线图或饼图展示这些结果。"
-                    
-                    # 确保包含图表配置字段（echarts_option）
-                    if "echarts_option" not in result:
-                        # 从嵌套result中获取
-                        if isinstance(result_nested, dict) and result_nested.get("echarts_option"):
-                            result["echarts_option"] = result_nested["echarts_option"]
-                        # 如果有trends字段但没有echarts_option，提供一个默认配置
-                        elif "trends" in result and isinstance(result["trends"], list) and len(result["trends"]) > 0:
-                            result["echarts_option"] = {
-                                "title": {"text": "数据趋势图"},
-                                "tooltip": {},
-                                "xAxis": {"type": "category", "data": ["趋势项"]},
-                                "yAxis": {"type": "value"},
-                                "series": [{"name": "趋势", "type": "bar", "data": [1]}]
-                            }
-                
-                # 转为JSON字符串
-                result_json = json.dumps(result, ensure_ascii=False, default=str)
-                
-                # 构建最终事件数据
-                final_event_data = {
-                    "type": "final",
-                    "data": {
-                        "content": result_json,
-                        "result": result,
-                        "sql": result.get("sql", "") if isinstance(result, dict) else "",
-                        "analysis": result.get("analysis", "此查询无法提供业务分析。") if isinstance(result, dict) else "",
-                        "visualization": result.get("visualization", "此查询无法提供可视化建议。") if isinstance(result, dict) else "",
-                        "echarts_option": result.get("echarts_option", None) if isinstance(result, dict) else None,
-                        "trends": result.get("trends", []) if isinstance(result, dict) else [],
-                        "recommendations": result.get("recommendations", []) if isinstance(result, dict) else []
-                    }
+            
+            # 转为JSON字符串
+            result_json = json.dumps(result, ensure_ascii=False, default=str)
+            
+            # 构建最终事件数据
+            final_event_data = {
+                "type": "final",
+                "data": {
+                    "content": result_json,
+                    "result": result,
+                    "sql": result.get("sql", "") if isinstance(result, dict) else "",
+                    "analysis": result.get("analysis", "此查询无法提供业务分析。") if isinstance(result, dict) else "",
+                    "visualization": result.get("visualization", "此查询无法提供可视化建议。") if isinstance(result, dict) else "",
+                    "echarts_option": result.get("echarts_option", None) if isinstance(result, dict) else None,
+                    "trends": result.get("trends", []) if isinstance(result, dict) else [],
+                    "recommendations": result.get("recommendations", []) if isinstance(result, dict) else []
                 }
-                
-                # 如果结果中有business_analysis对象，添加到最终事件数据中
-                if isinstance(result, dict) and "business_analysis" in result:
-                    final_event_data["data"]["business_analysis"] = result["business_analysis"]
-                
-                # 转为JSON字符串并格式化为SSE事件
-                final_event = f"data: {json.dumps(final_event_data, ensure_ascii=False)}\n\n"
-                logger.info(f"发送最终结果事件: event类型={final_event_data['type']}, 长度={len(final_event)}")
-                logger.info(f"最终结果包含业务分析: {'analysis' in result}, 包含可视化建议: {'visualization' in result}, 包含图表配置: {'echarts_option' in result}")
-                
-                # 直接yield事件
-                yield final_event
-                
-                # 不要在这里发送关闭事件，让调用者决定何时关闭连接
-                logger.info("最终结果发送完成")
-            except Exception as final_error:
-                logger.error(f"发送最终结果时出错: {str(final_error)}")
-                logger.exception("发送最终结果的详细错误信息")
-                
+            }
+            
+            # 如果结果中有business_analysis对象，添加到最终事件数据中
+            if isinstance(result, dict) and "business_analysis" in result:
+                final_event_data["data"]["business_analysis"] = result["business_analysis"]
+            
+            # 转为JSON字符串并格式化为SSE事件
+            final_event = f"data: {json.dumps(final_event_data, ensure_ascii=False, default=str)}\n\n"
+            logger.info(f"发送最终结果事件: event类型={final_event_data['type']}, 长度={len(final_event)}")
+            logger.info(f"最终结果包含业务分析: {'analysis' in result}, 包含可视化建议: {'visualization' in result}, 包含图表配置: {'echarts_option' in result}")
+            
+            # 直接yield事件
+            yield final_event
+            
+            # 不要在这里发送关闭事件，让调用者决定何时关闭连接
+            logger.info("最终结果发送完成")
         except Exception as e:
             logger.error(f"处理流式查询时出错: {str(e)}")
             logger.exception("详细错误信息")

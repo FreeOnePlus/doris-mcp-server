@@ -157,7 +157,7 @@ class NL2SQLService:
             # 直接处理查询
             logger.info(f"开始处理查询: {query}")
             result = self.processor.process(query)
-            logger.info(f"查询处理完成，结果: {json.dumps(result, ensure_ascii=False)[:200]}...")
+            logger.info(f"查询处理完成，结果: {json.dumps(result, ensure_ascii=False, default=str)[:200]}...")
             
             # 记录处理时间
             processing_time = time.time() - start_time

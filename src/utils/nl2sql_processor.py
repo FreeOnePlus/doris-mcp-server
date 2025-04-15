@@ -322,7 +322,16 @@ class NL2SQLProcessor:
                 return {
                     "business_analysis": "此查询结果显示了基本的数据统计信息，建议结合业务目标进行更深入分析。",
                     "visualization": "根据数据特点，可以选择合适的图表展示这些结果，如时间序列数据可使用折线图，类别对比可使用柱状图。",
-                    "echarts_option": None
+                    "trends": ["数据统计完成"],
+                    "recommendations": ["建议结合业务目标进行深入分析"],
+                    "echarts_option": {
+                        "title": {"text": "数据统计结果"},
+                        "tooltip": {"trigger": "axis"},
+                        "legend": {"data": ["数据值"]},
+                        "xAxis": {"type": "category", "data": ["数据点"]},
+                        "yAxis": {"type": "value"},
+                        "series": [{"name": "数据值", "type": "bar", "data": [1]}]
+                    }
                 }
             
             # 构建返回结果
@@ -334,6 +343,61 @@ class NL2SQLProcessor:
                 "echarts_option": analysis_result.get("echarts_option", None)
             }
             
+            # 确保echarts_option不为None
+            if result["echarts_option"] is None:
+                # 尝试创建基于查询结果的简单图表
+                if query_result and isinstance(query_result, list) and len(query_result) > 0:
+                    first_row = query_result[0]
+                    if isinstance(first_row, dict) and len(first_row) > 0:
+                        # 尝试构建简单图表
+                        try:
+                            # 获取第一个字段作为类别，第二个字段作为数值
+                            fields = list(first_row.keys())
+                            category_field = fields[0] if len(fields) > 0 else "类别"
+                            value_field = fields[1] if len(fields) > 1 else fields[0]
+                            
+                            # 提取数据
+                            categories = [str(row.get(category_field, "")) for row in query_result[:10]]
+                            values = [row.get(value_field, 0) for row in query_result[:10]]
+                            
+                            # 创建默认图表配置
+                            result["echarts_option"] = {
+                                "title": {"text": f"{category_field}与{value_field}关系图"},
+                                "tooltip": {"trigger": "axis"},
+                                "legend": {"data": [value_field]},
+                                "xAxis": {"type": "category", "data": categories},
+                                "yAxis": {"type": "value"},
+                                "series": [{"name": value_field, "type": "bar", "data": values}]
+                            }
+                        except Exception as chart_error:
+                            logger.warning(f"生成默认图表配置失败: {str(chart_error)}")
+                            # 提供一个非常基础的默认图表
+                            result["echarts_option"] = {
+                                "title": {"text": "查询结果数据图"},
+                                "tooltip": {"trigger": "axis"},
+                                "xAxis": {"type": "category", "data": ["数据点"]},
+                                "yAxis": {"type": "value"},
+                                "series": [{"name": "数据", "type": "bar", "data": [1]}]
+                            }
+                    else:
+                        # 提供一个非常基础的默认图表
+                        result["echarts_option"] = {
+                            "title": {"text": "查询结果数据图"},
+                            "tooltip": {"trigger": "axis"},
+                            "xAxis": {"type": "category", "data": ["数据点"]},
+                            "yAxis": {"type": "value"},
+                            "series": [{"name": "数据", "type": "bar", "data": [1]}]
+                        }
+                else:
+                    # 空数据的默认图表
+                    result["echarts_option"] = {
+                        "title": {"text": "暂无有效数据", "subtext": "查询结果为空或无法分析", "left": "center", "top": "center"},
+                        "tooltip": {"show": false},
+                        "xAxis": {"show": false},
+                        "yAxis": {"show": false},
+                        "series": []
+                    }
+            
             return result
             
         except Exception as e:
@@ -344,12 +408,30 @@ class NL2SQLProcessor:
             if "销量" in query or "销售" in query:
                 return {
                     "business_analysis": "销售数据分析显示，数据呈现周期性波动，工作日销量普遍高于周末。",
-                    "visualization": "建议使用折线图展示时间序列数据，可以清晰观察销售趋势和周期性变化。"
+                    "visualization": "建议使用折线图展示时间序列数据，可以清晰观察销售趋势和周期性变化。",
+                    "trends": ["数据加载完成"],
+                    "recommendations": ["建议查看详细数据分析"],
+                    "echarts_option": {
+                        "title": {"text": "销售数据分析"},
+                        "tooltip": {"trigger": "axis"},
+                        "xAxis": {"type": "category", "data": ["数据点"]},
+                        "yAxis": {"type": "value"},
+                        "series": [{"name": "销售数据", "type": "line", "data": [1]}]
+                    }
                 }
             else:
                 return {
                     "business_analysis": "此数据展示了查询结果的基本情况，建议结合业务目标进行更深入分析。",
-                    "visualization": "建议根据数据特点选择合适的图表类型展示结果。"
+                    "visualization": "建议根据数据特点选择合适的图表类型展示结果。",
+                    "trends": ["数据加载完成"],
+                    "recommendations": ["建议查看详细数据"],
+                    "echarts_option": {
+                        "title": {"text": "查询结果数据图"},
+                        "tooltip": {"trigger": "axis"},
+                        "xAxis": {"type": "category", "data": ["数据点"]},
+                        "yAxis": {"type": "value"},
+                        "series": [{"name": "数据", "type": "bar", "data": [1]}]
+                    }
                 }
 
     def _process_query(self, query):
@@ -1461,6 +1543,8 @@ class NL2SQLProcessor:
                 context_info.append("除非必要,优先查询精细层（如ads、dim）而非粗粒度层（如dwd、ods）。")
             if self.enable_multi_database:
                 context_info.append("支持跨数据库查询。在涉及多个数据库的表时,使用完整的 database_name.table_name 格式。")
+            else:
+                context_info.append("单库模式下，不使用数据库前缀，直接使用表名引用表，例如 FROM customer 而不是 FROM tpch.customer。")
             
             # 如果有之前执行的SQL错误信息,添加到系统提示中
             if previous_error:
@@ -1473,6 +1557,9 @@ class NL2SQLProcessor:
 分析错误原因并生成正确的SQL,避免重复之前的错误。特别注意表名、字段名、语法以及表关联条件是否正确。""")
                 
             context = "\n".join(context_info)
+            # 明确标识当前模式
+            mode_info = "单数据库模式" if not self.enable_multi_database else "多数据库模式"
+            context = f"当前配置: {mode_info}\n{context}"
             system_prompt = NL2SQL_PROMPTS["system_with_context"].format(context=context)
 
             messages = [Message("system", system_prompt)]
@@ -1855,19 +1942,45 @@ class NL2SQLProcessor:
                     # 结果是一个字典列表，直接使用列名
                     if results:
                         column_names = list(results[0].keys())
+                        
+                        logger.info(f"SQL执行成功，获取到 {len(results)} 条记录")
+                        
+                        # 返回成功结果（添加result字段用于保持兼容性）
+                        return {
+                            "status": "success",
+                            "sql": sql,
+                            "data": results,
+                            "result": results,  # 添加此字段，使result_preview可以正常工作
+                            "column_names": column_names
+                        }
                     else:
+                        # 没有结果但执行成功 - 0条记录
+                        logger.info(f"SQL执行成功，但获取到 0 条记录")
+                        
+                        # 如果有原始查询，可以尝试修复/重新生成SQL
+                        if query and attempt < max_retries:
+                            # 特殊处理：结果为空情况
+                            no_result_error = "查询结果为空，可能SQL查询条件过于严格或数据表中没有匹配的数据"
+                            logger.info(f"尝试修复空结果SQL: {sql}")
+                            
+                            # 尝试修复SQL（向LLM解释结果为空的情况）
+                            fixed_sql = self._fix_sql(sql, no_result_error, query)
+                            if fixed_sql and fixed_sql != sql:
+                                sql = fixed_sql
+                                logger.info(f"SQL已修复，将使用修复后的SQL重试")
+                                continue  # 使用新SQL继续尝试
+                            else:
+                                logger.warning(f"SQL修复失败或返回相同SQL")
+                        
+                        # 如果是最后一次尝试或没有修复成功，返回空结果
                         column_names = []
-                    
-                    logger.info(f"SQL执行成功，获取到 {len(results)} 条记录")
-                    
-                    # 返回成功结果（添加result字段用于保持兼容性）
-                    return {
-                        "status": "success",
-                        "sql": sql,
-                        "data": results,
-                        "result": results,  # 添加此字段，使result_preview可以正常工作
-                        "column_names": column_names
-                    }
+                        return {
+                            "status": "success",
+                            "sql": sql,
+                            "data": [],
+                            "result": [],  # 添加此字段，使result_preview可以正常工作
+                            "column_names": column_names
+                        }
                 else:
                     # 没有结果但执行成功
                     return {
@@ -2099,6 +2212,9 @@ class NL2SQLProcessor:
 
         # 记录原始内容的前100个字符，用于调试
         logger.info(f"原始LLM响应(前100字符): {content[:100]}")
+        
+        # 预处理内容，移除可能导致JSON解析错误的特殊字符
+        content = self._clean_json_content(content)
 
         # 方法1: 尝试提取```json代码块
         try:
@@ -2109,7 +2225,9 @@ class NL2SQLProcessor:
                 try:
                     # 清理可能导致解析失败的控制字符
                     cleaned_block = self._clean_json_content(json_block.strip())
-                    return json.loads(cleaned_block)
+                    parsed_json = json.loads(cleaned_block)
+                    logger.info("从JSON代码块中成功提取到JSON")
+                    return parsed_json
                 except json.JSONDecodeError as e:
                     logger.warning(f"代码块中的JSON解析失败: {str(e)}")
                     continue
@@ -2118,46 +2236,114 @@ class NL2SQLProcessor:
 
         # 方法2: 尝试直接解析整个内容
         try:
-            cleaned_content = self._clean_json_content(content)
-            return json.loads(cleaned_content)
+            return json.loads(content)
         except json.JSONDecodeError as e:
             logger.warning(f"直接JSON解析失败: {str(e)}")
 
-        # 方法3: 尝试查找和提取JSON块
+        # 方法3: 尝试提取最外层的JSON对象
         try:
-            # 清理特殊字符和换行
-            cleaned_content = re.sub(r'[\r\n\t]', ' ', content)
-            
-            # 查找JSON块
-            json_start = cleaned_content.find('{')
-            json_end = cleaned_content.rfind('}') + 1
+            # 查找第一个{和最后一个}
+            json_start = content.find('{')
+            json_end = content.rfind('}') + 1
             
             if json_start >= 0 and json_end > json_start:
-                json_part = cleaned_content[json_start:json_end]
-                # 清理JSON内容
-                json_part = self._clean_json_content(json_part)
+                json_part = content[json_start:json_end]
                 try:
                     return json.loads(json_part)
-                except json.JSONDecodeError:
-                    logger.warning(f"提取的JSON块解析失败")
+                except json.JSONDecodeError as e:
+                    logger.warning(f"提取的JSON块解析失败: {str(e)}")
         except Exception as e:
             logger.warning(f"尝试提取JSON块时出错: {str(e)}")
 
-        # 方法4: 使用正则表达式提取SQL字段
+        # 方法4: 多层次JSON提取尝试
+        # 这对嵌套的复杂JSON特别有用
         try:
-            sql_pattern = r'["\']sql["\']\s*:\s*["\'](.*?)["\']'
-            sql_match = re.search(sql_pattern, content, re.DOTALL)
-            if sql_match:
-                sql_value = sql_match.group(1).strip()
-                logger.info(f"使用正则表达式直接提取到SQL值: {sql_value[:100]}...")
-                return {"sql": sql_value}
+            # 尝试匹配所有可能的JSON对象
+            json_objects = re.findall(r'{.*?}', content, re.DOTALL)
+            
+            # 按长度排序，优先尝试更长的（可能更完整的）JSON对象
+            json_objects.sort(key=len, reverse=True)
+            
+            for json_obj in json_objects:
+                try:
+                    parsed = json.loads(json_obj)
+                    # 检查是否是有意义的JSON对象（至少有一个键）
+                    if isinstance(parsed, dict) and len(parsed) > 0:
+                        logger.info(f"从多层次JSON提取中成功解析: 键数量={len(parsed)}")
+                        return parsed
+                except json.JSONDecodeError:
+                    continue
         except Exception as e:
-            logger.warning(f"使用正则表达式提取SQL时出错: {str(e)}")
+            logger.warning(f"多层次JSON提取尝试失败: {str(e)}")
+
+        # 方法5: 尝试修复和重建JSON
+        try:
+            # 识别常见的JSON结构问题并修复
+            # 1. 处理缺少引号的键
+            fixed_content = re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', content)
+            # 2. 处理缺少逗号的问题
+            fixed_content = re.sub(r'}\s*{', '},{', fixed_content)
+            # 3. 处理字符串中的不匹配引号
+            fixed_content = fixed_content.replace('\\"', '"').replace("\\'", "'")
+            
+            # 尝试解析修复后的内容
+            try:
+                return json.loads(fixed_content)
+            except json.JSONDecodeError:
+                # 如果仍然失败，尝试提取修复后内容中的JSON对象
+                json_start = fixed_content.find('{')
+                json_end = fixed_content.rfind('}') + 1
+                
+                if json_start >= 0 and json_end > json_start:
+                    json_part = fixed_content[json_start:json_end]
+                    try:
+                        return json.loads(json_part)
+                    except json.JSONDecodeError:
+                        pass
+        except Exception as e:
+            logger.warning(f"JSON修复尝试失败: {str(e)}")
+
+        # 方法6: 使用正则表达式提取关键字段
+        try:
+            # 提取各个字段
+            result = {}
+            
+            # 提取business_analysis
+            ba_pattern = r'["\']business_analysis["\']\s*:\s*["\']([^"\']*)["\']'
+            ba_match = re.search(ba_pattern, content, re.DOTALL)
+            if ba_match:
+                result["business_analysis"] = ba_match.group(1).strip()
+            
+            # 提取visualization_suggestions
+            vs_pattern = r'["\']visualization_suggestions["\']\s*:\s*["\']([^"\']*)["\']'
+            vs_match = re.search(vs_pattern, content, re.DOTALL)
+            if vs_match:
+                result["visualization_suggestions"] = vs_match.group(1).strip()
+            
+            # 尝试提取echarts_option部分（作为整体）
+            eo_pattern = r'["\']echarts_option["\']\s*:\s*({[^}]*})'
+            eo_match = re.search(eo_pattern, content, re.DOTALL)
+            if eo_match:
+                eo_text = eo_match.group(1).strip()
+                try:
+                    # 尝试解析echarts_option
+                    result["echarts_option"] = json.loads(eo_text)
+                except json.JSONDecodeError:
+                    # 如果解析失败，至少保留文本
+                    logger.warning("无法解析echarts_option JSON，将其作为文本保存")
+                    result["echarts_option"] = {"title": {"text": "图表配置解析失败"}, "series": []}
+            
+            # 如果提取到了任何字段，返回结果
+            if result:
+                logger.info(f"使用正则表达式提取了 {len(result)} 个字段")
+                return result
+        except Exception as e:
+            logger.warning(f"使用正则表达式提取字段失败: {str(e)}")
 
         # 所有方法都失败
         logger.error(f"所有方法都无法提取有效JSON: {content[:100]}")
         return {"error": "Failed to parse JSON response", "content": content}
-        
+
     def _clean_json_content(self, content: str) -> str:
         """
         清理JSON内容，移除控制字符和处理转义问题
@@ -2171,14 +2357,44 @@ class NL2SQLProcessor:
         if not content:
             return ""
             
-        # 移除不可打印字符和控制字符
+        # 移除不可打印字符和控制字符，但保留基本的空白字符
         cleaned = ''.join(c for c in content if c >= ' ' or c in ['\n', '\r', '\t'])
         
+        # 替换特殊Unicode字符和不可打印字符
+        cleaned = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', cleaned)
+        
         # 处理常见的转义问题
-        cleaned = cleaned.replace('\\\\', '\\').replace('\\"', '"')
+        cleaned = cleaned.replace('\\\\', '\\').replace('\\"', '"').replace("\\'", "'")
+        
+        # 处理转义的字符
+        cleaned = cleaned.replace('\\n', '\n').replace('\\r', '\r').replace('\\t', '\t')
         
         # 如果有转义的尖括号，还原它们
         cleaned = cleaned.replace('\\<', '<').replace('\\>', '>')
+        
+        # 修复常见的JSON格式问题
+        # 1. 确保所有属性名都用双引号包围
+        cleaned = re.sub(r'([{,])\s*([a-zA-Z0-9_]+)\s*:', r'\1"\2":', cleaned)
+        
+        # 2. 修复常见的引号不匹配问题
+        quote_pattern = r'(["\']\w+["\'])\s*:\s*([^",{}\[\]]*?)(\s*[,}\]])'
+        while re.search(quote_pattern, cleaned):
+            cleaned = re.sub(quote_pattern, r'\1: "\2"\3', cleaned)
+        
+        # 3. 修复可能缺少的逗号
+        cleaned = re.sub(r'}\s*{', '},{', cleaned)
+        cleaned = re.sub(r']\s*{', '],{', cleaned)
+        cleaned = re.sub(r'}\s*\[', '},\[', cleaned)
+        cleaned = re.sub(r']\s*\[', '],\[', cleaned)
+        
+        # 4. 修复常见的布尔值和空值问题
+        cleaned = re.sub(r':\s*true\b', ': true', cleaned)
+        cleaned = re.sub(r':\s*false\b', ': false', cleaned)
+        cleaned = re.sub(r':\s*null\b', ': null', cleaned)
+        
+        # 5. 处理异常的空格和引号
+        cleaned = re.sub(r'\s+(?=[\[\],{}:])', '', cleaned)  # 删除标点前的空格
+        cleaned = re.sub(r'(?<=[\[\],{:"])\s+', '', cleaned)  # 删除标点后的空格
         
         return cleaned
 
@@ -2199,9 +2415,18 @@ class NL2SQLProcessor:
             # 记录转换前的SQL
             original_sql = sql
 
-            # 如果未启用多数据库模式,在所有没有前缀的表名前添加当前数据库名
+            # 如果未启用多数据库模式
             if not self.enable_multi_database:
-                sql = self._add_database_prefix_to_sql(sql, self.db_name)
+                # 在单库模式下，需要将可能存在的database.table格式转换为table格式
+                db_name = self.db_name
+                if db_name:
+                    # 处理可能已经有数据库前缀的情况，将database.table转换为table
+                    # 注意只替换当前数据库的前缀，不处理其他数据库
+                    pattern = rf'\b{re.escape(db_name)}\.([a-zA-Z0-9_]+)\b'
+                    sql = re.sub(pattern, r'\1', sql, flags=re.IGNORECASE)
+                
+                # 然后，如果需要在执行时添加前缀，可以由_add_database_prefix_to_sql函数处理
+                # sql = self._add_database_prefix_to_sql(sql, self.db_name)
             else:
                 # 多数据库逻辑（保持不变）
                 # 获取所有数据库和表的映射关系
@@ -2346,21 +2571,34 @@ class NL2SQLProcessor:
         Returns:
             Dict: 包含system和user提示的字典
         """
-        # 错误类型分析
-        error_type = error_analysis(error_message)
+        # 检查是否是空结果错误
+        is_empty_result = "查询结果为空" in error_message
         
-        # 系统提示
-        system_prompt = SQL_FIX_PROMPTS["error_type_system"].format(
-            error_type=error_type,
-            error_message=error_message
-        )
+        if is_empty_result:
+            # 使用空结果修复提示
+            system_prompt = SQL_FIX_PROMPTS["empty_result_system"]
+            user_prompt = SQL_FIX_PROMPTS["empty_result_user"].format(
+                sql=sql,
+                query=query,
+                table_info=table_info
+            )
+        else:
+            # 常规错误修复
+            # 错误类型分析
+            error_type = error_analysis(error_message)
+            
+            # 系统提示
+            system_prompt = SQL_FIX_PROMPTS["error_type_system"].format(
+                error_type=error_type,
+                error_message=error_message
+            )
 
-        # 用户提示
-        user_prompt = SQL_FIX_PROMPTS["error_fix_user"].format(
-            sql=sql,
-            query=query,
-            table_info=table_info
-        )
+            # 用户提示
+            user_prompt = SQL_FIX_PROMPTS["error_fix_user"].format(
+                sql=sql,
+                query=query,
+                table_info=table_info
+            )
 
         return {
             "system": system_prompt,
@@ -2497,10 +2735,18 @@ def error_analysis(error_msg: str) -> str:
         return "表不存在"
     elif "field not found" in error_msg or "column not found" in error_msg:
         return "字段不存在"
-    elif "ambiguous" in error_msg:
-        return "字段名称冲突"
-    elif "type" in error_msg and "mismatch" in error_msg:
-        return "类型不匹配"
+    elif "查询结果为空" in error_msg or "没有匹配的数据" in error_msg:
+        return "空结果"
+    elif "division by zero" in error_msg:
+        return "除零错误"
+    elif "duplicate key" in error_msg:
+        return "重复键错误"
+    elif "data type mismatch" in error_msg or "cannot cast" in error_msg:
+        return "数据类型不匹配"
+    elif "permission denied" in error_msg:
+        return "权限错误"
+    elif "timeout" in error_msg or "execution time" in error_msg:
+        return "查询超时"
     else:
         return "未知错误"
 
@@ -2605,6 +2851,12 @@ def execute_sql(sql: str):
                     "step": "business_metadata",
                     "progress": 40
                 })
+                
+            # 添加单库/多库模式信息
+            if self.enable_multi_database:
+                context_info.append("支持跨数据库查询。在涉及多个数据库的表时,使用完整的 database_name.table_name 格式。")
+            else:
+                context_info.append("单库模式下，不使用数据库前缀，直接使用表名引用表，例如 FROM customer 而不是 FROM tpch.customer。")
             
             # 如果有之前的错误,添加到上下文
             if previous_error:
@@ -2617,6 +2869,9 @@ def execute_sql(sql: str):
             
             # 构建提示
             context = "\n\n".join(context_info)
+            # 明确标识当前模式
+            mode_info = "单数据库模式" if not self.enable_multi_database else "多数据库模式"
+            context = f"当前配置: {mode_info}\n{context}"
             system_prompt = NL2SQL_PROMPTS["SYSTEM_PROMPT"].format(context=context)
             user_prompt = NL2SQL_PROMPTS["USER_PROMPT"].format(query=query)
             

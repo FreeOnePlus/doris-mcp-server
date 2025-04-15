@@ -10,14 +10,19 @@ Apache Doris MCP NL2SQL服务
 import os
 import sys
 import json
+from decimal import Decimal
 from dotenv import load_dotenv
 import datetime
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 from starlette.routing import Route
-from fastapi import Response, Request, FastAPI
+from fastapi import Response, Request, FastAPI, WebSocket, HTTPException, Depends, WebSocketDisconnect
 import logging
 import uvicorn
+import asyncio
+import time
+from contextlib import asynccontextmanager
+import traceback
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -35,12 +40,69 @@ from src.sse_server import DorisMCPSseServer
 # 获取日志器
 logger = get_logger(__name__)
 
-# 替换json.dumps，确保中文不被转义为Unicode序列
+# 创建Decimal类型处理器
+def decimal_converter(obj):
+    # 直接检查对象是否为Decimal类型
+    if isinstance(obj, Decimal):
+        return float(obj)
+    # 对于老版本代码的兼容性，也检查类名
+    elif hasattr(obj, '__class__') and obj.__class__.__name__ == 'Decimal':
+        return float(obj)
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+# 替换json.dumps，确保中文不被转义为Unicode序列并正确处理Decimal类型
 _original_dumps = json.dumps
 def _custom_dumps(*args, **kwargs):
     kwargs['ensure_ascii'] = False
+    
+    # 添加自定义的默认转换器，处理Decimal类型
+    if 'default' not in kwargs:
+        kwargs['default'] = decimal_converter
+    else:
+        # 如果已经提供了default转换器，包装它以确保能处理Decimal类型
+        original_default = kwargs['default']
+        def wrapped_default(obj):
+            try:
+                if isinstance(obj, Decimal):
+                    return float(obj)
+                # 对于老版本代码的兼容性，也检查类名
+                elif hasattr(obj, '__class__') and obj.__class__.__name__ == 'Decimal':
+                    return float(obj)
+                return original_default(obj)
+            except TypeError:
+                return decimal_converter(obj)
+        kwargs['default'] = wrapped_default
+        
     return _original_dumps(*args, **kwargs)
+
+# 替换json.dump，确保能处理Decimal类型
+_original_dump = json.dump
+def _custom_dump(obj, fp, *args, **kwargs):
+    kwargs['ensure_ascii'] = False
+    
+    # 添加自定义的默认转换器，处理Decimal类型
+    if 'default' not in kwargs:
+        kwargs['default'] = decimal_converter
+    else:
+        # 如果已经提供了default转换器，包装它以确保能处理Decimal类型
+        original_default = kwargs['default']
+        def wrapped_default(obj):
+            try:
+                if isinstance(obj, Decimal):
+                    return float(obj)
+                # 对于老版本代码的兼容性，也检查类名
+                elif hasattr(obj, '__class__') and obj.__class__.__name__ == 'Decimal':
+                    return float(obj)
+                return original_default(obj)
+            except TypeError:
+                return decimal_converter(obj)
+        kwargs['default'] = wrapped_default
+        
+    return _original_dump(obj, fp, *args, **kwargs)
+
+# 替换原始函数
 json.dumps = _custom_dumps
+json.dump = _custom_dump
 
 # 从mcp.server.fastmcp导入FastMCP
 from mcp.server.fastmcp import FastMCP
@@ -56,6 +118,7 @@ load_dotenv(override=True)
 
 # 读取环境变量决定是否自动刷新元数据
 auto_refresh_metadata = os.getenv("AUTO_REFRESH_METADATA", "false").lower() == "true"
+logger.info(f"自动刷新元数据功能设置为: {auto_refresh_metadata}")
 
 # 初始化MCP服务器
 mcp = FastMCP(
@@ -165,22 +228,60 @@ def add_sse_endpoints(app):
     
     return app
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 初始化应用程序状态
+    from src.utils.singleton import AppState
+    from src.utils.metadata_extractor import MetadataExtractor
+    
+    app_state = AppState()
+    
+    try:
+        # 读取环境变量，确定是否需要自动刷新元数据
+        auto_refresh_metadata = os.getenv("AUTO_REFRESH_METADATA", "false").lower() == "true"
+        if auto_refresh_metadata:
+            try:
+                # 执行元数据刷新
+                logger.info("启动时刷新元数据...")
+                metadata_extractor = MetadataExtractor()
+                success = metadata_extractor.refresh_all_databases_metadata()
+                if success:
+                    logger.info("元数据刷新成功")
+                else:
+                    logger.warning("元数据刷新部分失败，可能会影响应用功能")
+            except Exception as e:
+                logger.error(f"元数据刷新过程中出错: {str(e)}")
+                logger.error(traceback.format_exc())
+        else:
+            logger.info("自动刷新元数据功能已关闭")
+    except Exception as e:
+        logger.error(f"启动服务时出错: {str(e)}")
+    
+    yield
+    # 清理资源（如果需要）
+    logger.info("服务关闭，清理资源...")
+
+# 健康检查端点
+@app.get("/health", tags=["Health"])
+async def health_check():
+    return {"status": "healthy", "timestamp": time.time()}
+
 async def main():
     """主入口函数"""
     try:
         # 启动服务器
         config = uvicorn.Config(
             app=app,
-            host="127.0.0.1",
+            host="0.0.0.0",
             port=3000,
             log_level="info"
         )
         server = uvicorn.Server(config)
         
         # 打印服务器信息
-        print(f"启动 MCP SSE 服务器，地址: http://127.0.0.1:3000/")
-        print(f"MCP SSE 端点: http://127.0.0.1:3000/mcp")
-        print(f"MCP 消息端点: http://127.0.0.1:3000/mcp/messages")
+        print(f"启动 MCP SSE 服务器，地址: http://0.0.0.0:3000/")
+        print(f"MCP SSE 端点: http://0.0.0.0:3000/mcp")
+        print(f"MCP 消息端点: http://0.0.0.0:3000/mcp/messages")
         
         await server.serve()
         
