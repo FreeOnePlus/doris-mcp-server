@@ -73,7 +73,7 @@
                           </el-button>
                         </div>
                       </div>
-                      <pre class="sql-code">{{ message.sql }}</pre>
+                      <pre class="sql-code" v-html="formatSQL(message.sql)"></pre>
                     </div>
                     
                     <!-- SQL查询结果显示 - 优先使用直接的result数组 -->
@@ -1582,6 +1582,101 @@ function formatCellValue(value, columnName) {
   return value;
 }
 
+// 格式化SQL显示
+function formatSQL(sql) {
+  if (!sql) return '';
+  
+  // 1. 替换SQL关键词为大写并添加高亮样式
+  const keywords = [
+    'SELECT', 'FROM', 'WHERE', 'GROUP BY', 'ORDER BY', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN', 
+    'INNER JOIN', 'HAVING', 'LIMIT', 'OFFSET', 'AND', 'OR', 'NOT', 'IN', 'BETWEEN', 
+    'LIKE', 'AS', 'ON', 'WITH', 'UNION', 'ALL', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'DISTINCT',
+    'DESC', 'ASC', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'NULL', 'IS NULL', 'IS NOT NULL',
+    'CREATE', 'ALTER', 'DROP', 'TABLE', 'VIEW', 'INDEX', 'INSERT', 'UPDATE', 'DELETE'
+  ];
+  
+  // 函数和操作符
+  const functions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'CAST', 'COALESCE', 'NULLIF', 'EXTRACT', 'TO_CHAR', 'DATE_FORMAT'];
+  
+  // 先确保HTML安全
+  let formattedSQL = sql.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  
+  // 处理SQL注释 -- 和 /* */
+  formattedSQL = formattedSQL
+    .replace(/--(.*)$/gm, '<span class="sql-comment">--$1</span>')
+    .replace(/\/\*([\s\S]*?)\*\//g, '<span class="sql-comment">/*$1*/</span>');
+  
+  // 处理字符串（单引号和双引号）
+  formattedSQL = formattedSQL
+    .replace(/'([^']*)'/g, '<span class="sql-string">\'$1\'</span>')
+    .replace(/"([^"]*)"/g, '<span class="sql-string">"$1"</span>');
+  
+  // 关键词高亮 - 确保完整匹配单词
+  for (const keyword of keywords) {
+    const regex = new RegExp(`\\b${keyword}\\b`, 'gi');
+    formattedSQL = formattedSQL.replace(regex, match => 
+      `<span class="sql-keyword">${match.toUpperCase()}</span>`);
+  }
+  
+  // 函数高亮 - 注意要匹配带括号的形式
+  for (const func of functions) {
+    const regex = new RegExp(`\\b${func}\\s*\\(`, 'gi');
+    formattedSQL = formattedSQL.replace(regex, match => {
+      // 分离函数名和括号
+      const parts = match.split(/([\s(])/);
+      const funcName = parts[0].toUpperCase();
+      const rest = parts.slice(1).join('');
+      return `<span class="sql-function">${funcName}</span>${rest}`;
+    });
+  }
+  
+  // 数字高亮
+  formattedSQL = formattedSQL.replace(/\b(\d+(\.\d+)?)\b/g, '<span class="sql-number">$1</span>');
+  
+  // 美化SQL语法 - 增加缩进和换行
+  formattedSQL = formattedSQL
+    .replace(/\bSELECT\b/gi, 'SELECT')
+    .replace(/\bFROM\b/gi, '\nFROM')
+    .replace(/\bWHERE\b/gi, '\nWHERE')
+    .replace(/\bGROUP BY\b/gi, '\nGROUP BY')
+    .replace(/\bHAVING\b/gi, '\nHAVING')
+    .replace(/\bORDER BY\b/gi, '\nORDER BY')
+    .replace(/\bLIMIT\b/gi, '\nLIMIT')
+    // 处理所有JOIN类型
+    .replace(/\b(LEFT|RIGHT|INNER|OUTER|CROSS|FULL)?\s*JOIN\b/gi, '\n$1 JOIN')
+    // 子句缩进
+    .replace(/\bON\b/gi, '\n  ON')
+    .replace(/\bAND\b/gi, '\n  AND')
+    .replace(/\bOR\b/gi, '\n  OR')
+    // CASE WHEN 语句格式化
+    .replace(/\bCASE\b/gi, '\n  CASE')
+    .replace(/\bWHEN\b/gi, '\n    WHEN')
+    .replace(/\bTHEN\b/gi, ' THEN')
+    .replace(/\bELSE\b/gi, '\n    ELSE')
+    .replace(/\bEND\b/gi, '\n  END')
+    // 处理子查询
+    .replace(/\(/g, function(match, offset, string) {
+      // 检查括号前是否有关键词或函数名，如果没有则假定是子查询
+      const prevChars = string.substring(Math.max(0, offset - 20), offset);
+      if (!/\b(IN|EXISTS|FROM|SELECT|WHERE|AND|OR|COUNT|SUM|AVG|MIN|MAX|COALESCE)\s*$/i.test(prevChars)) {
+        return '\n(\n  ';
+      }
+      return match;
+    })
+    .replace(/\)/g, function(match, offset, string) {
+      // 检查括号后是否有其他字符，如果是在行尾则添加换行
+      const nextChar = string.charAt(offset + 1);
+      if (nextChar === '' || nextChar === ',' || nextChar === ' ') {
+        return '\n)';
+      }
+      return match;
+    })
+    // 移除多余空行
+    .replace(/\n\s*\n/g, '\n');
+  
+  return formattedSQL;
+}
+
 // 从message对象中获取result数组
 function getMessageResultArray(message) {
   console.log('尝试从message中提取result数组');
@@ -1882,6 +1977,35 @@ function getMessageResultHeaders(message) {
           max-height: 300px;
           overflow-y: auto;
           margin: 0;
+          
+          .sql-keyword {
+            color: #409EFF;
+            font-weight: 600;
+          }
+          
+          /* 允许v-html显示的内容使用下面的样式 */
+          :deep(.sql-keyword) {
+            color: #409EFF;
+            font-weight: 600;
+          }
+          
+          :deep(.sql-string) {
+            color: #67C23A;  /* 绿色 */
+          }
+          
+          :deep(.sql-comment) {
+            color: #909399;  /* 灰色 */
+            font-style: italic;
+          }
+          
+          :deep(.sql-function) {
+            color: #E6A23C;  /* 橙色 */
+            font-weight: 500;
+          }
+          
+          :deep(.sql-number) {
+            color: #F56C6C;  /* 红色 */
+          }
         }
       }
       
