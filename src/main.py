@@ -131,7 +131,8 @@ def start_server():
     app.state.mcp = mcp
     
     # 注册MCP工具函数
-    register_mcp_tools(mcp)
+    logger.info("正在注册MCP工具...")
+    asyncio.run(register_mcp_tools(mcp))
     
     # 启动FastAPI应用
     uvicorn.run(

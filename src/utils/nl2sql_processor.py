@@ -2384,8 +2384,6 @@ class NL2SQLProcessor:
         # 3. 修复可能缺少的逗号
         cleaned = re.sub(r'}\s*{', '},{', cleaned)
         cleaned = re.sub(r']\s*{', '],{', cleaned)
-        cleaned = re.sub(r'}\s*\[', '},\[', cleaned)
-        cleaned = re.sub(r']\s*\[', '],\[', cleaned)
         
         # 4. 修复常见的布尔值和空值问题
         cleaned = re.sub(r':\s*true\b', ': true', cleaned)

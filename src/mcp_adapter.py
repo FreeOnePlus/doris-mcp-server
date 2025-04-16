@@ -18,9 +18,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, StreamingResponse
 from typing import Dict, Any, List, Optional, Callable, AsyncGenerator
 
-# 导入工具注册中心
-from src.tools.tool_registry import get_registry, get_tool, get_tool_list
-
 # 获取日志记录器
 logger = logging.getLogger("mcp.adapter")
 

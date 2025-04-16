@@ -21,7 +21,6 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 from starlette.applications import Starlette
-from src.tools.tool_registry import get_registry
 
 # 获取日志记录器
 logger = logging.getLogger("doris-mcp-sse")
@@ -72,57 +71,27 @@ class DorisMCPSseServer:
     def setup_sse_routes(self):
         """设置SSE相关路由"""
         
-        # 存储mcp_server引用到应用状态中，以便路由函数访问
-        self.app.state.mcp_server = self.mcp_server
-        
         @self.app.get("/health")
-        async def health_check(request: Request):
+        async def health_check():
             """健康检查端点"""
+            from src.nl2sql_service import NL2SQLService
+            
             try:
-                # 获取MCP实例
-                mcp = request.app.state.mcp_server
+                nl2sql = NL2SQLService()
+                result = await nl2sql.mcp_doris_health()
                 
-                try:
-                    # 直接查找health工具
-                    tools = await mcp.list_tools()
-                    health_tool = None
-                    
-                    for tool in tools:
-                        if getattr(tool, 'name', '') == 'health':
-                            health_tool = tool
-                            break
-                    
-                    if health_tool:
-                        # 获取工具函数
-                        func = health_tool.func if hasattr(health_tool, 'func') else None
-                        
-                        if callable(func):
-                            # 直接调用函数
-                            logger.info("调用health工具函数")
-                            result = await func()
-                            return result
-                        elif callable(health_tool):
-                            # 直接调用工具对象
-                            logger.info("调用health工具对象")
-                            result = await health_tool()
-                            return result
-                    
-                    # 后备方案：直接返回简单的健康状态
-                    logger.info("使用后备健康检查逻辑")
-                    return {
-                        "status": "healthy",
-                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "version": "1.0.0",
-                        "message": "后备健康检查"
-                    }
-                except Exception as e:
-                    logger.error(f"健康检查出错: {str(e)}")
-                    logger.error(f"错误详情: {traceback.format_exc()}")
-                    return {
-                        "status": "error",
-                        "error": str(e),
-                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-                    }
+                # 如果是MCP格式结果，解包返回原始结果
+                if isinstance(result, dict) and "content" in result and len(result["content"]) > 0:
+                    content = result["content"][0]
+                    if content.get("type") == "text" and "text" in content:
+                        try:
+                            return json.loads(content["text"])
+                        except:
+                            # 如果不能解析为JSON，则直接返回文本
+                            return {"status": "healthy", "text": content["text"]}
+                
+                # 如果不是MCP格式，直接返回
+                return result
             except Exception as e:
                 return {
                     "status": "error",
@@ -131,75 +100,36 @@ class DorisMCPSseServer:
                 }
         
         @self.app.get("/status")
-        async def status(request: Request):
+        async def status():
             """获取服务器状态"""
             try:
-                # 获取MCP实例
-                mcp = request.app.state.mcp_server
+                # 获取工具列表
+                tools = await self.mcp_server.list_tools()
+                tool_names = [tool.name if hasattr(tool, 'name') else str(tool) for tool in tools]
+                logger.info(f"获取工具列表，当前注册的工具: {tool_names}")
                 
-                try:
-                    # 直接查找status工具
-                    tools = await mcp.list_tools()
-                    status_tool = None
-                    
-                    for tool in tools:
-                        if getattr(tool, 'name', '') == 'status':
-                            status_tool = tool
-                            break
-                    
-                    if status_tool:
-                        # 获取工具函数
-                        func = status_tool.func if hasattr(status_tool, 'func') else None
-                        
-                        if callable(func):
-                            # 直接调用函数
-                            logger.info("调用status工具函数")
-                            result = await func()
-                            return result
-                        elif callable(status_tool):
-                            # 直接调用工具对象
-                            logger.info("调用status工具对象")
-                            result = await status_tool()
-                            return result
-                    
-                    # 后备方案：如果找不到status工具，获取基本状态信息
-                    logger.info("使用后备状态检查逻辑")
-                    
-                    # 获取工具列表
-                    tools = await mcp.list_tools()
-                    tool_names = [getattr(tool, 'name', str(tool)) for tool in tools]
-                    
-                    # 获取资源列表
-                    resources = await mcp.list_resources()
-                    resource_names = [getattr(res, 'name', str(res)) for res in resources]
-                    
-                    # 获取提示模板列表
-                    prompts = await mcp.list_prompts()
-                    prompt_names = [getattr(prompt, 'name', str(prompt)) for prompt in prompts]
-                    
-                    return {
-                        "status": "running",
-                        "name": mcp.name,
-                        "mode": "mcp_sse",
-                        "clients": len(self.client_sessions),
-                        "tools": tool_names,
-                        "resources": resource_names,
-                        "prompts": prompt_names,
-                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-                    }
-                except Exception as e:
-                    logger.error(f"状态检查出错: {str(e)}")
-                    logger.error(f"错误详情: {traceback.format_exc()}")
-                    return {
-                        "status": "error",
-                        "error": str(e),
-                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-                    }
+                # 获取资源列表
+                resources = await self.mcp_server.list_resources()
+                resource_names = [res.name if hasattr(res, 'name') else str(res) for res in resources]
+                
+                # 获取提示模板列表
+                prompts = await self.mcp_server.list_prompts()
+                prompt_names = [prompt.name if hasattr(prompt, 'name') else str(prompt) for prompt in prompts]
+                
+                return {
+                    "status": "running",
+                    "name": self.mcp_server.name,
+                    "mode": "mcp_sse",
+                    "clients": len(self.client_sessions),
+                    "tools": tool_names,
+                    "resources": resource_names,
+                    "prompts": prompt_names
+                }
             except Exception as e:
+                logger.error(f"获取状态时出错: {str(e)}")
                 return {
                     "status": "error",
-                    "error": str(e),
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                    "error": str(e)
                 }
         
         @self.app.get("/mcp")
@@ -367,7 +297,7 @@ class DorisMCPSseServer:
                 # 尝试获取NL2SQL状态
                 try:
                     # 获取MCP实例
-                    mcp = self.app.state.mcp_server
+                    mcp = self.app.state.mcp if hasattr(self.app.state, 'mcp') else self.mcp_server
                     
                     # 尝试找到get_nl2sql_status工具并调用
                     nl2sql_status_tool = None
@@ -745,7 +675,7 @@ class DorisMCPSseServer:
                         )
                     
                     # 获取MCP实例
-                    mcp = request.app.state.mcp_server
+                    mcp = request.app.state.mcp
                     
                     # 检查是否为流式工具调用
                     stream_mode = "stream" in request.query_params or params.get("stream", False)
@@ -1121,7 +1051,7 @@ class DorisMCPSseServer:
         """
         logger.info(f"调用工具: {tool_name}, 参数: {json.dumps(arguments, ensure_ascii=False)}")
         
-        # 从请求中提取最近的消息内容
+        # 获取最近的查询内容，用于处理random_string参数
         recent_query = self._extract_recent_query(request)
         
         # 处理工具名称映射 - 添加对标准名称工具的支持
@@ -1135,172 +1065,112 @@ class DorisMCPSseServer:
             "get_nl2sql_status": "mcp_doris_get_nl2sql_status",
             "refresh_metadata": "mcp_doris_refresh_metadata",
             "sql_optimize": "mcp_doris_sql_optimize",
-            "fix_sql": "mcp_doris_fix_sql"
+            "fix_sql": "mcp_doris_fix_sql",
+            "health": "mcp_doris_health",
+            "status": "mcp_doris_status",
+            "count_chars": "mcp_doris_count_chars"
         }
         
         # 如果是标准名称，转换为MCP名称
         mapped_tool_name = tool_mapping.get(tool_name, tool_name)
         
-        # 处理不同的工具调用
-        if mapped_tool_name.startswith("mcp_doris_"):
-            # 调用Doris相关工具
-            from nl2sql_service import NL2SQLService
+        # 从mcp_doris_tools导入工具函数
+        try:
+            # 导入工具模块
+            import src.tools.mcp_doris_tools as mcp_tools
             
-            nl2sql = NL2SQLService()
-            tool_method = getattr(nl2sql, mapped_tool_name, None)
+            # 获取对应的工具函数
+            tool_function = getattr(mcp_tools, mapped_tool_name, None)
             
-            if not tool_method:
-                raise ValueError(f"未找到工具方法: {mapped_tool_name}")
-            
-            # 处理查询相关的工具调用
-            if mapped_tool_name in ["mcp_doris_nl2sql_query", "mcp_doris_nl2sql_query_stream"]:
-                # 支持query或random_string参数
-                query = None
-                if "query" in arguments and arguments.get("query"):
-                    query = arguments.get("query", "")
-                elif "random_string" in arguments:
-                    # Claude可能会使用随机字符串作为占位符
-                    logger.info("检测到random_string参数，使用作为查询内容")
-                    query = arguments.get("random_string") or recent_query or "显示所有表的数据量"
-                
-                if not query:
-                    raise ValueError("查询参数不能为空")
-                
-                logger.info(f"执行NL2SQL查询: {query}")
-                return await tool_method(query)
-            
-            # 处理表解释工具
-            elif mapped_tool_name == "mcp_doris_explain_table":
-                # 支持table_name或random_string参数
-                table_name = None
-                if "table_name" in arguments and arguments.get("table_name"):
-                    table_name = arguments.get("table_name", "")
-                elif "random_string" in arguments:
-                    # 将random_string作为表名
-                    random_string = arguments.get("random_string", "")
-                    if random_string:
-                        logger.info(f"检测到random_string参数，将其作为表名: {random_string}")
-                        table_name = random_string
-                    else:
-                        # 尝试从最近的查询中提取表名
-                        logger.info("random_string为空，尝试从最近的查询中提取表名")
-                        # 简单的表名提取逻辑，实际应用中可能需要更复杂的逻辑
-                        import re
-                        if recent_query:
-                            table_matches = re.findall(r'表\s*[\'"]?([a-zA-Z0-9_]+)[\'"]?', recent_query)
-                            if table_matches:
-                                table_name = table_matches[0]
-                            else:
-                                # 如果没有找到明确的表名引用，使用默认表
-                                table_name = "lineitem"
-                        else:
-                            table_name = "lineitem"  # 默认表名
-                    
-                if not table_name:
-                    raise ValueError("表名参数不能为空")
-                
-                logger.info(f"解释表结构: {table_name}")
-                return await tool_method(table_name)
-            
-            # 处理SQL优化工具
-            elif mapped_tool_name == "mcp_doris_sql_optimize":
-                sql = None
-                if "sql" in arguments and arguments.get("sql"):
-                    sql = arguments.get("sql", "")
-                elif "random_string" in arguments:
-                    # 将random_string作为SQL内容
-                    random_string = arguments.get("random_string", "")
-                    if random_string:
-                        logger.info(f"检测到random_string参数，将其作为SQL: {random_string}")
-                        sql = random_string
-                    else:
-                        # 尝试从最近的查询中提取SQL
-                        logger.info("random_string为空，尝试从最近的查询中提取SQL")
-                        # 提取SQL语句的逻辑
-                        import re
-                        if recent_query:
-                            sql_matches = re.findall(r'```sql\s*([\s\S]+?)\s*```', recent_query)
-                            if sql_matches:
-                                sql = sql_matches[0].strip()
-                            else:
-                                # 如果找不到SQL代码块，尝试直接使用查询
-                                sql = recent_query
-                    
-                if not sql:
-                    raise ValueError("SQL参数不能为空")
-                
-                logger.info(f"优化SQL: {sql[:100]}...")
-                return await tool_method(sql)
-            
-            # 处理SQL修复工具
-            elif mapped_tool_name == "mcp_doris_fix_sql":
-                sql = None
-                error_message = ""
-                
-                if "sql" in arguments and arguments.get("sql"):
-                    sql = arguments.get("sql", "")
-                    error_message = arguments.get("error_message", "")
-                elif "random_string" in arguments:
-                    # 将random_string作为SQL内容
-                    random_string = arguments.get("random_string", "")
-                    if random_string:
-                        logger.info(f"检测到random_string参数，将其作为SQL: {random_string}")
-                        sql = random_string
-                    else:
-                        # 尝试从最近的查询中提取SQL
-                        logger.info("random_string为空，尝试从最近的查询中提取SQL")
-                        if recent_query:
-                            sql = recent_query
-                
-                if not sql:
-                    raise ValueError("SQL参数不能为空")
-                
-                logger.info(f"修复SQL: {sql[:100]}...")
-                return await tool_method(sql, error_message)
-            
-            # 处理无参数工具
-            else:
-                logger.info(f"调用无参数工具: {mapped_tool_name}")
-                return await tool_method()
-        
-        # 处理其他标准工具调用
-        elif tool_name in tool_mapping.keys():
-            # 这种情况是冗余的，因为上面已经处理了映射，但为了安全起见保留此代码
-            mapped_tool_name = tool_mapping[tool_name]
-            logger.info(f"映射工具名称: {tool_name} -> {mapped_tool_name}")
-            return await self.call_tool(mapped_tool_name, arguments, request)
-        
-        # 使用一般的FastMCP工具处理
-        else:
-            try:
-                # 获取MCP实例
-                mcp = self.app.state.mcp_server
-                
-                # 查找工具
-                tool_instance = None
+            if not tool_function:
+                # 如果在mcp_tools中不存在，尝试使用MCP工具
+                mcp = self.app.state.mcp if hasattr(self.app.state, 'mcp') else self.mcp_server
+                # 查找对应的工具
                 for tool in await mcp.list_tools():
-                    if getattr(tool, 'name', '') == tool_name:
-                        tool_instance = tool
+                    if getattr(tool, 'name', '') == mapped_tool_name:
+                        tool_function = tool
                         break
                 
-                if not tool_instance:
-                    raise ValueError(f"未找到工具: {tool_name}")
-                
-                # 执行工具调用
-                func = tool_instance.func if hasattr(tool_instance, 'func') else None
-                if func:
-                    return await func(**arguments)
-                
-                # 如果没有func属性，尝试直接调用
-                if callable(tool_instance):
-                    return await tool_instance(**arguments)
-                
-                # 如果都不行，则抛出错误
-                raise ValueError(f"不支持的工具: {tool_name}")
-            except Exception as e:
-                logger.error(f"一般工具调用错误: {str(e)}")
-                raise ValueError(f"工具调用错误: {str(e)}")
+                if not tool_function:
+                    raise ValueError(f"未找到工具: {tool_name} / {mapped_tool_name}")
+            
+            # 处理常见输入参数转换
+            processed_args = self._process_tool_arguments(mapped_tool_name, arguments, recent_query)
+            
+            # 调用工具函数
+            result = await tool_function(**processed_args)
+            
+            # 返回工具执行结果
+            return result
+        except AttributeError as e:
+            logger.error(f"工具函数不存在: {mapped_tool_name}, 错误: {str(e)}")
+            raise ValueError(f"工具函数不存在: {mapped_tool_name}")
+        except Exception as e:
+            logger.error(f"调用工具时出错: {str(e)}", exc_info=True)
+            raise ValueError(f"调用工具时出错: {str(e)}")
     
+    def _process_tool_arguments(self, tool_name, arguments, recent_query):
+        """
+        处理工具参数，支持特殊处理逻辑
+        
+        Args:
+            tool_name: 工具名称
+            arguments: 原始参数
+            recent_query: 最近的查询内容
+            
+        Returns:
+            处理后的参数字典
+        """
+        # 复制参数，避免修改原始对象
+        processed_args = dict(arguments)
+        
+        # 处理random_string参数
+        if "random_string" in processed_args and tool_name.startswith("mcp_doris_"):
+            random_string = processed_args.pop("random_string", "")
+            
+            # 根据工具类型特殊处理
+            if tool_name in ["mcp_doris_nl2sql_query", "mcp_doris_nl2sql_query_stream"]:
+                # 对于NL2SQL查询，将random_string作为查询内容
+                if not processed_args.get("query"):
+                    processed_args["query"] = random_string or recent_query or "显示所有表的数据量"
+            
+            elif tool_name == "mcp_doris_explain_table":
+                # 对于表结构解释，将random_string作为表名
+                if not processed_args.get("table_name"):
+                    if random_string:
+                        processed_args["table_name"] = random_string
+                    elif recent_query:
+                        # 简单的表名提取逻辑
+                        import re
+                        table_matches = re.findall(r'表\s*[\'"]?([a-zA-Z0-9_]+)[\'"]?', recent_query)
+                        if table_matches:
+                            processed_args["table_name"] = table_matches[0]
+                        else:
+                            processed_args["table_name"] = "lineitem"  # 默认表名
+                    else:
+                        processed_args["table_name"] = "lineitem"  # 默认表名
+            
+            elif tool_name in ["mcp_doris_sql_optimize", "mcp_doris_fix_sql"]:
+                # 对于SQL优化和修复，将random_string作为SQL内容
+                if not processed_args.get("sql"):
+                    if random_string:
+                        processed_args["sql"] = random_string
+                    elif recent_query:
+                        # 尝试从最近的查询中提取SQL
+                        import re
+                        sql_matches = re.findall(r'```sql\s*([\s\S]+?)\s*```', recent_query)
+                        if sql_matches:
+                            processed_args["sql"] = sql_matches[0].strip()
+                        else:
+                            processed_args["sql"] = recent_query
+            
+            elif tool_name == "mcp_doris_count_chars":
+                # 对于字符串计数，将random_string作为输入字符串
+                if not processed_args.get("input_string"):
+                    processed_args["input_string"] = random_string or recent_query or ""
+        
+        return processed_args
+
     def _extract_recent_query(self, request: Request) -> Optional[str]:
         """
         从请求中提取最近的用户查询
