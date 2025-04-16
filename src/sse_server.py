@@ -14,6 +14,7 @@ import json
 import uuid
 import logging
 import time
+import traceback
 from typing import Dict, Any, Optional
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -71,37 +72,134 @@ class DorisMCPSseServer:
     def setup_sse_routes(self):
         """设置SSE相关路由"""
         
-        @self.app.get("/status")
-        async def status():
-            """获取服务器状态"""
+        # 存储mcp_server引用到应用状态中，以便路由函数访问
+        self.app.state.mcp_server = self.mcp_server
+        
+        @self.app.get("/health")
+        async def health_check(request: Request):
+            """健康检查端点"""
             try:
-                # 获取工具列表
-                tools = await self.mcp_server.list_tools()
-                tool_names = [tool.name if hasattr(tool, 'name') else str(tool) for tool in tools]
-                logger.info(f"获取工具列表，当前注册的工具: {tool_names}")
+                # 获取MCP实例
+                mcp = request.app.state.mcp_server
                 
-                # 获取资源列表
-                resources = await self.mcp_server.list_resources()
-                resource_names = [res.name if hasattr(res, 'name') else str(res) for res in resources]
-                
-                # 获取提示模板列表
-                prompts = await self.mcp_server.list_prompts()
-                prompt_names = [prompt.name if hasattr(prompt, 'name') else str(prompt) for prompt in prompts]
-                
-                return {
-                    "status": "running",
-                    "name": self.mcp_server.name,
-                    "mode": "mcp_sse",
-                    "clients": len(self.client_sessions),
-                    "tools": tool_names,
-                    "resources": resource_names,
-                    "prompts": prompt_names
-                }
+                try:
+                    # 直接查找health工具
+                    tools = await mcp.list_tools()
+                    health_tool = None
+                    
+                    for tool in tools:
+                        if getattr(tool, 'name', '') == 'health':
+                            health_tool = tool
+                            break
+                    
+                    if health_tool:
+                        # 获取工具函数
+                        func = health_tool.func if hasattr(health_tool, 'func') else None
+                        
+                        if callable(func):
+                            # 直接调用函数
+                            logger.info("调用health工具函数")
+                            result = await func()
+                            return result
+                        elif callable(health_tool):
+                            # 直接调用工具对象
+                            logger.info("调用health工具对象")
+                            result = await health_tool()
+                            return result
+                    
+                    # 后备方案：直接返回简单的健康状态
+                    logger.info("使用后备健康检查逻辑")
+                    return {
+                        "status": "healthy",
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "version": "1.0.0",
+                        "message": "后备健康检查"
+                    }
+                except Exception as e:
+                    logger.error(f"健康检查出错: {str(e)}")
+                    logger.error(f"错误详情: {traceback.format_exc()}")
+                    return {
+                        "status": "error",
+                        "error": str(e),
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                    }
             except Exception as e:
-                logger.error(f"获取状态时出错: {str(e)}")
                 return {
                     "status": "error",
-                    "error": str(e)
+                    "error": str(e),
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                }
+        
+        @self.app.get("/status")
+        async def status(request: Request):
+            """获取服务器状态"""
+            try:
+                # 获取MCP实例
+                mcp = request.app.state.mcp_server
+                
+                try:
+                    # 直接查找status工具
+                    tools = await mcp.list_tools()
+                    status_tool = None
+                    
+                    for tool in tools:
+                        if getattr(tool, 'name', '') == 'status':
+                            status_tool = tool
+                            break
+                    
+                    if status_tool:
+                        # 获取工具函数
+                        func = status_tool.func if hasattr(status_tool, 'func') else None
+                        
+                        if callable(func):
+                            # 直接调用函数
+                            logger.info("调用status工具函数")
+                            result = await func()
+                            return result
+                        elif callable(status_tool):
+                            # 直接调用工具对象
+                            logger.info("调用status工具对象")
+                            result = await status_tool()
+                            return result
+                    
+                    # 后备方案：如果找不到status工具，获取基本状态信息
+                    logger.info("使用后备状态检查逻辑")
+                    
+                    # 获取工具列表
+                    tools = await mcp.list_tools()
+                    tool_names = [getattr(tool, 'name', str(tool)) for tool in tools]
+                    
+                    # 获取资源列表
+                    resources = await mcp.list_resources()
+                    resource_names = [getattr(res, 'name', str(res)) for res in resources]
+                    
+                    # 获取提示模板列表
+                    prompts = await mcp.list_prompts()
+                    prompt_names = [getattr(prompt, 'name', str(prompt)) for prompt in prompts]
+                    
+                    return {
+                        "status": "running",
+                        "name": mcp.name,
+                        "mode": "mcp_sse",
+                        "clients": len(self.client_sessions),
+                        "tools": tool_names,
+                        "resources": resource_names,
+                        "prompts": prompt_names,
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                except Exception as e:
+                    logger.error(f"状态检查出错: {str(e)}")
+                    logger.error(f"错误详情: {traceback.format_exc()}")
+                    return {
+                        "status": "error",
+                        "error": str(e),
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                    }
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "error": str(e),
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                 }
         
         @self.app.get("/mcp")
@@ -269,7 +367,7 @@ class DorisMCPSseServer:
                 # 尝试获取NL2SQL状态
                 try:
                     # 获取MCP实例
-                    mcp = self.app.state.mcp if hasattr(self.app.state, 'mcp') else self.mcp_server
+                    mcp = self.app.state.mcp_server
                     
                     # 尝试找到get_nl2sql_status工具并调用
                     nl2sql_status_tool = None
@@ -436,36 +534,41 @@ class DorisMCPSseServer:
 
     async def mcp_message(self, request: Request):
         """接收客户端消息的端点"""
-        # 从URL参数中获取会话ID
-        session_id = request.query_params.get("session_id")
-        if not session_id or session_id not in self.client_sessions:
-            return JSONResponse(
-                {"status": "error", "message": "无效的会话ID"}, 
-                status_code=403,
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Credentials": "true",
-                    "Access-Control-Allow-Methods": "*",
-                    "Access-Control-Allow-Headers": "*",
-                    "Access-Control-Expose-Headers": "*"
-                }
-            )
-        
-        # 更新会话活动时间
-        self.client_sessions[session_id]["last_active"] = time.time()
-        
-        # 获取请求体
         try:
-            body = await request.json()
-            logger.info(f"接收到消息 [会话ID: {session_id}]: {json.dumps(body)}")
+            # 解析请求参数
+            session_id = self._get_session_id(request)
             
-            # 处理消息
-            message_id = body.get("id", str(uuid.uuid4()))
+            # 检查会话是否存在
+            if not session_id or session_id not in self.client_sessions:
+                logger.warning(f"会话不存在: {session_id}")
+                return JSONResponse(
+                    {"jsonrpc": "2.0", "error": {"code": -32000, "message": "会话不存在或已过期"}},
+                    status_code=401
+                )
             
-            # 特殊处理JSON-RPC格式的命令
-            method = body.get("method")
-            if method:
-                # 处理特殊命令
+            # 更新会话最后活动时间
+            self.client_sessions[session_id]["last_active"] = time.time()
+            
+            # 获取请求体
+            try:
+                body = await request.json()
+                logger.info(f"接收到消息 [会话ID: {session_id}]: {json.dumps(body)}")
+                
+                # 处理消息
+                message_id = body.get("id", str(uuid.uuid4()))
+                
+                # 处理JSON-RPC 2.0格式的命令
+                if "jsonrpc" not in body or body.get("jsonrpc") != "2.0" or "method" not in body:
+                    return JSONResponse(
+                        {"jsonrpc": "2.0", "id": message_id, "error": {"code": -32600, "message": "无效的请求，需要是JSON-RPC 2.0格式"}},
+                        status_code=400
+                    )
+                
+                # 获取方法和参数
+                method = body.get("method")
+                params = body.get("params", {})
+                
+                # 特殊处理JSON-RPC格式的命令
                 if method == "initialize":
                     # 初始化请求
                     logger.info(f"处理initialize命令 [会话ID: {session_id}]")
@@ -475,9 +578,9 @@ class DorisMCPSseServer:
                         "result": {
                             "protocolVersion": "2024-11-05",
                             "name": self.mcp_server.name,
-                            "instructions": "这是一个用于Apache Doris数据库的MCP服务器，提供NL2SQL查询功能",
+                            "instructions": "这是一个用于Apache Doris数据库的MCP服务器",
                             "serverInfo": {
-                                "version": "1.0.0",
+                                "version": "0.1.0",
                                 "name": "Doris MCP Server"
                             },
                             "capabilities": {
@@ -496,7 +599,7 @@ class DorisMCPSseServer:
                     }
                     await self.client_sessions[session_id]["queue"].put(response)
                     return JSONResponse(
-                        {"status": "success"},
+                        {"status": "success"}, 
                         headers={
                             "Access-Control-Allow-Origin": "*",
                             "Access-Control-Allow-Credentials": "true",
@@ -505,25 +608,7 @@ class DorisMCPSseServer:
                             "Access-Control-Expose-Headers": "*"
                         }
                     )
-                elif method == "notifications/initialized":
-                    # 初始化完成通知
-                    logger.info(f"处理initialized通知 [会话ID: {session_id}]")
-                    response = {
-                        "jsonrpc": "2.0",
-                        "method": "notifications/initialized",
-                        "params": {}
-                    }
-                    await self.client_sessions[session_id]["queue"].put(response)
-                    return JSONResponse(
-                        {"status": "success"},
-                        headers={
-                            "Access-Control-Allow-Origin": "*",
-                            "Access-Control-Allow-Credentials": "true",
-                            "Access-Control-Allow-Methods": "*",
-                            "Access-Control-Allow-Headers": "*",
-                            "Access-Control-Expose-Headers": "*"
-                        }
-                    )
+                
                 elif method == "mcp/listOfferings":
                     # 列出所有可用功能
                     logger.info(f"处理listOfferings命令 [会话ID: {session_id}]")
@@ -551,6 +636,7 @@ class DorisMCPSseServer:
                     prompts = await self.mcp_server.list_prompts()
                     prompts_json = [prompt.model_dump() if hasattr(prompt, "model_dump") else prompt for prompt in prompts]
                     
+                    # 构建响应
                     response = {
                         "jsonrpc": "2.0",
                         "id": message_id,
@@ -571,6 +657,7 @@ class DorisMCPSseServer:
                             "Access-Control-Expose-Headers": "*"
                         }
                     )
+                
                 elif method == "mcp/listTools" or method == "tools/list":
                     # 列出所有工具
                     logger.info(f"处理listTools命令 [会话ID: {session_id}]")
@@ -605,6 +692,7 @@ class DorisMCPSseServer:
                             "Access-Control-Expose-Headers": "*"
                         }
                     )
+                
                 elif method == "mcp/listResources":
                     # 列出所有资源
                     logger.info(f"处理listResources命令 [会话ID: {session_id}]")
@@ -628,9 +716,9 @@ class DorisMCPSseServer:
                             "Access-Control-Expose-Headers": "*"
                         }
                     )
-                elif method == "mcp/callTool":
+                
+                elif method == "mcp/callTool" or method == "tools/call":
                     # 调用工具 - 特殊处理
-                    params = body.get("params", {})
                     tool_name = params.get("name")
                     arguments = params.get("arguments", {})
                     
@@ -657,7 +745,7 @@ class DorisMCPSseServer:
                         )
                     
                     # 获取MCP实例
-                    mcp = request.app.state.mcp
+                    mcp = request.app.state.mcp_server
                     
                     # 检查是否为流式工具调用
                     stream_mode = "stream" in request.query_params or params.get("stream", False)
@@ -703,10 +791,13 @@ class DorisMCPSseServer:
                             kwargs['callback'] = callback
                             
                             # 执行工具调用
-                            func = tool_instance.func if hasattr(tool_instance, 'func') else tool_instance
+                            # 修复: 不直接调用工具对象，而是创建异步任务调用call_tool方法
+                            # func = tool_instance.func if hasattr(tool_instance, 'func') else tool_instance
                             
                             # 启动异步任务执行流式工具
-                            asyncio.create_task(self._execute_stream_tool(func, kwargs, message_id, session_id))
+                            # asyncio.create_task(self._execute_stream_tool(func, kwargs, message_id, session_id))
+                            # 修改为使用call_tool方法
+                            asyncio.create_task(self._execute_stream_tool_wrapper(tool_name, kwargs, message_id, session_id, request))
                             
                             # 返回接收确认
                             return JSONResponse(
@@ -775,18 +866,23 @@ class DorisMCPSseServer:
                                 )
                             
                             # 执行工具调用
-                            func = tool_instance.func if hasattr(tool_instance, 'func') else tool_instance
-                            result = await func(**arguments)
+                            # 修复: 不直接调用工具对象，而是调用自定义的call_tool方法
+                            result = await self.call_tool(tool_name, arguments, request)
                             
                             # 特殊格式化结果
-                            formatted_result = {
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, indent=2)
-                                    }
-                                ]
-                            }
+                            # 如果结果已经是符合格式的，就直接使用
+                            if isinstance(result, dict) and "content" in result and isinstance(result["content"], list):
+                                formatted_result = result
+                            else:
+                                # 否则，格式化为标准格式
+                                formatted_result = {
+                                    "content": [
+                                        {
+                                            "type": "json", 
+                                            "text": result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+                                        }
+                                    ]
+                                }
                             
                             # 构建响应
                             response = {
@@ -794,9 +890,13 @@ class DorisMCPSseServer:
                                 "id": message_id,
                                 "result": formatted_result
                             }
+                            
+                            # 将响应放入队列
                             await self.client_sessions[session_id]["queue"].put(response)
+                            
+                            # 返回接收确认
                             return JSONResponse(
-                                {"status": "success"},
+                                {"status": "success"}, 
                                 headers={
                                     "Access-Control-Allow-Origin": "*",
                                     "Access-Control-Allow-Credentials": "true",
@@ -806,16 +906,43 @@ class DorisMCPSseServer:
                                 }
                             )
                         except Exception as e:
-                            logger.error(f"工具调用错误 [会话ID: {session_id}, 工具: {tool_name}]: {str(e)}")
-                            error_response = {
-                                "jsonrpc": "2.0",
-                                "id": message_id,
-                                "error": {
-                                    "code": -32000,
-                                    "message": str(e)
+                            logger.error(f"工具调用错误: {str(e)}", exc_info=True)
+                            
+                            # 构建错误响应
+                            if str(e).startswith('{"code":'):
+                                # 如果是JSON格式的错误，直接使用
+                                try:
+                                    error_obj = json.loads(str(e))
+                                    error_response = {
+                                        "jsonrpc": "2.0",
+                                        "id": message_id,
+                                        "error": error_obj
+                                    }
+                                except:
+                                    # 如果解析失败，使用标准格式
+                                    error_response = {
+                                        "jsonrpc": "2.0",
+                                        "id": message_id,
+                                        "error": {
+                                            "code": -32000,
+                                            "message": str(e)
+                                        }
+                                    }
+                            else:
+                                # 普通错误字符串
+                                error_response = {
+                                    "jsonrpc": "2.0",
+                                    "id": message_id,
+                                    "error": {
+                                        "code": -32000,
+                                        "message": str(e)
+                                    }
                                 }
-                            }
+                            
+                            # 将错误响应放入队列
                             await self.client_sessions[session_id]["queue"].put(error_response)
+                            
+                            # 返回错误状态
                             return JSONResponse(
                                 {"status": "error", "message": str(e)},
                                 status_code=500,
@@ -827,169 +954,33 @@ class DorisMCPSseServer:
                                     "Access-Control-Expose-Headers": "*"
                                 }
                             )
-            
-            # 继续处理普通工具调用或者其他消息类型
-            # 获取MCP实例
-            mcp = request.app.state.mcp
-
-            # 检查是否为流式工具调用
-            stream_mode = "stream" in request.query_params or body.get("stream", False)
-
-            # 获取工具名称
-            tool_name = None
-            if "tool" in body:
-                tool_name = body.get("tool")
-            elif "method" in body and not method:  # 如果上面已经处理过method，则跳过
-                # 可能是直接使用方法名作为工具名
-                tool_name = body.get("method")
-            
-            # 获取参数
-            arguments = {}
-            if "arguments" in body:
-                arguments = body.get("arguments", {})
-            elif "params" in body:
-                params = body.get("params", {})
-                if isinstance(params, dict) and "arguments" in params:
-                    arguments = params.get("arguments", {})
-                else:
-                    arguments = params
-            
-            logger.info(f"工具调用 [会话ID: {session_id}, 工具: {tool_name}, 参数: {arguments}, 流模式: {stream_mode}]")
-            
-            if tool_name and stream_mode:
-                # 流式工具调用
-                logger.info(f"使用流式响应处理工具调用 [会话ID: {session_id}, 工具: {tool_name}]")
-                
-                try:
-                    # 查找工具
-                    tool_instance = None
-                    for tool in await mcp.list_tools():
-                        if getattr(tool, 'name', '') == tool_name:
-                            tool_instance = tool
-                            break
-                    
-                    if not tool_instance:
-                        raise Exception(f"工具 {tool_name} 不存在")
-                    
-                    # 定义回调函数
-                    async def callback(content, metadata):
-                        # 发送部分结果
-                        partial_message = {
-                            "jsonrpc": "2.0",
-                            "id": message_id,
-                            "partial": True,
-                            "result": {
-                                "content": content,
-                                "metadata": metadata
-                            }
-                        }
-                        # 将消息放入队列
-                        await self.client_sessions[session_id]["queue"].put(partial_message)
-                        
-                        # 如果包含可视化数据，则广播到所有客户端
-                        if metadata and "visualization" in metadata:
-                            await self.broadcast_visualization_data(metadata["visualization"])
-                    
-                    # 构建参数字典
-                    kwargs = dict(arguments)
-                    kwargs['callback'] = callback
-                    
-                    # 执行工具调用
-                    func = tool_instance.func if hasattr(tool_instance, 'func') else tool_instance
-                    
-                    # 启动异步任务执行流式工具
-                    asyncio.create_task(self._execute_stream_tool(func, kwargs, message_id, session_id))
-                    
-                    # 返回接收确认
-                    return JSONResponse(
-                        {"status": "processing"}, 
-                        headers={
-                            "Access-Control-Allow-Origin": "*",
-                            "Access-Control-Allow-Credentials": "true",
-                            "Access-Control-Allow-Methods": "*",
-                            "Access-Control-Allow-Headers": "*",
-                            "Access-Control-Expose-Headers": "*"
-                        }
-                    )
-                except Exception as e:
-                    logger.error(f"流式工具处理错误: {str(e)}")
-                    error_message = {
-                        "jsonrpc": "2.0",
-                        "id": message_id,
-                        "success": False,
-                        "error": str(e)
-                    }
-                    # 将错误消息放入队列
-                    await self.client_sessions[session_id]["queue"].put(error_message)
-                    return JSONResponse(
-                        {"status": "error", "message": str(e)}, 
-                        status_code=500,
-                        headers={
-                            "Access-Control-Allow-Origin": "*",
-                            "Access-Control-Allow-Credentials": "true",
-                            "Access-Control-Allow-Methods": "*",
-                            "Access-Control-Allow-Headers": "*",
-                            "Access-Control-Expose-Headers": "*"
-                        }
-                    )
-            else:
-                # 非流式工具调用或其他消息
-                if tool_name:
-                    # 非流式工具调用
-                    logger.info(f"使用标准响应处理工具调用 [会话ID: {session_id}, 工具: {tool_name}]")
-                    
-                    try:
-                        # 查找工具
-                        tool_instance = None
-                        for tool in await mcp.list_tools():
-                            if getattr(tool, 'name', '') == tool_name:
-                                tool_instance = tool
-                                break
-                        
-                        if not tool_instance:
-                            raise Exception(f"工具 {tool_name} 不存在")
-                        
-                        # 执行工具调用
-                        func = tool_instance.func if hasattr(tool_instance, 'func') else tool_instance
-                        result = await func(**arguments)
-                        
-                        # 构建响应
-                        response = {
-                            "jsonrpc": "2.0",
-                            "id": message_id,
-                            "success": True,
-                            "result": result
-                        }
-                    except Exception as e:
-                        logger.error(f"工具调用错误 [会话ID: {session_id}, 工具: {tool_name}]: {str(e)}")
-                        response = {
-                            "jsonrpc": "2.0",
-                            "id": message_id,
-                            "success": False,
-                            "error": str(e)
-                        }
                 else:
                     # 其他类型的消息，直接转发给MCP处理
                     logger.info(f"处理一般消息 [会话ID: {session_id}]")
                     
                     try:
                         # 处理消息
-                        result = await mcp.process_message(body)
+                        # FastMCP对象没有process_message方法，改为直接构造响应
+                        # result = await mcp.process_message(body)
                         
                         # 构建响应
                         response = {
                             "jsonrpc": "2.0",
                             "id": message_id,
-                            "success": True,
-                            "result": result
+                            "result": {
+                                "status": "ok",
+                                "message": "消息已接收，但无法处理未识别的消息类型"
+                            }
                         }
                     except Exception as e:
                         logger.error(f"处理消息错误 [会话ID: {session_id}]: {str(e)}")
                         response = {
                             "jsonrpc": "2.0",
                             "id": message_id,
-                            "success": False,
-                            "error": str(e)
+                            "error": {
+                                "code": -32000,
+                                "message": f"消息处理错误: {str(e)}"
+                            }
                         }
 
                 # 将响应放入队列
@@ -1007,21 +998,41 @@ class DorisMCPSseServer:
                         "Access-Control-Expose-Headers": "*"
                     }
                 )
-        except Exception as e:
-            logger.error(f"处理消息错误: {str(e)}")
-            # 发送错误响应
-            error_response = {
-                "jsonrpc": "2.0",
-                "id": message_id if 'message_id' in locals() else str(uuid.uuid4()),
-                "error": {
-                    "code": -32000,
-                    "message": str(e)
+            except Exception as e:
+                logger.error(f"处理消息错误: {str(e)}")
+                # 发送错误响应
+                error_response = {
+                    "jsonrpc": "2.0",
+                    "id": message_id if 'message_id' in locals() else str(uuid.uuid4()),
+                    "error": {
+                        "code": -32000,
+                        "message": str(e)
+                    }
                 }
-            }
-            
-            await self.client_sessions[session_id]["queue"].put(error_response)
+                
+                await self.client_sessions[session_id]["queue"].put(error_response)
+                return JSONResponse(
+                    {"status": "error", "message": str(e)}, 
+                    status_code=500,
+                    headers={
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Credentials": "true",
+                        "Access-Control-Allow-Methods": "*",
+                        "Access-Control-Allow-Headers": "*",
+                        "Access-Control-Expose-Headers": "*"
+                    }
+                )
+        except Exception as e:
+            logger.error(f"处理请求出错: {str(e)}", exc_info=True)
             return JSONResponse(
-                {"status": "error", "message": str(e)}, 
+                {
+                    "jsonrpc": "2.0",
+                    "id": "unknown",
+                    "error": {
+                        "code": -32000,
+                        "message": f"处理请求出错: {str(e)}"
+                    }
+                },
                 status_code=500,
                 headers={
                     "Access-Control-Allow-Origin": "*",
@@ -1032,18 +1043,19 @@ class DorisMCPSseServer:
                 }
             )
 
-    async def _execute_stream_tool(self, func, kwargs, message_id, session_id):
-        """执行流式工具并将结果放入会话消息队列
+    async def _execute_stream_tool_wrapper(self, tool_name, kwargs, message_id, session_id, request):
+        """包装流式工具调用
         
         Args:
-            func: 要执行的函数
+            tool_name: 工具名称
             kwargs: 函数参数
             message_id: 消息ID
             session_id: 会话ID
+            request: 请求对象
         """
         try:
-            # 执行工具调用
-            result = await func(**kwargs)
+            # 通过调用标准工具方法执行
+            result = await self.call_tool(tool_name, kwargs, request)
             
             # 发送完成消息
             final_message = {
@@ -1094,4 +1106,312 @@ class DorisMCPSseServer:
             }
         }
         await self.broadcast_message(message)
+
+    async def call_tool(self, tool_name, arguments, request):
+        """
+        调用指定的工具并返回结果
+        
+        Args:
+            tool_name: 工具名称
+            arguments: 工具参数
+            request: 原始请求对象
+        
+        Returns:
+            工具调用结果
+        """
+        logger.info(f"调用工具: {tool_name}, 参数: {json.dumps(arguments, ensure_ascii=False)}")
+        
+        # 从请求中提取最近的消息内容
+        recent_query = self._extract_recent_query(request)
+        
+        # 处理工具名称映射 - 添加对标准名称工具的支持
+        tool_mapping = {
+            # 标准名称到Doris MCP名称的映射
+            "nl2sql_query": "mcp_doris_nl2sql_query",
+            "nl2sql_query_stream": "mcp_doris_nl2sql_query_stream",
+            "list_database_tables": "mcp_doris_list_database_tables",
+            "explain_table": "mcp_doris_explain_table",
+            "get_business_overview": "mcp_doris_get_business_overview",
+            "get_nl2sql_status": "mcp_doris_get_nl2sql_status",
+            "refresh_metadata": "mcp_doris_refresh_metadata",
+            "sql_optimize": "mcp_doris_sql_optimize",
+            "fix_sql": "mcp_doris_fix_sql"
+        }
+        
+        # 如果是标准名称，转换为MCP名称
+        mapped_tool_name = tool_mapping.get(tool_name, tool_name)
+        
+        # 处理不同的工具调用
+        if mapped_tool_name.startswith("mcp_doris_"):
+            # 调用Doris相关工具
+            from nl2sql_service import NL2SQLService
+            
+            nl2sql = NL2SQLService()
+            tool_method = getattr(nl2sql, mapped_tool_name, None)
+            
+            if not tool_method:
+                raise ValueError(f"未找到工具方法: {mapped_tool_name}")
+            
+            # 处理查询相关的工具调用
+            if mapped_tool_name in ["mcp_doris_nl2sql_query", "mcp_doris_nl2sql_query_stream"]:
+                # 支持query或random_string参数
+                query = None
+                if "query" in arguments and arguments.get("query"):
+                    query = arguments.get("query", "")
+                elif "random_string" in arguments:
+                    # Claude可能会使用随机字符串作为占位符
+                    logger.info("检测到random_string参数，使用作为查询内容")
+                    query = arguments.get("random_string") or recent_query or "显示所有表的数据量"
+                
+                if not query:
+                    raise ValueError("查询参数不能为空")
+                
+                logger.info(f"执行NL2SQL查询: {query}")
+                return await tool_method(query)
+            
+            # 处理表解释工具
+            elif mapped_tool_name == "mcp_doris_explain_table":
+                # 支持table_name或random_string参数
+                table_name = None
+                if "table_name" in arguments and arguments.get("table_name"):
+                    table_name = arguments.get("table_name", "")
+                elif "random_string" in arguments:
+                    # 将random_string作为表名
+                    random_string = arguments.get("random_string", "")
+                    if random_string:
+                        logger.info(f"检测到random_string参数，将其作为表名: {random_string}")
+                        table_name = random_string
+                    else:
+                        # 尝试从最近的查询中提取表名
+                        logger.info("random_string为空，尝试从最近的查询中提取表名")
+                        # 简单的表名提取逻辑，实际应用中可能需要更复杂的逻辑
+                        import re
+                        if recent_query:
+                            table_matches = re.findall(r'表\s*[\'"]?([a-zA-Z0-9_]+)[\'"]?', recent_query)
+                            if table_matches:
+                                table_name = table_matches[0]
+                            else:
+                                # 如果没有找到明确的表名引用，使用默认表
+                                table_name = "lineitem"
+                        else:
+                            table_name = "lineitem"  # 默认表名
+                    
+                if not table_name:
+                    raise ValueError("表名参数不能为空")
+                
+                logger.info(f"解释表结构: {table_name}")
+                return await tool_method(table_name)
+            
+            # 处理SQL优化工具
+            elif mapped_tool_name == "mcp_doris_sql_optimize":
+                sql = None
+                if "sql" in arguments and arguments.get("sql"):
+                    sql = arguments.get("sql", "")
+                elif "random_string" in arguments:
+                    # 将random_string作为SQL内容
+                    random_string = arguments.get("random_string", "")
+                    if random_string:
+                        logger.info(f"检测到random_string参数，将其作为SQL: {random_string}")
+                        sql = random_string
+                    else:
+                        # 尝试从最近的查询中提取SQL
+                        logger.info("random_string为空，尝试从最近的查询中提取SQL")
+                        # 提取SQL语句的逻辑
+                        import re
+                        if recent_query:
+                            sql_matches = re.findall(r'```sql\s*([\s\S]+?)\s*```', recent_query)
+                            if sql_matches:
+                                sql = sql_matches[0].strip()
+                            else:
+                                # 如果找不到SQL代码块，尝试直接使用查询
+                                sql = recent_query
+                    
+                if not sql:
+                    raise ValueError("SQL参数不能为空")
+                
+                logger.info(f"优化SQL: {sql[:100]}...")
+                return await tool_method(sql)
+            
+            # 处理SQL修复工具
+            elif mapped_tool_name == "mcp_doris_fix_sql":
+                sql = None
+                error_message = ""
+                
+                if "sql" in arguments and arguments.get("sql"):
+                    sql = arguments.get("sql", "")
+                    error_message = arguments.get("error_message", "")
+                elif "random_string" in arguments:
+                    # 将random_string作为SQL内容
+                    random_string = arguments.get("random_string", "")
+                    if random_string:
+                        logger.info(f"检测到random_string参数，将其作为SQL: {random_string}")
+                        sql = random_string
+                    else:
+                        # 尝试从最近的查询中提取SQL
+                        logger.info("random_string为空，尝试从最近的查询中提取SQL")
+                        if recent_query:
+                            sql = recent_query
+                
+                if not sql:
+                    raise ValueError("SQL参数不能为空")
+                
+                logger.info(f"修复SQL: {sql[:100]}...")
+                return await tool_method(sql, error_message)
+            
+            # 处理无参数工具
+            else:
+                logger.info(f"调用无参数工具: {mapped_tool_name}")
+                return await tool_method()
+        
+        # 处理其他标准工具调用
+        elif tool_name in tool_mapping.keys():
+            # 这种情况是冗余的，因为上面已经处理了映射，但为了安全起见保留此代码
+            mapped_tool_name = tool_mapping[tool_name]
+            logger.info(f"映射工具名称: {tool_name} -> {mapped_tool_name}")
+            return await self.call_tool(mapped_tool_name, arguments, request)
+        
+        # 使用一般的FastMCP工具处理
+        else:
+            try:
+                # 获取MCP实例
+                mcp = self.app.state.mcp_server
+                
+                # 查找工具
+                tool_instance = None
+                for tool in await mcp.list_tools():
+                    if getattr(tool, 'name', '') == tool_name:
+                        tool_instance = tool
+                        break
+                
+                if not tool_instance:
+                    raise ValueError(f"未找到工具: {tool_name}")
+                
+                # 执行工具调用
+                func = tool_instance.func if hasattr(tool_instance, 'func') else None
+                if func:
+                    return await func(**arguments)
+                
+                # 如果没有func属性，尝试直接调用
+                if callable(tool_instance):
+                    return await tool_instance(**arguments)
+                
+                # 如果都不行，则抛出错误
+                raise ValueError(f"不支持的工具: {tool_name}")
+            except Exception as e:
+                logger.error(f"一般工具调用错误: {str(e)}")
+                raise ValueError(f"工具调用错误: {str(e)}")
+    
+    def _extract_recent_query(self, request: Request) -> Optional[str]:
+        """
+        从请求中提取最近的用户查询
+        
+        Args:
+            request: 请求对象
+            
+        Returns:
+            Optional[str]: 最近的用户查询，如果没有找到则返回None
+        """
+        try:
+            # 尝试从请求体中提取消息历史
+            body = None
+            body_bytes = getattr(request, "_body", None)
+            if body_bytes:
+                try:
+                    body = json.loads(body_bytes)
+                except:
+                    pass
+            
+            if not body:
+                body = getattr(request, "_json", {})
+            
+            # 从消息历史中查找最近的用户消息
+            messages = body.get("params", {}).get("messages", [])
+            if messages:
+                # 反向遍历消息，查找最近的用户消息
+                for msg in reversed(messages):
+                    if msg.get("role") == "user":
+                        return msg.get("content", "")
+            
+            # 如果没有在消息历史中找到，尝试从原始消息中提取
+            message = body.get("params", {}).get("message", {})
+            if message and message.get("role") == "user":
+                return message.get("content", "")
+            
+            return None
+        except Exception as e:
+            logger.error(f"提取最近查询时出错: {str(e)}")
+            return None
+
+    def format_tool_result(self, result):
+        """
+        格式化工具调用结果为统一格式
+        
+        Args:
+            result: 工具调用原始结果
+        
+        Returns:
+            格式化后的结果
+        """
+        try:
+            # 如果结果已经是字典格式，直接返回
+            if isinstance(result, dict):
+                return result
+            
+            # 如果是字符串，尝试解析为JSON
+            if isinstance(result, str):
+                try:
+                    return json.loads(result)
+                except json.JSONDecodeError:
+                    # 纯文本结果
+                    return {"content": result}
+            
+            # 如果是其他类型，转换为字符串
+            return {"content": str(result)}
+        
+        except Exception as e:
+            logger.error(f"格式化工具结果时出错: {str(e)}")
+            return {"error": str(e)}
+
+    def _get_session_id(self, request: Request) -> str:
+        """
+        从请求中获取会话ID
+        
+        尝试从以下位置获取会话ID（按优先级排序）：
+        1. 查询参数session_id
+        2. 请求体中的session_id字段
+        3. 请求头中的X-Session-ID
+        
+        Args:
+            request: 请求对象
+            
+        Returns:
+            str: 会话ID，如果未找到则返回None
+        """
+        # 从查询参数中获取
+        session_id = request.query_params.get("session_id")
+        if session_id:
+            return session_id
+            
+        # 尝试从请求体中获取
+        try:
+            body = getattr(request, "_json", None)
+            if not body:
+                body_bytes = getattr(request, "_body", None)
+                if body_bytes:
+                    try:
+                        body = json.loads(body_bytes)
+                    except:
+                        pass
+            
+            if body and isinstance(body, dict) and "session_id" in body:
+                return body["session_id"]
+        except:
+            pass
+            
+        # 从请求头中获取
+        session_id = request.headers.get("X-Session-ID")
+        if session_id:
+            return session_id
+            
+        return None
 

@@ -169,3 +169,52 @@ def get_database_schema():
                 schema[db][table] = str(e)
     
     return schema 
+
+def test_connection(db_name: Optional[str] = None) -> Dict[str, Any]:
+    """
+    测试数据库连接
+    
+    Args:
+        db_name: 指定要连接的数据库名称,如果为None则使用默认配置
+    
+    Returns:
+        Dict[str, Any]: 连接测试结果
+    """
+    import time
+    
+    start_time = time.time()
+    try:
+        # 获取数据库连接
+        conn = get_db_connection(db_name)
+        
+        # 执行简单的测试查询
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1 AS result")
+            result = cursor.fetchone()
+        
+        conn.close()
+        
+        # 计算响应时间
+        response_time = time.time() - start_time
+        
+        return {
+            "status": "success",
+            "response_time_ms": round(response_time * 1000, 2),
+            "database": db_name or get_db_name(),
+            "host": DB_CONFIG["host"],
+            "port": DB_CONFIG["port"],
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+    except Exception as e:
+        # 计算响应时间
+        response_time = time.time() - start_time
+        
+        return {
+            "status": "error",
+            "error": str(e),
+            "response_time_ms": round(response_time * 1000, 2),
+            "database": db_name or get_db_name(),
+            "host": DB_CONFIG["host"],
+            "port": DB_CONFIG["port"],
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        } 

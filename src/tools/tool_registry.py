@@ -18,6 +18,52 @@ from typing import Dict, Any, Callable, List, Optional, Tuple, Union
 # 获取日志记录器
 logger = logging.getLogger(__name__)
 
+# 添加Tool类定义
+class Tool:
+    """Tool类，用于封装工具函数和元数据"""
+    
+    def __init__(self, name: str, func: Callable, description: str = ""):
+        """初始化工具
+        
+        Args:
+            name: 工具名称
+            func: 工具函数
+            description: 工具描述
+        """
+        self.name = name
+        self.func = func
+        self.description = description
+        self._signature = inspect.signature(func)
+        
+    def __call__(self, *args, **kwargs):
+        """使Tool对象可调用，直接调用内部函数"""
+        return self.func(*args, **kwargs)
+    
+    @property
+    def parameters(self):
+        """获取参数信息"""
+        return {
+            "type": "object",
+            "properties": {
+                param_name: {"type": "string"}
+                for param_name in self._signature.parameters
+                if param_name != "self"
+            },
+            "required": [
+                param_name
+                for param_name, param in self._signature.parameters.items()
+                if param_name != "self" and param.default == inspect.Parameter.empty
+            ]
+        }
+        
+    def to_dict(self):
+        """将工具转换为字典表示"""
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters
+        }
+
 class ToolRegistry:
     """工具注册中心，用于集中管理和发现所有MCP工具"""
     
@@ -35,8 +81,8 @@ class ToolRegistry:
         if self._initialized:
             return
             
-        # 工具字典 {name: (function, description)}
-        self._tools: Dict[str, Tuple[Callable, str]] = {}
+        # 工具字典 {name: Tool实例}
+        self._tools: Dict[str, Tool] = {}
         # 已扫描的模块
         self._scanned_modules = set()
         self._initialized = True
@@ -54,7 +100,9 @@ class ToolRegistry:
         if name in self._tools:
             logger.warning(f"工具 {name} 已存在，将被覆盖")
         
-        self._tools[name] = (func, description)
+        # 创建Tool实例
+        tool = Tool(name, func, description)
+        self._tools[name] = tool
         logger.info(f"注册工具: {name} - {description}")
     
     def register_with_decorator(self, name: str = None, description: str = "") -> Callable:
@@ -104,15 +152,16 @@ class ToolRegistry:
             工具函数，如果不存在返回None
         """
         if name in self._tools:
-            return self._tools[name][0]
+            # 直接返回Tool对象，它是可调用的
+            return self._tools[name]
         return None
     
-    def get_all(self) -> Dict[str, Tuple[Callable, str]]:
+    def get_all(self) -> Dict[str, Tool]:
         """
         获取所有工具
         
         Returns:
-            所有工具的字典 {name: (function, description)}
+            所有工具的字典 {name: Tool实例}
         """
         return self._tools.copy()
     
@@ -126,8 +175,8 @@ class ToolRegistry:
         tools = self.get_all()
         logger.info(f"获取工具列表，当前注册的工具: {list(tools.keys())}")
         return [
-            {"name": name, "description": desc}
-            for name, (_, desc) in tools.items()
+            {"name": name, "description": tool.description}
+            for name, tool in tools.items()
         ]
     
     def scan_module(self, module_name: str) -> None:
@@ -200,45 +249,31 @@ class ToolRegistry:
                     # 扫描模块
                     self.scan_module(module_name)
                 
-                # 如果是目录且包含__init__.py
-                elif os.path.isdir(full_path) and os.path.exists(os.path.join(full_path, '__init__.py')):
-                    # 构建包名
-                    if package_prefix:
-                        sub_package = f"{package_prefix}.{item}"
-                    else:
-                        sub_package = item
-                    
-                    # 扫描模块
-                    self.scan_module(sub_package)
+                # 如果是目录且不是特殊目录
+                elif os.path.isdir(full_path) and item not in ['__pycache__', '.git', '.venv', 'venv']:
+                    # 构建新的包前缀
+                    new_prefix = f"{package_prefix}.{item}" if package_prefix else item
                     
                     # 递归扫描子目录
-                    self.scan_directory(full_path, sub_package)
-            
-            logger.info(f"扫描目录 {directory} 完成")
-            
+                    self.scan_directory(full_path, new_prefix)
+        
         except Exception as e:
             logger.error(f"扫描目录 {directory} 失败: {str(e)}")
     
     def clear(self) -> None:
-        """清空所有工具"""
+        """清空注册的工具"""
         self._tools.clear()
         self._scanned_modules.clear()
-        logger.info("清空所有工具")
-
-# 创建全局工具注册中心实例
-_registry_instance = None
+        logger.info("工具注册表已清空")
 
 def get_registry() -> ToolRegistry:
     """
     获取工具注册中心实例
     
     Returns:
-        工具注册中心实例
+        ToolRegistry: 工具注册中心实例
     """
-    global _registry_instance
-    if _registry_instance is None:
-        _registry_instance = ToolRegistry()
-    return _registry_instance
+    return ToolRegistry()
 
 def register_tool(name: str = None, description: str = "") -> Callable:
     """
@@ -265,12 +300,12 @@ def get_tool(name: str) -> Optional[Callable]:
     """
     return get_registry().get(name)
 
-def get_all_tools() -> Dict[str, Tuple[Callable, str]]:
+def get_all_tools() -> Dict[str, Tool]:
     """
     获取所有工具
     
     Returns:
-        所有工具的字典 {name: (function, description)}
+        所有工具的字典 {name: Tool实例}
     """
     return get_registry().get_all()
 
@@ -285,8 +320,8 @@ def get_tool_list() -> List[Dict[str, str]]:
     tools = registry.get_all()
     logger.info(f"获取工具列表，当前注册的工具: {list(tools.keys())}")
     return [
-        {"name": name, "description": desc}
-        for name, (_, desc) in tools.items()
+        {"name": name, "description": tool.description}
+        for name, tool in tools.items()
     ]
 
 def auto_discover() -> None:

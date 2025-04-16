@@ -17,8 +17,8 @@ import traceback
 # 导入工具注册中心
 from src.tools.tool_registry import get_registry, register_tool
 
-# 导入NL2SQLService
-from src.nl2sql_service import NL2SQLService
+# 导入Context
+from mcp.server.fastmcp import Context
 
 # 获取日志记录器
 logger = logging.getLogger("doris-mcp.tool-init")
@@ -35,13 +35,14 @@ def register_mcp_tools(mcp):
     try:
         registry = get_registry()
         
-        # 初始化NL2SQL服务
-        nl2sql_service = NL2SQLService()
-        
         # 注册NL2SQL相关工具
         @mcp.tool("nl2sql_query", description="将自然语言查询转换为SQL并执行返回结果")
-        async def nl2sql_query(query: str):
+        async def nl2sql_query(ctx: Context) -> Dict[str, Any]:
             """将自然语言查询转换为SQL并执行返回结果"""
+            # 从Context中获取NL2SQL服务和查询参数
+            query = ctx.params.get("query", "")
+            nl2sql_service = ctx.request_context.lifespan_context.nl2sql_service
+            
             logger.info(f"执行NL2SQL查询: {query}")
             try:
                 # 记录开始处理请求
@@ -75,8 +76,34 @@ def register_mcp_tools(mcp):
                 })
                 audit_logger.audit(json.dumps(audit_data))
                 
-                # 返回结果
-                return result
+                # 确保返回结果格式符合FastMCP期望
+                if "success" in result and not result["success"]:
+                    # 如果是错误结果，重新格式化为标准结构
+                    if "message" in result:
+                        error_message = result["message"]
+                        logger.error(f"查询处理失败: {error_message}")
+                        error = {
+                            "code": -32000,
+                            "message": error_message,
+                            "data": {
+                                "query": query,
+                                "type": "query_processing_error"
+                            }
+                        }
+                        raise ValueError(json.dumps(error))
+                
+                # 将结果格式化为客户端期望的格式
+                formatted_result = {
+                    "content": [
+                        {
+                            "text": json.dumps(result),
+                            "type": "json"
+                        }
+                    ]
+                }
+                
+                # 返回格式化后的结果
+                return formatted_result
             except Exception as e:
                 # 记录错误到审计日志和错误日志
                 error_msg = str(e)
@@ -90,15 +117,27 @@ def register_mcp_tools(mcp):
                     })
                     audit_logger.audit(json.dumps(audit_data))
                 
-                return {
-                    "success": False,
+                # 使用标准JSON-RPC错误格式
+                error = {
+                    "code": -32000,  # 服务器内部错误
                     "message": f"处理查询时出错: {error_msg}",
-                    "query": query
+                    "data": {
+                        "type": "query_processing_error",
+                        "query": query,
+                        "details": error_msg
+                    }
                 }
+                raise ValueError(json.dumps(error))
         
         @mcp.tool("nl2sql_query_stream", description="将自然语言查询转换为SQL并使用流式响应返回结果")
-        async def nl2sql_query_stream(query: str, callback=None):
+        async def nl2sql_query_stream(ctx: Context) -> Dict[str, Any]:
             """将自然语言查询转换为SQL并使用流式响应返回结果"""
+            # 从Context中获取NL2SQL服务和查询参数
+            query = ctx.params.get("query", "")
+            nl2sql_service = ctx.request_context.lifespan_context.nl2sql_service
+            # 获取回调函数
+            callback = ctx.params.get("callback")
+            
             logger.info(f"执行流式NL2SQL查询: {query}")
             try:
                 # 记录开始处理请求
@@ -156,8 +195,34 @@ def register_mcp_tools(mcp):
                 })
                 audit_logger.audit(json.dumps(audit_data))
                 
-                # 返回结果
-                return result
+                # 确保返回结果格式符合FastMCP期望
+                if "success" in result and not result["success"]:
+                    # 如果是错误结果，重新格式化为标准结构
+                    if "message" in result:
+                        error_message = result["message"]
+                        logger.error(f"查询处理失败: {error_message}")
+                        error = {
+                            "code": -32000,
+                            "message": error_message,
+                            "data": {
+                                "query": query,
+                                "type": "query_processing_error"
+                            }
+                        }
+                        raise ValueError(json.dumps(error))
+                
+                # 将结果格式化为客户端期望的格式
+                formatted_result = {
+                    "content": [
+                        {
+                            "text": json.dumps(result),
+                            "type": "json"
+                        }
+                    ]
+                }
+                
+                # 如果是成功结果，返回标准格式
+                return formatted_result
             except Exception as e:
                 # 记录错误到审计日志和错误日志
                 error_msg = str(e)
@@ -178,56 +243,118 @@ def register_mcp_tools(mcp):
                     except:
                         pass
                 
-                return {
-                    "success": False,
+                # 使用标准JSON-RPC错误格式
+                error = {
+                    "code": -32000,  # 服务器内部错误
                     "message": f"处理流式查询时出错: {error_msg}",
-                    "query": query
+                    "data": {
+                        "type": "stream_processing_error",
+                        "query": query,
+                        "details": error_msg
+                    }
                 }
+                raise ValueError(json.dumps(error))
         
         @mcp.tool("list_database_tables", description="列出数据库中的所有表")
-        async def list_database_tables():
+        async def list_database_tables(ctx: Context) -> Dict[str, Any]:
             """列出数据库中的所有表"""
             logger.info("获取数据库表列表")
+            # 从Context中获取NL2SQL服务
+            nl2sql_service = ctx.request_context.lifespan_context.nl2sql_service
+            
             try:
                 result = nl2sql_service.list_tables()
-                return result
+                # 将结果格式化为客户端期望的格式
+                formatted_result = {
+                    "content": [
+                        {
+                            "text": json.dumps(result),
+                            "type": "json"
+                        }
+                    ]
+                }
+                return formatted_result
             except Exception as e:
                 logger.error(f"列出表时出错: {str(e)}")
-                return {
-                    "success": False,
-                    "message": f"列出表时出错: {str(e)}"
+                # 修改错误返回格式，使用标准JSON-RPC错误格式
+                error = {
+                    "code": -32000,  # 服务器内部错误
+                    "message": f"列出表时出错: {str(e)}",
+                    "data": {
+                        "type": "database_tables_error",
+                        "details": str(e)
+                    }
                 }
+                raise ValueError(json.dumps(error))
         
         @mcp.tool("explain_table", description="获取表结构的详细信息")
-        async def explain_table(table_name: str):
+        async def explain_table(ctx: Context) -> Dict[str, Any]:
             """获取表结构的详细信息"""
+            # 从Context中获取NL2SQL服务和表名参数
+            table_name = ctx.params.get("table_name", "")
+            nl2sql_service = ctx.request_context.lifespan_context.nl2sql_service
+            
             logger.info(f"获取表结构: {table_name}")
             try:
                 result = nl2sql_service.explain_table(table_name)
-                return result
+                # 将结果格式化为客户端期望的格式
+                formatted_result = {
+                    "content": [
+                        {
+                            "text": json.dumps(result),
+                            "type": "json"
+                        }
+                    ]
+                }
+                return formatted_result
             except Exception as e:
                 logger.error(f"解释表时出错: {str(e)}")
-                return {
-                    "success": False,
-                    "message": f"解释表时出错: {str(e)}"
+                # 修改错误返回格式，使用标准JSON-RPC错误格式
+                error = {
+                    "code": -32000,  # 服务器内部错误
+                    "message": f"解释表时出错: {str(e)}",
+                    "data": {
+                        "type": "explain_table_error",
+                        "details": str(e),
+                        "table": table_name
+                    }
                 }
+                raise ValueError(json.dumps(error))
         
         @mcp.tool("get_business_overview", description="获取数据库业务领域概览")
-        async def get_business_overview():
+        async def get_business_overview(ctx: Context) -> Dict[str, Any]:
             """获取数据库业务领域概览"""
             logger.info("获取业务领域概览")
+            # 从Context中获取NL2SQL服务
+            nl2sql_service = ctx.request_context.lifespan_context.nl2sql_service
+            
             try:
                 result = nl2sql_service.get_business_overview()
-                return result
+                # 将结果格式化为客户端期望的格式
+                formatted_result = {
+                    "content": [
+                        {
+                            "text": json.dumps(result),
+                            "type": "json"
+                        }
+                    ]
+                }
+                return formatted_result
             except Exception as e:
                 logger.error(f"获取业务概览时出错: {str(e)}")
-                return {
-                    "success": False,
-                    "message": f"获取业务概览时出错: {str(e)}"
+                # 修改错误返回格式，使用标准JSON-RPC错误格式
+                error = {
+                    "code": -32000,  # 服务器内部错误
+                    "message": f"获取业务概览时出错: {str(e)}",
+                    "data": {
+                        "type": "business_overview_error",
+                        "details": str(e)
+                    }
                 }
+                raise ValueError(json.dumps(error))
         
         @mcp.tool("get_nl2sql_status", description="获取当前NL2SQL处理状态")
-        async def get_nl2sql_status():
+        async def get_nl2sql_status(ctx: Context) -> Dict[str, Any]:
             """获取当前NL2SQL处理状态"""
             logger.info("获取NL2SQL处理状态")
             try:
@@ -236,47 +363,95 @@ def register_mcp_tools(mcp):
                     from src.nl2sql_stream_processor import StreamNL2SQLProcessor
                     stream_processor = StreamNL2SQLProcessor()
                     status = stream_processor.get_current_processing_status()
-                    return {
-                        "success": True,
-                        "current_status": status,
-                        "timestamp": datetime.now().isoformat()
+                    formatted_result = {
+                        "content": [
+                            {
+                                "text": json.dumps({
+                                    "success": True,
+                                    "current_status": status,
+                                    "timestamp": datetime.now().isoformat()
+                                }),
+                                "type": "json"
+                            }
+                        ]
                     }
+                    return formatted_result
                 except ImportError:
                     # 如果无法导入流式处理器，返回基本状态
-                    return {
-                        "status": "idle",
-                        "message": "系统准备就绪",
-                        "timestamp": datetime.now().isoformat()
+                    formatted_result = {
+                        "content": [
+                            {
+                                "text": json.dumps({
+                                    "status": "idle",
+                                    "message": "系统准备就绪",
+                                    "timestamp": datetime.now().isoformat()
+                                }),
+                                "type": "json"
+                            }
+                        ]
                     }
+                    return formatted_result
             except Exception as e:
                 logger.error(f"获取处理状态时出错: {str(e)}")
-                return {
-                    "success": False,
+                # 修改错误返回格式，使用标准JSON-RPC错误格式
+                error = {
+                    "code": -32000,  # 服务器内部错误
                     "message": f"获取处理状态时出错: {str(e)}",
-                    "timestamp": datetime.now().isoformat()
+                    "data": {
+                        "type": "status_error",
+                        "details": str(e),
+                        "timestamp": datetime.now().isoformat()
+                    }
                 }
+                raise ValueError(json.dumps(error))
             
         @mcp.tool("refresh_metadata", description="刷新并保存元数据")
-        async def refresh_metadata(force: bool = False):
+        async def refresh_metadata(ctx: Context) -> Dict[str, Any]:
             """刷新并保存元数据"""
+            # 从Context中获取NL2SQL服务和force参数
+            force = ctx.params.get("force", False)
+            nl2sql_service = ctx.request_context.lifespan_context.nl2sql_service
+            
             logger.info(f"刷新元数据 [强制: {force}]")
             try:
-                nl2sql_service._refresh_metadata(force=force)
+                # 注：这里使用了内部方法_refresh_metadata，如果公开了refresh_metadata方法，应该使用公开方法
+                success = nl2sql_service._refresh_metadata(force=force)
                 refresh_type = "全量" if force else "增量"
-                return {
-                    "success": True,
-                    "message": f"{refresh_type}元数据刷新完成"
+                formatted_result = {
+                    "content": [
+                        {
+                            "text": json.dumps({
+                                "success": True,
+                                "message": f"{refresh_type}元数据刷新完成"
+                            }),
+                            "type": "json"
+                        }
+                    ]
                 }
+                return formatted_result
             except Exception as e:
                 logger.error(f"刷新元数据时出错: {str(e)}")
-                return {
-                    "success": False,
-                    "message": f"刷新元数据时出错: {str(e)}"
+                # 修改错误返回格式，使用标准JSON-RPC错误格式
+                error = {
+                    "code": -32000,  # 服务器内部错误
+                    "message": f"刷新元数据时出错: {str(e)}",
+                    "data": {
+                        "type": "refresh_metadata_error",
+                        "details": str(e),
+                        "force": force
+                    }
                 }
+                raise ValueError(json.dumps(error))
+        
+        # 其他工具函数可以类似地修改为使用Context
             
         @mcp.tool("sql_optimize", description="对SQL语句进行优化分析，提供性能改进建议和业务含义解读")
-        async def sql_optimize(sql: str, requirements: str = ""):
+        async def sql_optimize(ctx: Context) -> Dict[str, Any]:
             """优化SQL语句"""
+            # 从Context中获取参数
+            sql = ctx.params.get("sql", "")
+            requirements = ctx.params.get("requirements", "")
+            
             logger.info(f"优化SQL: {sql}")
             try:
                 # 记录开始处理请求
@@ -335,10 +510,15 @@ def register_mcp_tools(mcp):
                     "sql": sql,
                     "requirements": requirements
                 }
-            
+        
         @mcp.tool("fix_sql", description="修复SQL语句中的错误")
-        async def fix_sql(sql: str, error_message: str, requirements: str = ""):
+        async def fix_sql(ctx: Context) -> Dict[str, Any]:
             """修复SQL语句中的错误"""
+            # 从Context中获取参数
+            sql = ctx.params.get("sql", "")
+            error_message = ctx.params.get("error_message", "")
+            requirements = ctx.params.get("requirements", "")
+            
             logger.info(f"修复SQL: {sql}, 错误: {error_message}")
             try:
                 # 导入SQL优化器
@@ -368,59 +548,26 @@ def register_mcp_tools(mcp):
                     "error_message": error_message
                 }
             
-        @mcp.tool("list_llm_providers", description="列出可用的LLM提供商")
-        async def list_llm_providers():
-            """列出可用的LLM提供商"""
-            logger.info("获取LLM提供商列表")
-            try:
-                providers = nl2sql_service.get_available_llm_providers()
-                return {
-                    "success": True,
-                    "providers": providers,
-                    "current_provider": nl2sql_service.llm_provider
-                }
-            except Exception as e:
-                logger.error(f"列出LLM提供商时出错: {str(e)}")
-                return {
-                    "success": False,
-                    "message": f"列出LLM提供商时出错: {str(e)}"
-                }
-        
-        @mcp.tool("set_llm_provider", description="设置LLM提供商")
-        async def set_llm_provider(provider_name: str):
-            """设置LLM提供商"""
-            logger.info(f"设置LLM提供商: {provider_name}")
-            try:
-                success = nl2sql_service.set_llm_provider(provider_name)
-                if success:
-                    return {
-                        "success": True,
-                        "message": f"已切换到LLM提供商: {provider_name}"
-                    }
-                else:
-                    return {
-                        "success": False,
-                        "message": f"切换LLM提供商失败，{provider_name} 可能不可用"
-                    }
-            except Exception as e:
-                logger.error(f"设置LLM提供商时出错: {str(e)}")
-                return {
-                    "success": False,
-                    "message": f"设置LLM提供商时出错: {str(e)}"
-                }
-            
         @mcp.tool("health", description="健康检查工具")
-        async def health():
+        async def health(ctx: Context) -> Dict[str, Any]:
             """健康检查工具"""
+            # 获取应用配置
+            config = ctx.request_context.lifespan_context.config
+            
             return {
                 "status": "healthy",
                 "timestamp": datetime.now().isoformat(),
-                "version": "1.0.0"
+                "version": config.get("version", "1.0.0"),
+                "server_name": config.get("server_name", "Doris MCP Server")
             }
             
         @mcp.tool("status", description="获取服务器状态")
-        async def status():
+        async def status(ctx: Context) -> Dict[str, Any]:
             """获取服务器状态"""
+            # 获取应用配置和服务
+            config = ctx.request_context.lifespan_context.config
+            nl2sql_service = ctx.request_context.lifespan_context.nl2sql_service
+            
             try:
                 import psutil
                 import platform
@@ -444,7 +591,7 @@ def register_mcp_tools(mcp):
                         "uptime": datetime.now().timestamp() - process.create_time(),
                         "started_at": datetime.fromtimestamp(process.create_time()).isoformat(),
                         "timestamp": datetime.now().isoformat(),
-                        "version": "0.1.0"
+                        "version": config.get("version", "1.0.0")
                     },
                     "system": {
                         "platform": platform.platform(),
@@ -462,12 +609,12 @@ def register_mcp_tools(mcp):
                         "port": int(os.getenv("SERVER_PORT", 8080)),
                         "mcp_port": int(os.getenv("MCP_PORT", 3000)),
                         "log_level": os.getenv("LOG_LEVEL", "INFO"),
-                        "llm_provider": os.getenv("LLM_PROVIDER", "openai")
+                        "llm_provider": config.get("llm_provider", "openai")
                     },
                     "llm": {
                         "providers": llm_providers,
-                        "default_provider": os.getenv("LLM_PROVIDER", "openai"),
-                        "default_model": os.getenv(f"{os.getenv('LLM_PROVIDER', 'openai').upper()}_MODEL", "unknown")
+                        "default_provider": config.get("llm_provider", "openai"),
+                        "default_model": config.get("llm_model", "unknown")
                     }
                 }
             except Exception as e:
@@ -545,29 +692,6 @@ def init_tools() -> None:
             from src.utils.sql_optimizer import SQLOptimizer
             optimizer = SQLOptimizer()
             return optimizer.fix_sql(sql, error_message, requirements)
-        
-        @register_tool(description="获取当前NL2SQL处理状态")
-        def get_nl2sql_status():
-            """获取当前NL2SQL处理状态"""
-            from src.nl2sql_stream_processor import StreamNL2SQLProcessor
-            processor = StreamNL2SQLProcessor()
-            return processor.get_status()
-        
-        @register_tool(description="列出可用的LLM提供商")
-        def list_llm_providers():
-            """列出可用的LLM提供商"""
-            from src.nl2sql_service import NL2SQLService
-            service = NL2SQLService()
-            providers = service.list_llm_providers()
-            return {"providers": providers}
-        
-        @register_tool(description="设置LLM提供商")
-        def set_llm_provider(provider_name: str):
-            """设置LLM提供商"""
-            from src.nl2sql_service import NL2SQLService
-            service = NL2SQLService()
-            service.set_llm_provider(provider_name)
-            return {"provider": provider_name, "message": f"已设置为 {provider_name}"}
         
         @register_tool(description="健康检查工具")
         def health():

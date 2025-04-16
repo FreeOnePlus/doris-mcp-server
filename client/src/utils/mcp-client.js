@@ -265,20 +265,27 @@ export class MCPClient {
       
       // 构建请求对象
       const requestBody = {
+        jsonrpc: "2.0",
         id: id.toString(),
-        session_id: this.sessionId,
-        type: requestType
+        session_id: this.sessionId
       };
       
       // 根据请求类型添加特定参数
       if (requestType === 'tool') {
-        requestBody.tool = method;
+        // 添加method字段以修复验证错误
+        requestBody.method = method;
         requestBody.params = params;
       } else if (requestType === 'resource') {
-        requestBody.uri = method.replace('resources/', '');
+        requestBody.method = "access_resource";
+        requestBody.params = {
+          uri: method.replace('resources/', '')
+        };
       } else if (requestType === 'prompt') {
-        requestBody.prompt = method.replace('prompts/', '');
-        requestBody.params = params;
+        requestBody.method = "use_prompt";
+        requestBody.params = {
+          prompt: method.replace('prompts/', ''),
+          ...params
+        };
       }
       
       // 发送请求
