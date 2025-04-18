@@ -1,3 +1,5 @@
+[English](https://github.com/FreeOnePlus/doris-mcp-server/blob/main/README_EN.md)
+
 # Doris MCP Server
 
 Doris MCP (Model Control Panel) Server是一个基于Python的服务框架，用于通过自然语言处理将自然语言查询转换为SQL查询，支持多种LLM服务商。
