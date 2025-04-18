@@ -646,4 +646,122 @@ async def mcp_doris_status() -> Dict[str, Any]:
                     }, ensure_ascii=False)
                 }
             ]
+        }
+
+async def mcp_doris_exec_query(sql: str = None) -> Dict[str, Any]:
+    """
+    执行SQL查询并返回结果
+    
+    Args:
+        sql: 需要执行的SQL语句
+        
+    Returns:
+        Dict[str, Any]: 查询结果
+    """
+    logger.info(f"MCP工具调用: mcp_doris_exec_query, SQL: {sql}")
+    
+    try:
+        # 检查参数是否为None
+        if not sql:
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({
+                            "error": "缺少SQL参数",
+                            "message": "请提供需要执行的SQL语句"
+                        }, ensure_ascii=False)
+                    }
+                ]
+            }
+        
+        # 导入执行SQL功能
+        from src.utils.db import execute_query, is_read_only_query
+        
+        # 安全检查: 确保SQL是只读查询
+        if not is_read_only_query(sql):
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({
+                            "error": "不允许执行写操作",
+                            "message": "出于安全考虑，仅允许执行SELECT、SHOW和DESCRIBE等只读查询"
+                        }, ensure_ascii=False)
+                    }
+                ]
+            }
+        
+        # 记录开始时间
+        start_time = time.time()
+        
+        try:
+            # 执行查询
+            result = execute_query(sql)
+            
+            # 计算耗时
+            execution_time = time.time() - start_time
+            
+            # 限制结果大小，避免返回过大的结果集
+            max_results = 200
+            limited_result = result[:max_results] if len(result) > max_results else result
+            has_more = len(result) > max_results
+            
+            # 组装结果
+            response = {
+                "success": True,
+                "sql": sql,
+                "result": limited_result,
+                "row_count": len(result),
+                "returned_rows": len(limited_result),
+                "has_more": has_more,
+                "execution_time": f"{execution_time:.4f}秒",
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            # 如果结果被截断，添加提示信息
+            if has_more:
+                response["message"] = f"查询返回了{len(result)}条记录，但只显示了前{max_results}条"
+            
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(response, ensure_ascii=False, default=str)
+                    }
+                ]
+            }
+            
+        except Exception as e:
+            # 捕获SQL执行错误
+            error_message = str(e)
+            logger.error(f"SQL执行错误: {error_message}")
+            
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({
+                            "success": False,
+                            "sql": sql,
+                            "error": error_message,
+                            "message": "SQL执行失败，请检查SQL语法或数据库连接"
+                        }, ensure_ascii=False)
+                    }
+                ]
+            }
+    
+    except Exception as e:
+        logger.error(f"MCP工具执行失败 mcp_doris_exec_query: {str(e)}")
+        # 返回通用错误结果
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps({
+                        "error": str(e),
+                        "sql": sql
+                    }, ensure_ascii=False)
+                }
+            ]
         } 

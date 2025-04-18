@@ -1068,7 +1068,8 @@ class DorisMCPSseServer:
             "fix_sql": "mcp_doris_fix_sql",
             "health": "mcp_doris_health",
             "status": "mcp_doris_status",
-            "count_chars": "mcp_doris_count_chars"
+            "count_chars": "mcp_doris_count_chars",
+            "exec_query": "mcp_doris_exec_query"
         }
         
         # 如果是标准名称，转换为MCP名称
@@ -1150,8 +1151,8 @@ class DorisMCPSseServer:
                     else:
                         processed_args["table_name"] = "lineitem"  # 默认表名
             
-            elif tool_name in ["mcp_doris_sql_optimize", "mcp_doris_fix_sql"]:
-                # 对于SQL优化和修复，将random_string作为SQL内容
+            elif tool_name in ["mcp_doris_sql_optimize", "mcp_doris_fix_sql", "mcp_doris_exec_query"]:
+                # 对于SQL优化、修复和执行，将random_string作为SQL内容
                 if not processed_args.get("sql"):
                     if random_string:
                         processed_args["sql"] = random_string

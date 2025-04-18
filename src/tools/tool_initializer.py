@@ -34,7 +34,7 @@ async def register_mcp_tools(mcp):
     
     try:
         # 注册工具: 自然语言查询转SQL
-        @mcp.tool("nl2sql_query", description="将自然语言查询转换为SQL并执行返回结果")
+        @mcp.tool("nl2sql_query", description="如果用户输入的是自然语言的业务需求，则将自然语言查询转换为SQL并执行返回结果")
         async def nl2sql_query(ctx: Context) -> Dict[str, Any]:
             """将自然语言查询转换为SQL并执行返回结果"""
             query = ctx.params.get("query", "")
@@ -81,14 +81,14 @@ async def register_mcp_tools(mcp):
             return await tools.mcp_doris_refresh_metadata()
         
         # 注册工具: SQL优化
-        @mcp.tool("sql_optimize", description="对SQL语句进行优化分析，提供性能改进建议和业务含义解读")
+        @mcp.tool("sql_optimize", description="如果用户输入的是SQL语句，且希望对SQL语句进行优化分析，则执行该工具对SQL语句进行优化分析，并提供性能改进建议和业务含义解读")
         async def sql_optimize(ctx: Context) -> Dict[str, Any]:
             """对SQL语句进行优化分析，提供性能改进建议和业务含义解读"""
             sql = ctx.params.get("sql", "")
             return await tools.mcp_doris_sql_optimize(sql)
         
         # 注册工具: 修复SQL
-        @mcp.tool("fix_sql", description="修复SQL语句中的错误")
+        @mcp.tool("fix_sql", description="如果用户输入的是SQL语句，且希望对SQL语句进行修复，则执行该工具对SQL语句进行修复")
         async def fix_sql(ctx: Context) -> Dict[str, Any]:
             """修复SQL语句中的错误"""
             sql = ctx.params.get("sql", "")
@@ -106,6 +106,13 @@ async def register_mcp_tools(mcp):
         async def status(ctx: Context) -> Dict[str, Any]:
             """获取服务器状态"""
             return await tools.mcp_doris_status()
+        
+        # 注册工具: 执行SQL查询
+        @mcp.tool("exec_query", description="如果用户输入的是SQL语句，且没有其他诉求，则执行该工具执行SQL查询并返回结果")
+        async def exec_query(ctx: Context) -> Dict[str, Any]:
+            """执行SQL查询并返回结果"""
+            sql = ctx.params.get("sql", "")
+            return await tools.mcp_doris_exec_query(sql)
         
         # 获取工具数量
         tools_count = len(await mcp.list_tools())
