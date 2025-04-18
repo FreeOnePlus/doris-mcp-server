@@ -216,6 +216,13 @@ class NL2SQLProcessor:
             # 处理查询
             result = self._process_query(query)
             
+            # 检查是否为业务查询，如果不是，直接返回结果
+            if result and not result.get("is_business_query", True):
+                logger.info("非业务查询，跳过业务分析阶段直接返回结果")
+                if self._stage_listener:
+                    self._stage_listener("complete", "查询处理完成", 100)
+                return result
+            
             # 添加业务分析和可视化建议
             if result and "sql" in result and ("result" in result or "data" in result) and "analysis" not in result:
                 try:
@@ -933,75 +940,51 @@ class NL2SQLProcessor:
             query: 自然语言查询
 
         Returns:
-            Tuple[bool, float]: 是否是业务查询及置信度
+            Tuple[bool, float]: (是否是业务查询,置信度)
         """
-        # 1. 首先尝试从数据库获取业务关键词并进行匹配
-        try:
-            # 获取数据库中存储的业务关键词及其置信度
-            db_keywords = self.metadata_extractor.get_business_keywords_from_database(self.db_name)
+        # 1. 首先判断是否是直接SQL语句或命令
+        # 匹配常见的SQL命令格式
+        sql_command_pattern = re.compile(r'^\s*(SELECT|SHOW|DESC|DESCRIBE|CREATE|DROP|ALTER|INSERT|UPDATE|DELETE|EXPLAIN|USE|SET|GRANT|ANALYZE)\s+.*', re.IGNORECASE)
+        if sql_command_pattern.match(query):
+            # 对于管理类命令，直接判断为非业务查询
+            admin_commands = ['SHOW', 'DESC', 'DESCRIBE', 'CREATE', 'DROP', 'ALTER', 'GRANT', 'ANALYZE', 'USE', 'SET', 'EXPLAIN']
+            for cmd in admin_commands:
+                if query.upper().startswith(cmd):
+                    logger.info(f"通过SQL管理命令模式'{cmd}'判断查询'{query}'为非业务查询")
+                    return False, 0.95  # 高置信度判断为非业务查询
+            
+            # 对于SELECT语句，需要进一步判断是否是简单测试查询
+            if query.upper().startswith('SELECT'):
+                # 匹配简单测试查询，如SELECT 1, SELECT version(), 等
+                simple_test_pattern = re.compile(r'^\s*SELECT\s+(\d+|version\(\)|current_timestamp\(\)|now\(\))\s*;?\s*$', re.IGNORECASE)
+                if simple_test_pattern.match(query):
+                    logger.info(f"通过简单测试查询模式判断查询'{query}'为非业务查询")
+                    return False, 0.9  # 高置信度判断为非业务查询
+        
+        # 2. 检查是否包含数据库管理或测试关键词
+        db_admin_keywords = [
+            "show tables", "show databases", "describe table", "desc table", 
+            "create table", "drop table", "alter table", "truncate table",
+            "create database", "drop database", "show columns", "show index",
+            "grant", "revoke", "select 1", "select version()"
+        ]
+        
+        query_lower = query.lower()
+        for keyword in db_admin_keywords:
+            if keyword in query_lower:
+                logger.info(f"通过数据库管理关键词'{keyword}'判断查询'{query}'为非业务查询")
+                return False, 0.9  # 高置信度判断为非业务查询
 
-            # 如果数据库中已有关键词,则进行匹配
-            if db_keywords:
-                for keyword, confidence in db_keywords.items():
-                    # 跳过辅助关键词（时间维度、分析维度等非直接业务相关词）
-                    if len(keyword) <= 2 or keyword in self._get_auxiliary_keywords():
-                        continue
-
-                    if keyword in query:
-                        logger.info(f"通过数据库业务关键词'{keyword}'判断查询'{query}'为业务查询,置信度: {confidence}")
-                        return True, confidence
-
-                logger.info("数据库中的业务关键词匹配失败,使用内置关键词继续匹配")
-            else:
-                logger.info("数据库中未找到业务关键词,使用内置关键词进行匹配")
-
-                # 数据库中没有关键词,需要进行初始化保存
-                # 将关键词分为强业务关键词和辅助关键词
-                strong_business_keywords = self._get_strong_business_keywords()
-                auxiliary_keywords = self._get_auxiliary_keywords()
-
-                # 保存内置关键词到数据库（仅当数据库中没有关键词时执行）
-                try:
-                    # 准备所有内置关键词
-                    keywords_to_save = []
-                    # 保存强业务关键词（高置信度）
-                    for keyword in strong_business_keywords:
-                        keywords_to_save.append({
-                            'keyword': keyword,
-                            'confidence': 0.9,  # 强业务关键词给予更高置信度
-                            'category': '强业务关键词',
-                            'source': '系统默认'
-                        })
-
-                    # 保存辅助关键词（低置信度）
-                    for keyword in auxiliary_keywords:
-                        keywords_to_save.append({
-                            'keyword': keyword,
-                            'confidence': 0.5,  # 辅助关键词给予较低置信度
-                            'category': '辅助关键词',
-                            'source': '系统默认'
-                        })
-
-                    # 批量保存内置关键词
-                    self.metadata_extractor.save_business_keywords(self.db_name, keywords_to_save)
-                    logger.info(f"已将内置关键词保存到数据库,强业务关键词: {len(strong_business_keywords)}个,辅助关键词: {len(auxiliary_keywords)}个")
-                except Exception as e:
-                    logger.error(f"保存内置关键词到数据库出错: {str(e)}")
-        except Exception as e:
-            logger.error(f"从数据库获取业务关键词出错: {str(e)},使用内置关键词进行匹配")
-
-        # 2. 无论是否数据库匹配失败,都使用内置的业务关键词进行内存匹配
-        # 将关键词分为强业务关键词和辅助关键词
-        strong_business_keywords = self._get_strong_business_keywords()
+        # 3. 强业务关键词检查（原有逻辑）
+        strong_keywords = self._get_strong_business_keywords()
         auxiliary_keywords = self._get_auxiliary_keywords()
-
-        # 检查查询中是否包含强业务关键词
-        for keyword in strong_business_keywords:
+        
+        for keyword in strong_keywords:
             if keyword in query:
                 logger.info(f"通过强业务关键词'{keyword}'判断查询'{query}'为业务查询")
                 return True, 0.9  # 强业务关键词匹配给予更高的置信度
 
-        # 3. 如果强业务关键词没匹配到,再通过表名和列名等元数据提取的关键词匹配
+        # 4. 元数据关键词检查（原有逻辑保持不变）
         # 使用静态变量记录是否已经提取过元数据关键词
         if not hasattr(self, '_extracted_metadata_keywords'):
             business_keywords = self._extract_business_keywords()
@@ -1040,13 +1023,13 @@ class NL2SQLProcessor:
                 logger.info(f"通过元数据关键词'{keyword}'判断查询'{query}'为业务查询")
                 return True, 0.8  # 元数据关键词匹配给予较高置信度
 
-        # 4. 如果同时出现多个辅助关键词,也可能是业务查询
+        # 5. 辅助关键词检查（原有逻辑）
         auxiliary_matches = [kw for kw in auxiliary_keywords if kw in query]
         if len(auxiliary_matches) >= 2:
             logger.info(f"通过多个辅助关键词{auxiliary_matches}组合判断查询'{query}'为业务查询")
             return True, 0.7  # 多个辅助关键词组合给予中等置信度
 
-        # 5. 如果关键词都没有匹配成功,再尝试使用LLM判断（慢速路径）
+        # 6. LLM判断（原有逻辑）
         logger.info(f"本地关键词匹配未成功,尝试使用LLM判断查询: '{query}'")
         try:
             llm_result = self._check_business_query_with_llm(query)
@@ -1218,7 +1201,7 @@ class NL2SQLProcessor:
             # 向LLM请求判断结果
             response = llm_client.chat(messages)
             llm_response = response.content if response and hasattr(response, 'content') else ""
-            logger.debug(f"LLM响应内容: {llm_response}")
+            logger.info(f"原始LLM响应(前100字符): {llm_response[:100]}")
 
             # 解析LLM响应
             if llm_response:
@@ -1275,34 +1258,7 @@ class NL2SQLProcessor:
             }
             log_query_process(log_data, log_type="business_query_check")
             
-            # ... existing code ...
-            
-            # 使用审计日志记录查找相似示例的请求
-            llm_request_log = {
-                "function": "_find_similar_example",
-                "query": query,
-                "system_prompt": system_prompt,
-                "user_prompt": user_prompt,
-                "batch_index": i,
-                "batch_size": len(batch),
-                "timestamp": datetime.now().isoformat()
-            }
-            log_query_process(llm_request_log, log_type="find_similar_request")
-            
-            # ... existing code ...
-            
-            # 使用审计日志记录LLM响应
-            llm_response_log = {
-                "function": "_find_similar_example",
-                "query": query,
-                "response_content": response.content,
-                "batch_index": i,
-                "batch_size": len(batch),
-                "timestamp": datetime.now().isoformat()
-            }
-            log_query_process(llm_response_log, log_type="find_similar_response")
-            
-            logger.info(f"LLM响应内容前100个字符: {response.content[:100]}...")
+            logger.info(f"LLM判断结果: {query} -> is_business_query={result['is_business_query']}, confidence={result['confidence']}")
 
         except Exception as e:
             logger.error(f"LLM判断业务查询失败: {str(e)}")

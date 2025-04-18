@@ -34,7 +34,7 @@ async def register_mcp_tools(mcp):
     
     try:
         # 注册工具: 自然语言查询转SQL
-        @mcp.tool("nl2sql_query", description="如果用户输入的是自然语言的业务需求，则将自然语言查询转换为SQL并执行返回结果")
+        @mcp.tool("nl2sql_query", description="如果用户输入的是自然语言的业务需求，且非SQL语句及其他工具能力场景，则将自然语言查询转换为SQL并执行返回结果")
         async def nl2sql_query(ctx: Context) -> Dict[str, Any]:
             """将自然语言查询转换为SQL并执行返回结果"""
             query = ctx.params.get("query", "")

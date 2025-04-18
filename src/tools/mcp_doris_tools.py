@@ -399,17 +399,18 @@ async def mcp_doris_refresh_metadata() -> Dict[str, Any]:
             ]
         }
 
-async def mcp_doris_sql_optimize(sql: str = None) -> Dict[str, Any]:
+async def mcp_doris_sql_optimize(sql: str = None, optimization_level: str = "normal") -> Dict[str, Any]:
     """
     对SQL语句进行优化分析，提供性能改进建议和业务含义解读
     
     Args:
         sql: 需要优化的SQL语句
+        optimization_level: 优化级别，可选值：normal, aggressive
         
     Returns:
         Dict[str, Any]: 优化结果
     """
-    logger.info(f"MCP工具调用: mcp_doris_sql_optimize, SQL: {sql}")
+    logger.info(f"MCP工具调用: mcp_doris_sql_optimize, SQL: {sql}, 优化级别: {optimization_level}")
     
     try:
         # 检查参数是否为None
@@ -433,8 +434,42 @@ async def mcp_doris_sql_optimize(sql: str = None) -> Dict[str, Any]:
         # 从SQL中提取表信息
         table_info = optimizer.extract_table_info(sql)
         
+        # 准备要求信息，包含优化级别
+        requirements = f"优化级别: {optimization_level}"
+        if optimization_level == "aggressive":
+            requirements += "。请提供更激进的优化方案，可以考虑更多高级优化技术，即使这些技术可能需要对数据模型进行修改。"
+        
         # 执行SQL优化
-        result = optimizer.optimize(sql, table_info=table_info)
+        result = optimizer.process(sql, requirements)
+        
+        # 如果是纯LLM模式，添加明显的提示信息
+        if result.get("status") == "llm_only" or result.get("is_llm_only", False):
+            # 在原始结果中添加明显的提示信息
+            result["warning"] = "⚠️ 警告：此SQL无法在当前数据库中执行，优化结果仅基于LLM模型的能力，没有实际执行参数作为参考，请谨慎使用。"
+            
+            # 创建一个包含提示的新结果对象
+            enhanced_result = {
+                "is_llm_only": True,
+                "warning": "⚠️ 警告：此SQL无法在当前数据库中执行，优化结果仅基于LLM模型的能力，没有实际执行参数作为参考，请谨慎使用。",
+                "original_result": result
+            }
+            
+            # 合并关键信息到顶层
+            enhanced_result.update({
+                "request_id": result.get("request_id", ""),
+                "status": result.get("status", ""),
+                "message": result.get("message", ""),
+                "original_sql": result.get("original_sql", ""),
+                "error": result.get("error", ""),
+                "optimization_result": result.get("optimization_result", {}),
+                "optimization_level": optimization_level
+            })
+            
+            # 使用增强后的结果
+            result = enhanced_result
+        else:
+            # 为正常结果也添加优化级别信息
+            result["optimization_level"] = optimization_level
         
         # 构建标准格式的返回结果
         return {
@@ -454,7 +489,8 @@ async def mcp_doris_sql_optimize(sql: str = None) -> Dict[str, Any]:
                     "type": "text",
                     "text": json.dumps({
                         "error": str(e),
-                        "sql": sql
+                        "sql": sql,
+                        "optimization_level": optimization_level
                     }, ensure_ascii=False)
                 }
             ]
@@ -491,16 +527,91 @@ async def mcp_doris_fix_sql(sql: str = None, error_message: str = "") -> Dict[st
         # 创建SQL优化器
         optimizer = SQLOptimizer()
         
-        # 优化SQL
-        fix_result = optimizer.fix_sql(sql, error_message)
+        # 提取表信息以提供更好的上下文
+        table_info = optimizer.extract_table_info(sql)
+        
+        # 尝试执行SQL获取具体错误（如果未提供错误信息）
+        if not error_message:
+            try:
+                from src.utils.db import execute_query
+                # 尝试执行，但捕获错误
+                try:
+                    execute_query(sql)
+                    # 如果执行成功，说明SQL没有错误
+                    logger.info("SQL执行成功，无需修复")
+                    return {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps({
+                                    "success": True,
+                                    "message": "SQL语法正确，无需修复",
+                                    "original_sql": sql,
+                                    "fixed_sql": sql,
+                                    "explanation": "SQL语法正确，可以正常执行",
+                                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                                }, ensure_ascii=False)
+                            }
+                        ]
+                    }
+                except Exception as e:
+                    # 捕获执行错误作为错误信息
+                    error_message = str(e)
+                    logger.info(f"捕获到SQL执行错误：{error_message}")
+            except Exception as e:
+                logger.warning(f"尝试执行SQL以获取错误时失败：{str(e)}")
+        
+        # 执行修复，模拟完整的process流程
+        execution_result = optimizer.execute_with_profile(sql)
+        
+        # 如果执行成功，但我们要求修复，说明语法上没有问题
+        if execution_result.get("status") == "success" and not error_message:
+            logger.info("SQL执行成功，无需修复")
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({
+                            "success": True,
+                            "message": "SQL语法正确，无需修复",
+                            "original_sql": sql,
+                            "fixed_sql": sql,
+                            "explanation": "SQL语法正确，可以正常执行",
+                            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                        }, ensure_ascii=False)
+                    }
+                ]
+            }
+        
+        # 获取错误信息
+        if execution_result.get("status") == "error" and not error_message:
+            error_message = execution_result.get("error", "未知错误")
+        
+        # 修复SQL
+        fix_result = optimizer.fix_sql(
+            sql, 
+            error_message, 
+            "", 
+            table_info,
+            execution_result.get("profile", "")
+        )
+        
+        # 提取修复后的SQL
+        fixed_sql = fix_result.get("fixed_sql", "")
+        # 如果没有生成修复后的SQL，则保持原样
+        if not fixed_sql:
+            fixed_sql = sql
+            logger.warning("未能生成修复后的SQL，返回原始SQL")
         
         # 包装结果
         result = {
             "success": True,
             "message": "SQL修复成功",
             "original_sql": sql,
-            "fixed_sql": fix_result.get("corrected_sql", ""),
-            "explanation": fix_result.get("explanation", ""),
+            "fixed_sql": fixed_sql,
+            "explanation": fix_result.get("error_analysis", ""),
+            "business_meaning": fix_result.get("business_meaning", ""),
+            "sql_logic": fix_result.get("sql_logic", ""),
             "error_message": error_message,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }

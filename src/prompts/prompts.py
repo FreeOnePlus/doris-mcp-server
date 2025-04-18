@@ -436,6 +436,20 @@ BUSINESS_REASONING_PROMPTS = {
 - "如何烹饪意大利面"
 - "明天是星期几"
 
+特别注意：SQL管理命令不属于业务查询。以下是SQL管理命令的例子，这些都不是业务查询：
+- "SHOW TABLES;"
+- "DESCRIBE customer;"
+- "SHOW DATABASES;"
+- "CREATE TABLE xxx;"
+- "DROP TABLE xxx;"
+- "ALTER TABLE xxx;"
+- "SELECT 1;"
+- "SELECT version();"
+- "SHOW COLUMNS FROM xxx;"
+- "USE database_name;"
+- "GRANT xxx;"
+- "ANALYZE TABLE xxx;"
+
 请根据提供的查询内容仔细分析是否为业务查询,并提供你的判断、置信度和推理过程。
 如果是业务查询,请同时提取出查询中的具体业务关键词（不要包括"今天"、"统计"、"对比"等非业务明确含义的词）。
 
