@@ -8,19 +8,16 @@ Doris MCP SSE 服务器实现
 支持和客户端的双向通信，同时与现有的Doris-MCP-Server集成。
 """
 
-import os
 import asyncio
 import json
 import uuid
 import logging
 import time
-import traceback
-from typing import Dict, Any, Optional
+from typing import Any, Optional
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
-from starlette.applications import Starlette
 
 # 获取日志记录器
 logger = logging.getLogger("doris-mcp-sse")
@@ -74,24 +71,13 @@ class DorisMCPSseServer:
         @self.app.get("/health")
         async def health_check():
             """健康检查端点"""
-            from src.nl2sql_service import NL2SQLService
-            
             try:
-                nl2sql = NL2SQLService()
-                result = await nl2sql.mcp_doris_health()
-                
-                # 如果是MCP格式结果，解包返回原始结果
-                if isinstance(result, dict) and "content" in result and len(result["content"]) > 0:
-                    content = result["content"][0]
-                    if content.get("type") == "text" and "text" in content:
-                        try:
-                            return json.loads(content["text"])
-                        except:
-                            # 如果不能解析为JSON，则直接返回文本
-                            return {"status": "healthy", "text": content["text"]}
-                
-                # 如果不是MCP格式，直接返回
-                return result
+                # 使用直接的健康检查逻辑
+                return {
+                    "status": "healthy",
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "server": "Doris MCP Server"
+                }
             except Exception as e:
                 return {
                     "status": "error",
@@ -1061,7 +1047,6 @@ class DorisMCPSseServer:
             "nl2sql_query_stream": "mcp_doris_nl2sql_query_stream",
             "list_database_tables": "mcp_doris_list_database_tables",
             "explain_table": "mcp_doris_explain_table",
-            "get_business_overview": "mcp_doris_get_business_overview",
             "get_nl2sql_status": "mcp_doris_get_nl2sql_status",
             "refresh_metadata": "mcp_doris_refresh_metadata",
             "sql_optimize": "mcp_doris_sql_optimize",
@@ -1069,7 +1054,25 @@ class DorisMCPSseServer:
             "health": "mcp_doris_health",
             "status": "mcp_doris_status",
             "count_chars": "mcp_doris_count_chars",
-            "exec_query": "mcp_doris_exec_query"
+            "exec_query": "mcp_doris_exec_query",
+            # 新增工具映射
+            "get_schema_list": "mcp_doris_get_schema_list",
+            "save_metadata": "mcp_doris_save_metadata",
+            "get_metadata": "mcp_doris_get_metadata",
+            "analyze_query_result": "mcp_doris_analyze_query_result",
+            "generate_sql": "mcp_doris_generate_sql",
+            "explain_sql": "mcp_doris_explain_sql",
+            "modify_sql": "mcp_doris_modify_sql",
+            "parse_query": "mcp_doris_parse_query",
+            "identify_query_type": "mcp_doris_identify_query_type",
+            "extract_entities": "mcp_doris_extract_entities",
+            "validate_sql_syntax": "mcp_doris_validate_sql_syntax",
+            "check_sql_security": "mcp_doris_check_sql_security",
+            "find_similar_examples": "mcp_doris_find_similar_examples",
+            "find_similar_history": "mcp_doris_find_similar_history",
+            "calculate_query_similarity": "mcp_doris_calculate_query_similarity",
+            "adapt_similar_query": "mcp_doris_adapt_similar_query",
+            "get_nl2sql_prompt": "mcp_doris_get_nl2sql_prompt"
         }
         
         # 如果是标准名称，转换为MCP名称
@@ -1099,7 +1102,40 @@ class DorisMCPSseServer:
             processed_args = self._process_tool_arguments(mapped_tool_name, arguments, recent_query)
             
             # 调用工具函数
-            result = await tool_function(**processed_args)
+            try:
+                # 记录工具类型和属性信息，帮助调试
+                logger.debug(f"工具函数类型: {type(tool_function)}")
+                logger.debug(f"工具函数属性: {dir(tool_function)}")
+                
+                if callable(tool_function):
+                    logger.debug("工具函数是可调用的，直接调用")
+                    result = await tool_function(**processed_args)
+                elif hasattr(tool_function, 'run'):
+                    logger.debug("工具函数有run方法，调用run方法")
+                    result = await tool_function.run(**processed_args)
+                elif hasattr(tool_function, 'execute'):
+                    logger.debug("工具函数有execute方法，调用execute方法")
+                    result = await tool_function.execute(**processed_args)
+                elif hasattr(tool_function, 'call'):
+                    logger.debug("工具函数有call方法，调用call方法")
+                    result = await tool_function.call(**processed_args)
+                elif hasattr(tool_function, '__call__'):
+                    logger.debug("工具函数有__call__方法，调用__call__方法")
+                    result = await tool_function.__call__(**processed_args)
+                else:
+                    # 如果是dict类型，尝试从其中获取函数
+                    if isinstance(tool_function, dict) and 'function' in tool_function:
+                        logger.debug("工具是字典类型，尝试获取'function'键")
+                        actual_func = tool_function['function']
+                        if callable(actual_func):
+                            result = await actual_func(**processed_args)
+                        else:
+                            raise ValueError(f"字典中的函数不可调用: {type(actual_func)}")
+                    else:
+                        raise ValueError(f"工具类型不支持: {type(tool_function)}, 属性: {dir(tool_function)}")
+            except Exception as e:
+                logger.error(f"调用工具函数失败: {str(e)}", exc_info=True)
+                raise ValueError(f"调用工具时出错: {str(e)}")
             
             # 返回工具执行结果
             return result

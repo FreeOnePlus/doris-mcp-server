@@ -112,22 +112,28 @@ cleanup() {
 
 # 启动服务器
 start_server() {
+    echo -e "${YELLOW}正在停止现有的Doris MCP服务器进程...${NC}"
+    pkill -f "python -m src.main" || true
+
+    # 等待进程完全停止
+    sleep 2
+
     echo -e "${YELLOW}正在启动Doris MCP服务器...${NC}"
-    chmod +x "$START_SCRIPT"
-    "$START_SCRIPT" &
+    nohup python -m src.main >> logs/doris_mcp.log 2>> logs/doris_mcp.error &
     
     # 等待服务器启动
-    for i in {1..10}; do
-        sleep 1
-        if curl -s http://localhost:$MCP_PORT/health > /dev/null 2>&1; then
-            echo -e "${GREEN}Doris MCP服务器已成功启动 (端口: $MCP_PORT)${NC}"
+    sleep 5
+
+    echo -e "${YELLOW}检查服务器是否成功启动...${NC}"
+    if pgrep -f "python -m src.main" > /dev/null; then
+        echo -e "${GREEN}Doris MCP服务器已成功启动${NC}"
+        echo -e "${GREEN}服务地址: http://localhost:$MCP_PORT/${NC}"
             return 0
+    else
+        echo -e "${RED}服务器启动失败，请检查日志文件${NC}"
+        tail -n 20 logs/doris_mcp.error
+        return 1
         fi
-        echo -e "${YELLOW}等待服务器启动 (${i}/10)...${NC}"
-    done
-    
-    echo -e "${RED}服务器启动超时，请检查日志获取更多信息${NC}"
-    return 1
 }
 
 # 主函数

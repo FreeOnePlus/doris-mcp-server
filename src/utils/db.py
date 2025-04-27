@@ -4,6 +4,7 @@ import pymysql
 import pandas as pd
 from typing import Dict, List, Optional, Any
 from dotenv import load_dotenv
+import re
 
 # 加载环境变量
 load_dotenv(override=True)
@@ -28,18 +29,31 @@ def get_multi_database_names() -> List[str]:
     if not ENABLE_MULTI_DATABASE:
         return []
         
-    multi_db_names_str = os.getenv("MULTI_DATABASE_NAMES", "[]")
+    multi_db_names_str = os.getenv("MULTI_DATABASE_NAMES", "")
+    
+    # 首先尝试作为JSON解析
     try:
         multi_db_names = json.loads(multi_db_names_str)
-        if not isinstance(multi_db_names, list):
-            return []
+        if isinstance(multi_db_names, list):
+            # 确保默认数据库也在列表中
+            default_db = DB_CONFIG.get("database")
+            if default_db and default_db not in multi_db_names:
+                multi_db_names.insert(0, default_db)
+            return multi_db_names
+    except json.JSONDecodeError:
+        # 如果JSON解析失败，尝试作为逗号分隔的字符串处理
+        pass
+    
+    # 按逗号分隔解析
+    if multi_db_names_str:
+        multi_db_names = [db.strip() for db in multi_db_names_str.split(',') if db.strip()]
         # 确保默认数据库也在列表中
         default_db = DB_CONFIG.get("database")
         if default_db and default_db not in multi_db_names:
             multi_db_names.insert(0, default_db)
         return multi_db_names
-    except json.JSONDecodeError:
-        return []
+    
+    return []
 
 # 多数据库名称列表
 MULTI_DATABASE_NAMES = get_multi_database_names()
@@ -81,6 +95,10 @@ def execute_query(sql, db_name: Optional[str] = None):
     conn = get_db_connection(db_name)
     try:
         with conn.cursor() as cursor:
+            # 在执行查询前先设置连接字符集为utf8
+            cursor.execute("SET NAMES utf8")
+            
+            # 执行实际的查询
             cursor.execute(sql)
             result = cursor.fetchall()
         return result
@@ -102,6 +120,10 @@ def execute_query_df(sql, db_name: Optional[str] = None):
     try:
         # 使用一个临时游标执行查询并获取结果
         with conn.cursor() as cursor:
+            # 在执行查询前先设置连接字符集为utf8
+            cursor.execute("SET NAMES utf8")
+            
+            # 执行实际的查询
             cursor.execute(sql)
             result = cursor.fetchall()
         
@@ -117,24 +139,45 @@ def execute_query_df(sql, db_name: Optional[str] = None):
 
 def is_read_only_query(sql):
     """检查SQL是否为只读查询"""
-    sql_lower = sql.lower().strip()
-    write_operations = [
-        "insert ", "update ", "delete ", "drop ", "alter ", "create ", "truncate ", "rename "
-    ]
-    
-    # 检查是否包含写操作关键字
-    for op in write_operations:
-        if op in sql_lower:
-            return False
-    
-    # 必须以 SELECT 或 SHOW 或 DESCRIBE 开头
-    if not (sql_lower.startswith("select ") or 
-            sql_lower.startswith("show ") or 
-            sql_lower.startswith("desc ") or 
-            sql_lower.startswith("describe ")):
+    if not sql:
         return False
     
-    return True
+    # 移除SQL注释
+    # 移除单行注释 (-- 开始到行尾)
+    sql_no_comments = re.sub(r'--.*?(\n|$)', ' ', sql)
+    # 移除多行注释 (/* ... */)
+    sql_no_comments = re.sub(r'/\*.*?\*/', ' ', sql_no_comments, flags=re.DOTALL)
+    # 移除行内注释 (包括空格内的注释格式 /* xxx */)
+    sql_no_comments = re.sub(r'/\*.*?\*/', ' ', sql_no_comments)
+    
+    # 标准化空白符
+    sql_lower = sql_no_comments.lower().strip()
+    
+    # 检查是否包含写操作关键字
+    write_operations = [
+        r'\binsert\b', r'\bupdate\b', r'\bdelete\b', r'\bdrop\b', 
+        r'\balter\b', r'\bcreate\b', r'\btruncate\b', r'\brename\b'
+    ]
+    
+    # 使用正则表达式确保精确匹配写操作关键字
+    for op in write_operations:
+        if re.search(op, sql_lower):
+            return False
+    
+    # 必须以 SELECT 或 SHOW 或 DESCRIBE 或 EXPLAIN 开头
+    read_patterns = [
+        r'^\s*select\b', 
+        r'^\s*show\b', 
+        r'^\s*desc\b', 
+        r'^\s*describe\b', 
+        r'^\s*explain\b'
+    ]
+    
+    for pattern in read_patterns:
+        if re.search(pattern, sql_lower):
+            return True
+    
+    return False
 
 def get_all_databases():
     """获取所有数据库"""

@@ -2,31 +2,44 @@
 # Doris MCP服务器启动脚本
 # 确保以SSE模式运行服务
 
-# 设置终端颜色
+# 设置颜色
 GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 echo -e "${GREEN}========== Doris MCP服务器启动脚本 ==========${NC}"
-echo -e "${YELLOW}确保以SSE模式运行MCP服务${NC}"
 
 # 检查虚拟环境
 if [ -d "venv" ]; then
-    echo -e "${GREEN}找到虚拟环境，正在激活...${NC}"
+    echo -e "${CYAN}找到虚拟环境，正在激活...${NC}"
     source venv/bin/activate
-else
-    echo -e "${YELLOW}未找到虚拟环境，正在创建...${NC}"
-    python -m venv venv
-    source venv/bin/activate
-    
-    echo -e "${GREEN}正在安装依赖...${NC}"
-    pip install -r requirements.txt
-    
-    # 安装最新的FastMCP库
-    echo -e "${GREEN}确保安装了最新的FastMCP库...${NC}"
-    pip install -U fastmcp
 fi
+
+# 清理缓存文件
+echo -e "${CYAN}正在清理缓存文件...${NC}"
+echo -e "${CYAN}清理Python缓存文件...${NC}"
+find . -type d -name "__pycache__" -exec rm -rf {} +  2>/dev/null || true
+echo -e "${CYAN}清理临时文件...${NC}"
+rm -rf .pytest_cache 2>/dev/null || true
+echo -e "${CYAN}清理日志文件...${NC}"
+find ./log -type f -name "*.log" -delete 2>/dev/null || true
+
+# 重新加载环境变量
+if [ -f .env ]; then
+    echo -e "${CYAN}加载.env文件中的环境变量...${NC}"
+    source .env
+fi
+
+# 在启动前输出关键环境变量
+echo -e "${CYAN}数据库设置:${NC}"
+echo "DB_HOST=${DB_HOST}"
+echo "DB_PORT=${DB_PORT}"
+echo "DB_DATABASE=${DB_DATABASE}"
+echo "FORCE_REFRESH_METADATA=${FORCE_REFRESH_METADATA}"
+
+# 启动服务器
+python -m src.main
 
 # 清理缓存文件
 echo -e "${YELLOW}正在清理缓存文件...${NC}"
@@ -56,7 +69,6 @@ rm -rf ./logs/*.log
 mkdir -p logs
 
 # 设置环境变量，强制使用SSE模式
-export MCP_TRANSPORT_TYPE=sse
 export MCP_PORT=3000
 export ALLOWED_ORIGINS="*"
 export LOG_LEVEL="info"

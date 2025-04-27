@@ -13,10 +13,10 @@ import logging
 import os
 import inspect
 import traceback
-from fastapi import Request, Response
+from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse, StreamingResponse
-from typing import Dict, Any, List, Optional, Callable, AsyncGenerator
+from starlette.responses import JSONResponse
+from typing import Dict, Any
 
 # 获取日志记录器
 logger = logging.getLogger("mcp.adapter")
@@ -129,41 +129,6 @@ class MCPAdapterMiddleware(BaseHTTPMiddleware):
         # 对于其他请求，继续处理
         return await call_next(request)
     
-    
-    def format_stream_event(self, event_type: str, data: Dict[str, Any]) -> str:
-        """格式化SSE事件"""
-        # 检查data是否为None
-        if data is None:
-            data = {}
-        
-        # 将数据直接放入data字段
-        event_data = {
-            "type": event_type,
-            "data": data
-        }
-        
-        # 尝试直接序列化整个事件对象
-        try:
-            # 转换为JSON
-            json_data = json.dumps(event_data, ensure_ascii=False)
-            
-            # 构建SSE事件
-            sse_event = f"data: {json_data}\n\n"
-            
-            # 详细日志记录发送的SSE事件
-            logger.info(f"发送SSE事件: 类型={event_type}, 数据长度={len(json_data)}")
-            logger.debug(f"原始SSE事件: {sse_event[:100]}...")
-            
-            return sse_event
-        except Exception as e:
-            # 如果序列化失败，返回错误事件
-            logger.error(f"序列化事件失败: {str(e)}, 事件类型: {event_type}")
-            error_data = {
-                "type": "error",
-                "message": f"序列化事件失败: {str(e)}"
-            }
-            return f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
-
 def init():
     # 配置日志
     logging.basicConfig(
@@ -243,29 +208,6 @@ if __name__ == "__main__":
 def register_routes(app):
     """注册路由和中间件"""
     logger.info("开始注册自定义路由")
-    
-    @app.post("/nl2sql/stream")
-    async def nl2sql_stream(request: Request):
-        """NL2SQL流式处理路由"""
-        logger.info("接收到NL2SQL流式处理请求")
-        adapter = MCPAdapterMiddleware(None)  # 传入None，因为我们不会使用它的中间件功能
-        return await adapter.process_nl2sql_query_stream(request)
-    
-    @app.options("/nl2sql/stream")
-    async def nl2sql_stream_options():
-        """处理NL2SQL流式接口的OPTIONS请求"""
-        logger.info("接收到NL2SQL流式接口OPTIONS请求")
-        return Response(
-            status_code=200,
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "POST, OPTIONS",
-                "Access-Control-Allow-Headers": "*",
-                "Access-Control-Max-Age": "86400",
-            }
-        )
-    
-    logger.info("注册了NL2SQL流式处理路由: /nl2sql/stream")
     
     # 添加中间件
     app.add_middleware(MCPAdapterMiddleware)

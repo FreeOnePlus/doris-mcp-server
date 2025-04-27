@@ -11,10 +11,9 @@ import os
 import sys
 import logging
 import logging.handlers
-import time
 from pathlib import Path
-from typing import Dict, Optional
-from datetime import datetime, timedelta
+from typing import Dict
+from datetime import datetime
 from dotenv import load_dotenv
 
 # 加载环境变量
