@@ -118,12 +118,12 @@ class DorisMCPSseServer:
                     "error": str(e)
                 }
         
-        @self.app.get("/mcp")
-        async def mcp_sse(request: Request):
-            """SSE服务入口点，建立客户端连接"""
+        @self.app.get("/mcp-sse-init")
+        async def mcp_sse_init(request: Request):
+            """SSE服务入口点，建立客户端连接 (Legacy)"""
             # 生成会话ID
             session_id = str(uuid.uuid4())
-            logger.info(f"新的SSE连接 [会话ID: {session_id}]")
+            logger.info(f"新的SSE连接 [会话ID: {session_id}] (Legacy)")
             
             # 创建客户端会话
             self.client_sessions[session_id] = {

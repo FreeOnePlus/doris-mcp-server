@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 # 添加项目根目录到路径
@@ -28,6 +29,7 @@ sys.path.insert(0, PROJECT_ROOT)
 # 导入MCP工具和资源
 from mcp.server.fastmcp import Context, FastMCP
 from src.sse_server import DorisMCPSseServer
+from src.streamable_server import DorisMCPStreamableServer
 from src.tools.tool_initializer import register_mcp_tools
 from src.utils.db_init import init_metadata_tables
 
@@ -55,7 +57,7 @@ class AppContext:
 
 # 应用生命周期管理
 @asynccontextmanager
-async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
+async def app_lifespan(app: FastAPI) -> AsyncIterator[AppContext]:
     """管理应用生命周期和共享资源"""
     # 初始化元数据表
     logger.info("开始初始化元数据表...")
@@ -122,62 +124,94 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         "version": "1.0.0"
     }
     
+    # 将共享资源（包括mcp实例）存储在app.state中
+    # mcp 实例在外部创建，这里可以存储其他配置
+    app.state.config = config
+    app.state.mcp = mcp
+    
     try:
-        # 提供上下文
-        yield AppContext(
-            config=config
-        )
+        # 提供上下文，状态已在 app.state 中设置
+        yield # No need to yield the context object itself
     finally:
         # 清理资源
         logger.info("清理应用资源...")
-        # 如果需要，可以在这里添加资源清理代码
 
 # 创建MCP服务器实例
 mcp = FastMCP(
     name="Doris MCP Server",
     description="Apache Doris 自然语言查询服务",
     lifespan=app_lifespan,
-    dependencies=["fastapi", "uvicorn", "openai"]
+    dependencies=["fastapi", "uvicorn", "openai", "sse_starlette"]
 )
 
 # 创建FastAPI应用
-app = FastAPI(title="Doris MCP Server")
+app = FastAPI(
+    title="Doris MCP Server (Hybrid: SSE + Streamable)",
+    lifespan=lambda app_instance: app_lifespan(app_instance)
+)
 
 # 启动服务器
 def start_server():
     args = parse_args()
     
-    # 确保使用SSE传输类型
-    transport_type = os.getenv('MCP_TRANSPORT_TYPE', 'sse')
-    if transport_type != 'sse':
-        logger.warning(f"配置的传输类型为 {transport_type}，但只支持SSE，将使用SSE模式")
-        os.environ['MCP_TRANSPORT_TYPE'] = 'sse'
+    # 配置 CORS
+    origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+    allow_credentials = os.getenv("MCP_ALLOW_CREDENTIALS", "false").lower() == "true"
+    logger.info(f"CORS Settings: allow_origins={origins}, allow_credentials={allow_credentials}")
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=allow_credentials,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["Mcp-Session-Id"],
+    )
     
     # 输出环境变量
-    print("环境变量:")
-    print(f"MCP_TRANSPORT_TYPE={os.getenv('MCP_TRANSPORT_TYPE', 'sse')}")
-    print(f"MCP_PORT={args.port}")
-    print(f"ALLOWED_ORIGINS={os.getenv('ALLOWED_ORIGINS', '*')}")
-    print(f"LOG_LEVEL={os.getenv('LOG_LEVEL', 'info')}")
-    print(f"MCP_ALLOW_CREDENTIALS={os.getenv('MCP_ALLOW_CREDENTIALS', 'false')}")
-    print(f"MCP_DEBUG_ADAPTER={os.getenv('MCP_DEBUG_ADAPTER', 'true')}")
+    print("--- Configuration ---")
+    print(f"Server Host: {args.host}")
+    print(f"Server Port: {args.port}")
+    print(f"Allowed Origins: {origins}")
+    print(f"Allow Credentials: {allow_credentials}")
+    print(f"Log Level: {os.getenv('LOG_LEVEL', 'info')}")
+    print(f"Debug Mode: {args.debug}")
+    print(f"Reload Mode: {args.reload}")
+    print(f"DB Host: {os.getenv('DB_HOST')}")
+    print(f"DB Port: {os.getenv('DB_PORT')}")
+    print(f"DB User: {os.getenv('DB_USER')}")
+    print(f"DB Database: {os.getenv('DB_DATABASE')}")
+    print(f"Force Refresh Metadata: {os.getenv('FORCE_REFRESH_METADATA', 'false')}")
+    print("---------------------")
     
-    # 初始化MCP服务器
-    print(f"正在启动MCP服务器 (SSE模式)...")
+    # 初始化MCP服务器 (Hybrid Mode)
+    print(f"Starting MCP Server in Hybrid Mode (SSE + Streamable HTTP)...")
     
-    # 创建SSE服务器
-    sse_server = DorisMCPSseServer(mcp, app)
+    # 创建并初始化两个服务器实现
+    # 它们会将各自的路由注册到同一个 FastAPI 'app' 实例上
+    print("Initializing Legacy SSE Server...")
+    sse_server = DorisMCPSseServer(mcp, app) 
+    print("Initializing Streamable HTTP Server...")
+    streamable_server = DorisMCPStreamableServer(mcp, app)
     
-    print(f"服务将在 http://{args.host}:{args.port} 上运行")
-    print(f"健康检查: http://{args.host}:{args.port}/health")
-    print(f"SSE测试: http://{args.host}:{args.port}/sse-test")
-    print("使用 Ctrl+C 停止服务")
+    # 打印可用端点
+    base_url = f"http://{args.host}:{args.port}"
+    print(f"Service running at: {base_url}")
+    print(f"  Health Check: GET {base_url}/health")
+    print(f"  Status Check: GET {base_url}/status")
+    print(f"  Legacy SSE Init: GET {base_url}/mcp-sse-init")
+    print(f"  Legacy SSE Messages: POST {base_url}/mcp/messages")
+    print(f"  Streamable HTTP: GET/POST/DELETE/OPTIONS {base_url}/mcp")
+    print("---------------------")
+    print("Use Ctrl+C to stop the service")
     
-    # 将MCP服务器实例添加到app.state中
-    app.state.mcp = mcp
-    
+    # 将MCP服务器实例添加到app.state中 (如果lifespan中没有设置，这里是必须的)
+    if not hasattr(app.state, 'mcp'):
+         app.state.mcp = mcp
+         logger.warning("MCP instance set in start_server, consider setting it earlier in lifespan.")
+
     # 注册MCP工具函数
-    logger.info("正在注册MCP工具...")
+    logger.info("Registering MCP tools...")
     asyncio.run(register_mcp_tools(mcp))
     
     # 启动FastAPI应用
@@ -191,82 +225,71 @@ def start_server():
 
 if __name__ == "__main__":
     try:
-        # 直接执行元数据初始化和刷新，确保在服务器启动前完成
-        logger.info("执行元数据初始化...")
-        init_metadata_tables()
+        # 不再需要在主程序块中执行初始化，这些操作已移至 app_lifespan
+        # logger.info("Executing pre-start metadata initialization...")
+        # init_metadata_tables()
         
-        # 检查各种元数据刷新控制变量
-        force_refresh_value = os.getenv("FORCE_REFRESH_METADATA", "false").lower()
-        startup_refresh_value = os.getenv("STARTUP_REFRESH_METADATA", "false").lower()
-        logger.info(f"FORCE_REFRESH_METADATA={force_refresh_value}")
-        logger.info(f"STARTUP_REFRESH_METADATA={startup_refresh_value}")
+        # # 检查各种元数据刷新控制变量
+        # force_refresh_value = os.getenv("FORCE_REFRESH_METADATA", "false").lower()
+        # startup_refresh_value = os.getenv("STARTUP_REFRESH_METADATA", "false").lower()
+        # logger.info(f"FORCE_REFRESH_METADATA={force_refresh_value}")
+        # logger.info(f"STARTUP_REFRESH_METADATA={startup_refresh_value}")
         
-        # 确定是否需要刷新元数据
-        force_refresh = force_refresh_value == "true"
-        startup_refresh = startup_refresh_value == "true"
-        need_refresh = force_refresh or startup_refresh
+        # # 确定是否需要刷新元数据
+        # force_refresh = force_refresh_value == "true"
+        # startup_refresh = startup_refresh_value == "true"
+        # need_refresh = force_refresh or startup_refresh
         
-        if need_refresh:
-            logger.info(f"检测到需要刷新元数据: FORCE_REFRESH_METADATA={force_refresh}, STARTUP_REFRESH_METADATA={startup_refresh}")
-            from src.utils.metadata_extractor import MetadataExtractor
-            from src.utils.db import execute_query
+        # if need_refresh:
+        #     logger.info(f"检测到需要刷新元数据: FORCE_REFRESH_METADATA={force_refresh}, STARTUP_REFRESH_METADATA={startup_refresh}")
+        #     from src.utils.metadata_extractor import MetadataExtractor
+        #     from src.utils.db import execute_query
             
-            try:
-                # 创建元数据提取器
-                metadata_extractor = MetadataExtractor()
-                # 执行刷新，根据force_refresh决定是全量还是增量
-                logger.info(f"正在执行{'强制全量' if force_refresh else '增量'}刷新元数据...")
-                result = metadata_extractor.refresh_all_databases_metadata(force=force_refresh)
+        #     try:
+        #         # 创建元数据提取器
+        #         metadata_extractor = MetadataExtractor()
+        #         # 执行刷新，根据force_refresh决定是全量还是增量
+        #         logger.info(f"正在执行{'强制全量' if force_refresh else '增量'}刷新元数据...")
+        #         result = metadata_extractor.refresh_all_databases_metadata(force=force_refresh)
                 
-                if result:
-                    logger.info("元数据刷新成功")
-                    # 设置环境变量，标记元数据已经刷新过
-                    os.environ["METADATA_REFRESHED"] = "true"
-                else:
-                    logger.warning("警告：元数据刷新失败，请检查日志获取详细错误信息")
-            except Exception as e:
-                logger.error(f"刷新元数据时出错: {str(e)}")
-        else:
-            logger.info("不需要在启动时刷新元数据，跳过刷新")
-            # 检查是否已存在元数据
-            try:
-                from src.utils.db import execute_query
-                from src.prompts.metadata_schema import METADATA_DB_NAME
+        #         if result:
+        #             logger.info("元数据刷新成功")
+        #             # 设置环境变量，标记元数据已经刷新过
+        #             os.environ["METADATA_REFRESHED"] = "true"
+        #         else:
+        #             logger.warning("警告：元数据刷新失败，请检查日志获取详细错误信息")
+        #     except Exception as e:
+        #         logger.error(f"刷新元数据时出错: {str(e)}")
+        # else:
+        #     logger.info("不需要在启动时刷新元数据，跳过刷新")
+        #     # 检查是否已存在元数据
+        #     try:
+        #         from src.utils.db import execute_query
+        #         from src.prompts.metadata_schema import METADATA_DB_NAME
                 
-                db_name = os.getenv("DB_DATABASE", "")
-                query = f"""
-                SELECT COUNT(*) as count
-                FROM {METADATA_DB_NAME}.business_metadata 
-                WHERE db_name = '{db_name}' 
-                AND table_name = '' 
-                AND metadata_type = 'business_summary'
-                """
+        #         db_name = os.getenv("DB_DATABASE", "")
+        #         query = f"""
+        #         SELECT COUNT(*) as count
+        #         FROM {METADATA_DB_NAME}.business_metadata 
+        #         WHERE db_name = '{db_name}' 
+        #         AND table_name = '' 
+        #         AND metadata_type = 'business_summary'
+        #         """
                 
-                result = execute_query(query)
-                if result and result[0]['count'] > 0:
-                    logger.info(f"数据库 {db_name} 已存在元数据")
-                    # 设置环境变量，标记元数据已经存在
-                    os.environ["METADATA_REFRESHED"] = "true"
-                else:
-                    logger.info(f"数据库 {db_name} 不存在元数据，将在有需要时刷新")
-            except Exception as e:
-                logger.error(f"检查元数据时出错: {str(e)}")
+        #         result = execute_query(query)
+        #         if result and result[0]['count'] > 0:
+        #             logger.info(f"数据库 {db_name} 已存在元数据")
+        #             # 设置环境变量，标记元数据已经存在
+        #             os.environ["METADATA_REFRESHED"] = "true"
+        #         else:
+        #             logger.info(f"数据库 {db_name} 不存在元数据，将在有需要时刷新")
+        #     except Exception as e:
+        #         logger.error(f"检查元数据时出错: {str(e)}")
         
         # 启动服务器
-        logger.info("启动 MCP SSE 服务器，地址: http://{}:{}/".format(
-            os.getenv('SERVER_HOST', '0.0.0.0'), 
-            int(os.getenv('SERVER_PORT', os.getenv('MCP_PORT', '3000')))
-        ))
-        logger.info("MCP SSE 端点: http://{}:{}/mcp".format(
-            os.getenv('SERVER_HOST', '0.0.0.0'), 
-            int(os.getenv('SERVER_PORT', os.getenv('MCP_PORT', '3000')))
-        ))
-        logger.info("MCP 消息端点: http://{}:{}/mcp/messages".format(
-            os.getenv('SERVER_HOST', '0.0.0.0'), 
-            int(os.getenv('SERVER_PORT', os.getenv('MCP_PORT', '3000')))
-        ))
         start_server()
     except KeyboardInterrupt:
         logger.info("接收到中断信号，服务器关闭")
     except Exception as e:
-        logger.error(f"服务器启动出错: {e}", exc_info=True) 
+        logger.critical(f"Failed to start server: {e}", exc_info=True)
+        sys.exit(1) 

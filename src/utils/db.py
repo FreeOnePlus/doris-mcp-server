@@ -213,6 +213,35 @@ def get_database_schema():
     
     return schema 
 
+# --- Added function to get detailed Doris version ---
+def get_doris_version_comment(db_name: Optional[str] = None) -> str:
+    """获取 Doris 数据库的详细版本注释信息"""
+    try:
+        # 执行查询获取 version_comment 变量
+        result = execute_query("SHOW VARIABLES LIKE '%version_comment%';", db_name=db_name)
+        
+        # 检查结果是否有效
+        if result and isinstance(result, list) and len(result) > 0:
+            # 通常结果是一个包含字典的列表，字典包含 'Variable_name' 和 'Value'
+            version_comment_info = result[0]
+            if isinstance(version_comment_info, dict) and 'Value' in version_comment_info:
+                return version_comment_info['Value']
+            else:
+                 # 如果结果格式不符合预期，记录警告并返回未知
+                 # (此处简单处理，实际可能需要更详细的日志)
+                 print(f"Warning: Unexpected format for version_comment: {version_comment_info}")
+                 return "未知 (格式错误)"
+        else:
+            # 如果没有返回结果，也返回未知
+            print(f"Warning: No result returned for version_comment query in db '{db_name or get_db_name()}'")
+            return "未知 (无结果)"
+            
+    except Exception as e:
+        # 发生异常时记录错误并返回未知
+        print(f"Error fetching Doris version comment: {e}") # Consider using logger
+        return "未知 (查询错误)"
+# --- End of added function ---
+
 def test_connection(db_name: Optional[str] = None) -> Dict[str, Any]:
     """
     测试数据库连接

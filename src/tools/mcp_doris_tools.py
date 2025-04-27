@@ -14,12 +14,15 @@ import json
 import logging
 from typing import Dict, Any, List
 import traceback
+import psutil  # Added import
+import datetime # Added import
 
 # 获取日志记录器
 logger = logging.getLogger("doris-mcp-tools")
 
 # 导入SimpleContext类，用于传递参数
 from src.utils.context import SimpleContext
+from src.utils.db import get_doris_version_comment # <-- Import the new function
 
 # 注意：所有函数不再使用装饰器，直接作为普通异步函数定义
 # mcp_doris_explain_table函数已被移除，功能已合并到mcp_doris_get_schema_list中
@@ -285,35 +288,69 @@ async def mcp_doris_fix_sql(sql: str = None, error_message: str = "", db_name: s
 
 async def mcp_doris_health() -> Dict[str, Any]:
     """
-    健康检查工具
+    健康检查工具, 包含数据库和基本系统资源检查
     
     Returns:
         Dict[str, Any]: 健康状态
     """
     logger.info("MCP工具调用: mcp_doris_health")
     
+    db_status = "unknown"
+    system_healthy = True
+    cpu_percent = -1.0
+    memory_percent = -1.0
+    
     try:
-        # 获取数据库版本
+        # 检查数据库连接和版本
+        doris_version = "未知"
         try:
-            from src.utils.db import execute_query
-            version_result = execute_query("SELECT VERSION()")
-            doris_version = version_result[0][0] if version_result else "未知"
-            db_status = "healthy"
+            doris_version = get_doris_version_comment()
+            if not doris_version.startswith("未知"):
+                db_status = "healthy"
+                logger.info(f"数据库连接正常，Doris版本: {doris_version}")
+            else:
+                db_status = "error"
+                logger.warning(f"数据库连接检查失败或无法获取版本: {doris_version}")
         except Exception as db_error:
-            doris_version = "未知"
+            logger.warning(f"数据库连接检查失败: {str(db_error)}", exc_info=True)
+            doris_version = f"未知 (检查异常: {str(db_error)})"
             db_status = "error"
         
+        # 检查基本系统资源
+        try:
+            cpu_percent = psutil.cpu_percent(interval=0.1) # Use short interval
+            memory = psutil.virtual_memory()
+            memory_percent = memory.percent
+            logger.info(f"系统资源检查: CPU={cpu_percent}%, Memory={memory_percent}%")
+            # 可以根据阈值判断系统是否健康，例如
+            # if cpu_percent > 95 or memory_percent > 90:
+            #     system_healthy = False
+            #     logger.warning("系统资源使用率过高")
+        except Exception as sys_error:
+            logger.error(f"获取系统资源信息失败: {str(sys_error)}")
+            system_healthy = False # Mark system as unhealthy if resources cannot be checked
+
         # 获取服务器时间
         server_time = time.strftime("%Y-%m-%d %H:%M:%S")
         
+        # 综合状态判断
+        overall_status = "healthy"
+        if db_status != "healthy" or not system_healthy:
+            overall_status = "error"
+            
         # 构建结果
         result = {
-            "status": "healthy" if db_status == "healthy" else "error",
+            "status": overall_status,
             "database": {
                 "status": db_status,
-                "version": doris_version,
-                "server_time": server_time
+                "version": doris_version
             },
+            "system": {
+                "status": "healthy" if system_healthy else "error",
+                "cpu_usage_percent": cpu_percent,
+                "memory_usage_percent": memory_percent
+            },
+            "server_time": server_time, # Moved server_time here
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
         
@@ -326,52 +363,115 @@ async def mcp_doris_health() -> Dict[str, Any]:
             ]
         }
     except Exception as e:
-        logger.error(f"健康检查失败: {str(e)}")
+        logger.error(f"健康检查失败: {str(e)}", exc_info=True) # Log traceback
+        
+        # Simplified error response
+        error_result = {
+             "status": "error",
+             "error": f"Health check failed: {str(e)}",
+             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
         
         return {
             "content": [
                 {
                     "type": "text",
-                    "text": json.dumps({
-                        "status": "error",
-                        "error": str(e),
-                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-                    }, ensure_ascii=False)
+                    "text": json.dumps(error_result, ensure_ascii=False)
                 }
             ]
         }
 
-async def mcp_doris_status() -> Dict[str, Any]:
+async def mcp_doris_status(include_metrics: bool = False) -> Dict[str, Any]:
     """
-    获取服务器状态
+    获取服务器状态, 可选包含详细系统指标
     
+    Args:
+        include_metrics: 是否包含详细系统指标 (CPU, Memory, Disk, Uptime)
+
     Returns:
         Dict[str, Any]: 服务器状态
     """
-    logger.info("MCP工具调用: mcp_doris_status")
+    logger.info(f"MCP工具调用: mcp_doris_status, include_metrics={include_metrics}")
     
     try:
         # 获取服务器时间
-        server_time = time.strftime("%Y-%m-%d %H:%M:%S")
+        current_timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         
-        # 获取Doris版本
+        # 获取Doris版本 (使用新函数)
+        doris_version = "未知"
         try:
-            from src.utils.db import execute_query
-            version_result = execute_query("SELECT VERSION()")
-            doris_version = version_result[0][0] if version_result else "未知"
-        except:
-            doris_version = "未知"
+            doris_version = get_doris_version_comment()
+            if doris_version.startswith("未知"):
+                 logger.warning(f"获取Doris版本失败或信息不完整: {doris_version}")
+            else:
+                 logger.info(f"成功获取Doris版本: {doris_version}")
+        except Exception as db_error:
+            logger.warning(f"获取Doris版本失败: {str(db_error)}", exc_info=True)
+            doris_version = f"未知 (获取异常: {str(db_error)})"
         
         # 获取基本状态信息
         status_data = {
             "status": "running",
             "service_name": "Doris MCP Server",
-            "version": "0.1.0",
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "server_time": server_time,
+            "version": "0.1.0", # Consider reading from a config or package info
+            "timestamp": current_timestamp,
             "doris_version": doris_version
         }
-        
+
+        # 如果请求包含详细指标，则添加系统资源信息
+        if include_metrics:
+            try:
+                logger.info("获取详细系统指标...")
+                # CPU
+                cpu_percent = psutil.cpu_percent(interval=0.1)
+                cpu_count_logical = psutil.cpu_count()
+                cpu_count_physical = psutil.cpu_count(logical=False)
+                
+                # Memory
+                memory = psutil.virtual_memory()
+                memory_total_gb = memory.total / (1024**3)
+                memory_used_gb = memory.used / (1024**3)
+                memory_percent = memory.percent
+                
+                # Disk (Root)
+                disk = psutil.disk_usage('/')
+                disk_total_gb = disk.total / (1024**3)
+                disk_used_gb = disk.used / (1024**3)
+                disk_percent = disk.percent
+                
+                # Uptime
+                boot_time_timestamp = psutil.boot_time()
+                boot_time = datetime.datetime.fromtimestamp(boot_time_timestamp)
+                uptime_seconds = time.time() - boot_time_timestamp
+                uptime_str = str(datetime.timedelta(seconds=int(uptime_seconds)))
+
+                status_data["system_metrics"] = {
+                    "cpu": {
+                        "usage_percent": cpu_percent,
+                        "logical_cores": cpu_count_logical,
+                        "physical_cores": cpu_count_physical
+                    },
+                    "memory": {
+                        "total_gb": round(memory_total_gb, 2),
+                        "used_gb": round(memory_used_gb, 2),
+                        "usage_percent": memory_percent
+                    },
+                    "disk_root": {
+                        "total_gb": round(disk_total_gb, 2),
+                        "used_gb": round(disk_used_gb, 2),
+                        "usage_percent": disk_percent
+                    },
+                    "uptime": {
+                         "seconds": int(uptime_seconds),
+                         "readable": uptime_str,
+                         "boot_time": boot_time.strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                }
+                logger.info("成功获取详细系统指标")
+            except Exception as metrics_error:
+                 logger.error(f"获取系统指标时出错: {metrics_error}", exc_info=True)
+                 status_data["system_metrics"] = {"error": f"Failed to get metrics: {metrics_error}"}
+
         return {
             "content": [
                 {
@@ -381,17 +481,20 @@ async def mcp_doris_status() -> Dict[str, Any]:
             ]
         }
     except Exception as e:
-        logger.error(f"获取服务器状态失败: {str(e)}")
+        logger.error(f"获取服务器状态失败: {str(e)}", exc_info=True) # Log traceback
+        
+        # Simplified error response
+        error_result = {
+             "status": "error",
+             "error": f"Failed to get status: {str(e)}",
+             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
         
         return {
             "content": [
                 {
                     "type": "text",
-                    "text": json.dumps({
-                        "status": "error",
-                        "error": str(e),
-                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-                    }, ensure_ascii=False)
+                    "text": json.dumps(error_result, ensure_ascii=False)
                 }
             ]
         }
