@@ -622,21 +622,19 @@ async def save_metadata(ctx) -> Dict[str, Any]:
 
 async def get_schema_list(ctx) -> Dict[str, Any]:
     """
-    获取数据库或表结构信息，用于Client端生成元数据
+    获取数据库或表结构信息
     
     Args:
         ctx: Context对象，包含请求参数
         - db_name: 数据库名称
         - table_name: 表名（可选，如果提供则只返回该表的结构）
-        - simple_mode: 是否使用简化模式（只返回表列表，不包含提示信息）
         
     Returns:
-        Dict[str, Any]: 数据库或表结构信息和提示词
+        Dict[str, Any]: 数据库或表结构信息
     """
     try:
         db_name = ctx.params.get("db_name", os.getenv("DB_DATABASE", ""))
         table_name = ctx.params.get("table_name", "")
-        simple_mode = ctx.params.get("simple_mode", False)
         
         # 处理跨库表名格式 (db_name.table_name)
         if table_name and "." in table_name:
@@ -652,11 +650,6 @@ async def get_schema_list(ctx) -> Dict[str, Any]:
         # 导入元数据提取器
         from src.utils.metadata_extractor import MetadataExtractor
         extractor = MetadataExtractor(db_name)
-        
-        # 如果未指定simple_mode或非简化模式，导入提示词模板
-        if not simple_mode:
-            # 导入提示词模板
-            from src.prompts.prompts import CLIENT_METADATA_PROMPT
         
         if table_name:
             # 获取单个表的结构
@@ -705,112 +698,7 @@ async def get_schema_list(ctx) -> Dict[str, Any]:
                 "relationships": related_tables
             }
             
-            # 如果是简化模式，直接返回表结构
-            if simple_mode:
-                return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps({
-                                "success": True,
-                                "db_name": db_name,
-                                "table_name": table_name,
-                                "schema": detailed_schema
-                            }, ensure_ascii=False, default=str)
-                        }
-                    ]
-                }
-                
-            # 以下是非简化模式的处理逻辑
-            # 准备字段信息和关系信息的格式化文本
-            columns_info = ""
-            for column in schema.get('columns', []):
-                col_name = column.get('name', '')
-                col_type = column.get('type', '')
-                col_comment = column.get('comment', '')
-                col_key = column.get('key', '')
-                col_nullable = "可为空" if column.get('nullable', True) else "非空"
-                
-                columns_info += f"  - {col_name} ({col_type}, {col_nullable}{', ' + col_key if col_key else ''}): {col_comment}\n"
-            
-            # 添加表关系信息
-            relationships_info = ""
-            if related_tables:
-                for rel in related_tables:
-                    if rel['type'] == 'references':
-                        relationships_info += f"  - {table_name}.{rel['this_column']} 引用 {rel['table']}.{rel['referenced_column']}\n"
-                    else:
-                        relationships_info += f"  - {rel['table']}.{rel['referenced_column']} 引用 {table_name}.{rel['this_column']}\n"
-            
-            # 使用提示词模板
-            prompt = CLIENT_METADATA_PROMPT["table_metadata"].format(
-                db_name=db_name,
-                table_name=table_name,
-                table_comment=schema.get('comment', '无注释'),
-                columns_info=columns_info,
-                relationships_info=relationships_info
-            )
-            
-            # 检查是否已存在表元数据
-            existing_metadata = None
-            try:
-                # 导入元数据模式定义
-                from src.prompts.metadata_schema import METADATA_DB_NAME
-                
-                # 首先从business_metadata表查询
-                business_metadata_query = f"""
-                SELECT metadata_value
-                FROM `{METADATA_DB_NAME}`.`business_metadata`
-                WHERE db_name = '{db_name}' 
-                AND table_name = '{table_name}'
-                AND metadata_type = 'table_summary'
-                ORDER BY update_time DESC
-                LIMIT 1
-                """
-                business_metadata_result = execute_query(business_metadata_query)
-                
-                # 如果在business_metadata表中找到
-                if business_metadata_result and len(business_metadata_result) > 0:
-                    metadata_value = business_metadata_result[0].get("metadata_value")
-                    if metadata_value:
-                        try:
-                            existing_metadata = json.loads(metadata_value)
-                            logger.info(f"从business_metadata表获取到表 {table_name} 的元数据")
-                        except json.JSONDecodeError:
-                            existing_metadata = None
-                
-                # 如果在business_metadata表中没找到，查询table_metadata表
-                if not existing_metadata:
-                    table_metadata_query = f"""
-                    SELECT business_summary
-                    FROM `{METADATA_DB_NAME}`.`table_metadata`
-                    WHERE database_name = '{db_name}' 
-                    AND table_name = '{table_name}'
-                    ORDER BY update_time DESC
-                    LIMIT 1
-                    """
-                    table_metadata_result = execute_query(table_metadata_query)
-                    
-                    if table_metadata_result and len(table_metadata_result) > 0:
-                        business_summary = table_metadata_result[0].get("business_summary")
-                        if business_summary:
-                            try:
-                                summary_obj = json.loads(business_summary)
-                                # 构建完整元数据对象
-                                existing_metadata = {
-                                    "table_name": table_name,
-                                    "business_description": summary_obj.get("business_description", ""),
-                                    "core_fields": [],
-                                    "relationships": related_tables
-                                }
-                                logger.info(f"从table_metadata表获取到表 {table_name} 的业务摘要")
-                            except json.JSONDecodeError:
-                                existing_metadata = None
-            except Exception as e:
-                logger.warning(f"获取表 {table_name} 元数据时出错: {str(e)}")
-                existing_metadata = None
-            
-            # 返回表结构、关系和提示词
+            # 返回表结构
             return {
                 "content": [
                     {
@@ -819,11 +707,7 @@ async def get_schema_list(ctx) -> Dict[str, Any]:
                             "success": True,
                             "db_name": db_name,
                             "table_name": table_name,
-                            "schema": detailed_schema,
-                            "existing_metadata": existing_metadata,
-                            "has_existing_metadata": existing_metadata is not None and len(existing_metadata) > 0,
-                            "prompt": prompt,
-                            "metadata_type": "table_summary"
+                            "schema": detailed_schema
                         }, ensure_ascii=False, default=str)
                     }
                 ]
@@ -857,30 +741,6 @@ async def get_schema_list(ctx) -> Dict[str, Any]:
                         "comment": schema.get("table_comment", ""),
                         "column_count": len(schema.get("columns", []))
                     }
-                    
-                    # 只有在非简化模式下才添加has_metadata标志
-                    if not simple_mode:
-                        # 检查是否有元数据
-                        has_metadata = False
-                        try:
-                            # 导入元数据模式定义
-                            from src.prompts.metadata_schema import METADATA_DB_NAME
-                            # 查询是否有元数据
-                            metadata_query = f"""
-                            SELECT COUNT(*) as count 
-                            FROM `{METADATA_DB_NAME}`.`business_metadata`
-                            WHERE db_name = '{db_name}' 
-                            AND table_name = '{table_name}'
-                            AND metadata_type = 'table_summary'
-                            """
-                            metadata_result = execute_query(metadata_query)
-                            if metadata_result and metadata_result[0].get("count", 0) > 0:
-                                has_metadata = True
-                        except Exception:
-                            has_metadata = False
-                        
-                        table_info["has_metadata"] = has_metadata
-                    
                     tables_info.append(table_info)
             
             # 构建数据库结构对象
@@ -890,25 +750,6 @@ async def get_schema_list(ctx) -> Dict[str, Any]:
                 "tables": tables_info,
                 "table_count": len(tables)
             }
-            
-            # 如果不是简化模式，添加提示消息
-            if not simple_mode:
-                db_structure["message"] = "请选择一个表以获取其结构详情和元数据生成提示"
-                
-                # 准备所有表的格式化文本用于生成提示词
-                formatted_tables_info = ""
-                for table_info in tables_info:
-                    formatted_tables_info += f"- {table_info['name']} ({table_info['column_count']} 列)\n"
-                
-                # 使用提示词模板
-                prompt = CLIENT_METADATA_PROMPT["database_metadata"].format(
-                    db_name=db_name,
-                    table_count=len(tables),
-                    tables_info=formatted_tables_info
-                )
-                
-                # 返回数据库结构信息和提示词
-                db_structure["prompt"] = prompt
             
             # 返回结果
             return {
@@ -1192,6 +1033,63 @@ async def get_metadata(ctx) -> Dict[str, Any]:
                 "business_metadata": table_metadata
             }
             
+            # 检查是否有元数据
+            has_metadata = table_metadata is not None and isinstance(table_metadata, dict) and len(table_metadata) > 0
+            
+            # 如果没有元数据，生成提示词
+            if not has_metadata:
+                # 导入提示词模板
+                from src.prompts.prompts import CLIENT_METADATA_PROMPT
+                
+                # 准备字段信息和关系信息的格式化文本
+                columns_info = ""
+                for column in schema.get('columns', []):
+                    col_name = column.get('name', '')
+                    col_type = column.get('type', '')
+                    col_comment = column.get('comment', '')
+                    col_key = column.get('key', '')
+                    col_nullable = "可为空" if column.get('nullable', True) else "非空"
+                    
+                    columns_info += f"  - {col_name} ({col_type}, {col_nullable}{', ' + col_key if col_key else ''}): {col_comment}\n"
+                
+                # 添加表关系信息
+                relationships_info = ""
+                if related_tables:
+                    for rel in related_tables:
+                        if rel['type'] == 'references':
+                            relationships_info += f"  - {table_name}.{rel['this_column']} 引用 {rel['table']}.{rel['referenced_column']}\n"
+                        else:
+                            relationships_info += f"  - {rel['table']}.{rel['referenced_column']} 引用 {table_name}.{rel['this_column']}\n"
+                
+                # 使用提示词模板
+                prompt = CLIENT_METADATA_PROMPT["table_metadata"].format(
+                    db_name=db_name,
+                    table_name=table_name,
+                    table_comment=schema.get('comment', '无注释'),
+                    columns_info=columns_info,
+                    relationships_info=relationships_info
+                )
+                
+                # 返回结果中增加提示词
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps({
+                                "success": True,
+                                "db_name": db_name,
+                                "table_name": table_name,
+                                "metadata": metadata_result,
+                                "has_metadata": False,
+                                "metadata_type": "table_metadata",
+                                "prompt": prompt,
+                                "message": "未找到元数据信息，请使用提供的提示词生成元数据"
+                            }, ensure_ascii=False, default=str)
+                        }
+                    ]
+                }
+            
+            # 如果有元数据，直接返回
             return {
                 "content": [
                     {
@@ -1201,6 +1099,7 @@ async def get_metadata(ctx) -> Dict[str, Any]:
                             "db_name": db_name,
                             "table_name": table_name,
                             "metadata": metadata_result,
+                            "has_metadata": True,
                             "metadata_type": "table_metadata"
                         }, ensure_ascii=False, default=str)
                     }
@@ -1232,6 +1131,8 @@ async def get_metadata(ctx) -> Dict[str, Any]:
             
             # 收集所有表的简要信息
             tables_info = []
+            formatted_tables_info = ""
+            
             for table_name in tables:
                 schema = extractor.get_table_schema(table_name, db_name)
                 if schema:
@@ -1266,13 +1167,28 @@ async def get_metadata(ctx) -> Dict[str, Any]:
                     except Exception as e:
                         logger.warning(f"检查表 {table_name} 是否有元数据时出错: {str(e)}")
                         has_metadata = False
-                        
-                    tables_info.append({
+                    
+                    # 添加到表信息列表
+                    table_info = {
                         "name": table_name,
                         "comment": schema.get("comment", ""),
                         "column_count": len(schema.get("columns", [])),
                         "has_metadata": has_metadata
-                    })
+                    }
+                    tables_info.append(table_info)
+                    
+                    # 构建格式化文本用于提示词
+                    formatted_tables_info += f"- {table_name} ({table_info['column_count']} 列): {table_info['comment']}\n"
+                    
+                    # 如果需要更详细的表信息，可以添加列信息
+                    if len(tables) <= 20:  # 只有表数量不太多时才添加列信息
+                        formatted_tables_info += "  列信息:\n"
+                        for col in schema.get("columns", [])[:5]:  # 只展示前5列
+                            col_name = col.get("name", "")
+                            col_type = col.get("type", "")
+                            col_comment = col.get("comment", "")
+                            formatted_tables_info += f"    - {col_name} ({col_type}): {col_comment}\n"
+                        formatted_tables_info += "\n"
             
             # 创建数据库元数据结果
             metadata_result = {
@@ -1281,6 +1197,40 @@ async def get_metadata(ctx) -> Dict[str, Any]:
                 "table_count": len(tables_info)
             }
             
+            # 检查是否有元数据
+            has_metadata = db_metadata is not None and isinstance(db_metadata, dict) and len(db_metadata) > 0
+            
+            # 如果没有元数据，生成提示词
+            if not has_metadata:
+                # 导入提示词模板
+                from src.prompts.prompts import CLIENT_METADATA_PROMPT
+                
+                # 使用提示词模板
+                prompt = CLIENT_METADATA_PROMPT["database_metadata"].format(
+                    db_name=db_name,
+                    table_count=len(tables),
+                    tables_info=formatted_tables_info
+                )
+                
+                # 返回结果中增加提示词
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps({
+                                "success": True,
+                                "db_name": db_name,
+                                "metadata": metadata_result,
+                                "has_metadata": False,
+                                "metadata_type": "database_metadata",
+                                "prompt": prompt,
+                                "message": "未找到数据库元数据信息，请使用提供的提示词生成元数据"
+                            }, ensure_ascii=False, default=str)
+                        }
+                    ]
+                }
+            
+            # 如果有元数据，直接返回
             return {
                 "content": [
                     {
@@ -1289,6 +1239,7 @@ async def get_metadata(ctx) -> Dict[str, Any]:
                             "success": True,
                             "db_name": db_name,
                             "metadata": metadata_result,
+                            "has_metadata": True,
                             "metadata_type": "database_metadata"
                         }, ensure_ascii=False, default=str)
                     }

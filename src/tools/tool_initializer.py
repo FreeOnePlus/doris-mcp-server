@@ -95,7 +95,10 @@ async def register_mcp_tools(mcp):
         async def exec_query(ctx: Context) -> Dict[str, Any]:
             """执行SQL查询并返回结果"""
             sql = ctx.params.get("sql", "")
-            return await mcp_doris_exec_query(sql)
+            db_name = ctx.params.get("db_name", None)
+            max_rows = ctx.params.get("max_rows", 100)
+            timeout = ctx.params.get("timeout", 30)
+            return await mcp_doris_exec_query(sql, db_name, max_rows, timeout)
         
         # 注册工具: 根据自然语言生成SQL
         @mcp.tool("generate_sql", description="[功能描述]：根据自然语言生成SQL但不执行，如果需要指定表名，请在tables参数中传入相关表名列表。\n[参数内容]：\n- random_string (string) [必填] - 调用工具的唯一标识符\n- query (string) [必填] - 自然语言查询描述\n- db_name (string) [选填] - 目标数据库名称，默认使用当前数据库\n- tables (array) [选填] - 相关表名列表")
@@ -215,14 +218,13 @@ async def register_mcp_tools(mcp):
             db_name = ctx.params.get("db_name", "")
             return await mcp_doris_save_metadata(metadata, metadata_type, table_name, db_name)
         
-        # 注册工具: 获取结构信息
-        @mcp.tool("get_schema_list", description="[功能描述]：获取数据库或表结构信息，默认仅返回表结构信息，simple_mode 传入参数为 false 时，返回完整库表结构信息和元数据信息。\n[参数内容]：\n- random_string (string) [必填] - 调用工具的唯一标识符\n- table_name (string) [选填] - 表名，如果不提供则获取整个数据库表列表\n- db_name (string) [选填] - 目标数据库名称，默认使用当前数据库\n- simple_mode (boolean) [选填] - 是否使用简化模式（只返回基本信息，不包含提示信息），默认为true")
+        # 注册工具: 获取结构信息（用于Client端生成元数据）
+        @mcp.tool("get_schema_list", description="[功能描述]：获取数据库或表结构信息。\n[参数内容]：\n- random_string (string) [必填] - 调用工具的唯一标识符\n- table_name (string) [选填] - 表名，如果不提供则获取整个数据库表列表\n- db_name (string) [选填] - 目标数据库名称，默认使用当前数据库")
         async def get_schema_list(ctx: Context) -> Dict[str, Any]:
             """获取数据库或表结构信息"""
             table_name = ctx.params.get("table_name", "")
             db_name = ctx.params.get("db_name", "")
-            simple_mode = ctx.params.get("simple_mode", True)
-            return await mcp_doris_get_schema_list(table_name, db_name, simple_mode)
+            return await mcp_doris_get_schema_list(table_name, db_name)
         
         # 注册工具: 获取NL2SQL工具流程指南（该工具为测试工具，逻辑应由 Agent 管理，故暂不开放）
         # @mcp.tool("get_nl2sql_prompt", description="[功能描述]：用户有传入自然语言希望进行数据库查询的意图，**必须**先行调用本工具指导如何按照正确流程执行。\n[参数内容]：\n- random_string (string) [必填] - 调用工具的唯一标识符")

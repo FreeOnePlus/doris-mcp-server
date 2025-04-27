@@ -231,6 +231,16 @@ async def execute_sql_query(ctx) -> Dict[str, Any]:
             else:
                 error_details["type"] = "unknown"
                 error_details["suggestion"] = "请检查SQL语句并尝试简化查询"
+            
+            # 创建错误响应
+            error_response = {
+                "success": False,
+                "error": error_message,
+                "error_details": error_details,
+                "sql": sql,
+                "db_name": db_name
+            }
+            
             # 确保错误响应也是可序列化的
             error_response = _serialize_row_data(error_response)
             

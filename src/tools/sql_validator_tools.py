@@ -31,56 +31,70 @@ async def _extract_tables_from_sql(sql: str) -> List[str]:
         List[str]: 表名列表
     """
     try:
-        # 使用LLM提取表名
-        from src.utils.llm_client import get_llm_client, Message
-        from src.prompts.prompts import SQL_VALIDATION_PROMPTS
-        
-        llm_client = get_llm_client()
-        
-        system_prompt = SQL_VALIDATION_PROMPTS["extract_tables_system"]
-        user_prompt = SQL_VALIDATION_PROMPTS["extract_tables_user"].format(sql=sql)
-        
-        messages = [
-            Message(role="system", content=system_prompt),
-            Message(role="user", content=user_prompt)
+        # 使用正则表达式提取表名
+        # 模式匹配 FROM、JOIN、UPDATE、INSERT INTO 后面的表名
+        # 同时处理带数据库前缀的表名 (db.table) 和不带前缀的表名
+        table_patterns = [
+            # FROM 子句
+            r'FROM\s+([`"]?([a-zA-Z0-9_]+)\.)?([`"]?[a-zA-Z0-9_]+[`"]?)', 
+            # JOIN 子句
+            r'JOIN\s+([`"]?([a-zA-Z0-9_]+)\.)?([`"]?[a-zA-Z0-9_]+[`"]?)',
+            # INSERT INTO 语句
+            r'INSERT\s+INTO\s+([`"]?([a-zA-Z0-9_]+)\.)?([`"]?[a-zA-Z0-9_]+[`"]?)',
+            # UPDATE 语句
+            r'UPDATE\s+([`"]?([a-zA-Z0-9_]+)\.)?([`"]?[a-zA-Z0-9_]+[`"]?)'
         ]
         
-        response = llm_client.chat(messages)
+        tables = set()
         
-        # 从响应中提取表名
-        tables = []
+        # 移除SQL中的字符串字面量，以避免在字符串中提取到表名
+        # 先替换单引号字符串
+        no_strings_sql = re.sub(r"'[^']*'", "''", sql)
+        # 再替换双引号字符串
+        no_strings_sql = re.sub(r'"[^"]*"', '""', no_strings_sql)
         
-        try:
-            # 尝试解析JSON格式响应
-            tables_json_match = re.search(r'\{[\s\S]*\}', response.content)
-            if tables_json_match:
-                tables_json = json.loads(tables_json_match.group(0))
-                if "tables" in tables_json and isinstance(tables_json["tables"], list):
-                    return tables_json["tables"]
-        except Exception as json_error:
-            logger.warning(f"无法解析表名JSON: {str(json_error)}")
+        # 使用多个模式匹配表名
+        for pattern in table_patterns:
+            matches = re.finditer(pattern, no_strings_sql, re.IGNORECASE)
+            for match in matches:
+                if match.group(2) and match.group(3):  # 有数据库前缀
+                    db_name = match.group(2)
+                    table_name = match.group(3).strip('`"')
+                    tables.add(f"{db_name}.{table_name}")
+                elif match.group(3):  # 只有表名
+                    table_name = match.group(3).strip('`"')
+                    tables.add(table_name)
         
-        # 如果JSON解析失败，直接按行解析
-        table_pattern = r'[\-\*]\s+(\w+)'
-        table_matches = re.findall(table_pattern, response.content)
+        # 处理子查询中的表名
+        # 移除括号内容再进行匹配
+        sub_queries = re.findall(r'\([^()]*\)', no_strings_sql)
+        for subquery in sub_queries:
+            # 递归调用自身提取子查询中的表名
+            if len(subquery) > 2:  # 不处理空括号
+                sub_tables = await _extract_tables_from_sql(subquery[1:-1])  # 移除括号
+                tables.update(sub_tables)
         
-        if table_matches:
-            tables = table_matches
-        else:
-            # 尝试从行文本中提取
-            lines = response.content.strip().split('\n')
-            for line in lines:
-                line = line.strip()
-                if line and not line.startswith(('表名', '提取', '表格', 'Table', 'SQL')):
-                    tables.append(line)
+        # 处理WITH语句中的公用表表达式(CTE)
+        cte_pattern = r'WITH\s+([a-zA-Z0-9_]+)\s+AS\s*\('
+        cte_matches = re.finditer(cte_pattern, no_strings_sql, re.IGNORECASE)
+        for match in cte_matches:
+            cte_name = match.group(1)
+            tables.add(cte_name)  # 将CTE名称也作为表名
         
-        return tables
+        # 如果未找到表名，可能是SQL格式不标准或是其他语句类型
+        if not tables:
+            # 使用更宽松的模式
+            fallback_pattern = r'(?:FROM|JOIN|INTO|UPDATE)\s+([a-zA-Z0-9_\.]+)'
+            fallback_matches = re.findall(fallback_pattern, no_strings_sql, re.IGNORECASE)
+            tables.update(fallback_matches)
+        
+        return list(tables)
         
     except Exception as e:
         logger.error(f"提取表名失败: {str(e)}", exc_info=True)
         
-        # 使用正则表达式作为备用方法
-        pattern = r'(?:FROM|JOIN)\s+([a-zA-Z0-9_]+)'
+        # 使用简单正则表达式作为最后的备用方法
+        pattern = r'(?:FROM|JOIN)\s+([a-zA-Z0-9_\.]+)'
         matches = re.findall(pattern, sql, re.IGNORECASE)
         return list(set(matches))
 

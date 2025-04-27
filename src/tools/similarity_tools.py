@@ -88,12 +88,10 @@ async def find_similar_examples(ctx) -> Dict[str, Any]:
             additional_count = min(top_k - len(candidate_examples), len(remaining_examples))
             if additional_count > 0:
                 candidate_examples.extend(random.sample(remaining_examples, additional_count))
-        
-        # 使用LLM计算相似度
-        similarity_results = await _calculate_similarity_with_llm(query, candidate_examples)
+
         
         # 按相似度排序
-        sorted_results = sorted(similarity_results, key=lambda x: x["similarity"], reverse=True)
+        sorted_results = sorted(candidate_examples, key=lambda x: x["similarity"], reverse=True)
         
         # 只返回前k个
         top_results = sorted_results[:top_k]
@@ -426,90 +424,6 @@ async def _prefilter_history(query: str, history_records: List[Dict[str, Any]]) 
         # 发生错误时返回原始历史记录的前10条
         return history_records[:10]
 
-async def _calculate_similarity_with_llm(query: str, candidate_examples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    使用LLM计算查询与候选示例的相似度
-    
-    Args:
-        query: 用户查询
-        candidate_examples: 候选示例列表
-        
-    Returns:
-        List[Dict[str, Any]]: 包含相似度分数的结果列表
-    """
-    try:
-        from src.utils.llm_client import get_llm_client, Message
-        from src.prompts.prompts import SIMILARITY_PROMPTS
-        
-        # 如果没有候选示例，返回空列表
-        if not candidate_examples:
-            return []
-        
-        llm_client = get_llm_client()
-        
-        # 准备LLM输入
-        formatted_examples = ""
-        for i, example in enumerate(candidate_examples, 1):
-            question = example.get("question", "")
-            answer = example.get("answer", "")
-            sql = example.get("sql", "")
-            
-            formatted_examples += f"示例 {i}:\n问题: {question}\n"
-            if sql:
-                formatted_examples += f"SQL: {sql}\n"
-            if answer:
-                formatted_examples += f"答案: {answer}\n"
-            formatted_examples += "\n"
-        
-        system_prompt = SIMILARITY_PROMPTS["system"]
-        user_prompt = SIMILARITY_PROMPTS["user"].format(
-            query=query,
-            examples=formatted_examples,
-            example_count=len(candidate_examples)
-        )
-        
-        messages = [
-            Message(role="system", content=system_prompt),
-            Message(role="user", content=user_prompt)
-        ]
-        
-        response = llm_client.chat(messages)
-        
-        # 从响应中提取相似度值
-        similarity_values = await _extract_similarity_values(response.content, len(candidate_examples))
-        
-        # 组合结果
-        results = []
-        for i, example in enumerate(candidate_examples):
-            similarity = 0.0
-            if i < len(similarity_values):
-                similarity = similarity_values[i]
-            
-            # 构建结果对象，复制原始示例的所有字段
-            result = dict(example)
-            result["similarity"] = similarity
-            
-            results.append(result)
-        
-        return results
-        
-    except Exception as e:
-        logger.error(f"使用LLM计算相似度失败: {str(e)}", exc_info=True)
-        
-        # 发生错误时使用文本相似度作为备用方法
-        results = []
-        for example in candidate_examples:
-            question = example.get("question", "")
-            similarity = await _calculate_text_similarity(query, question)
-            
-            # 构建结果对象
-            result = dict(example)
-            result["similarity"] = similarity
-            
-            results.append(result)
-        
-        return results
-
 async def _calculate_history_similarity(query: str, candidate_history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     计算查询与候选历史记录的相似度
@@ -522,56 +436,10 @@ async def _calculate_history_similarity(query: str, candidate_history: List[Dict
         List[Dict[str, Any]]: 包含相似度分数的结果列表
     """
     try:
-        from src.utils.llm_client import get_llm_client, Message
-        from src.prompts.prompts import SIMILARITY_PROMPTS
         
         # 如果没有候选历史记录，返回空列表
         if not candidate_history:
             return []
-        
-        llm_client = get_llm_client()
-        
-        # 准备LLM输入
-        formatted_history = ""
-        for i, record in enumerate(candidate_history, 1):
-            history_query = record.get("query", "")
-            history_sql = record.get("sql", "")
-            
-            formatted_history += f"历史记录 {i}:\n查询: {history_query}\n"
-            if history_sql:
-                formatted_history += f"SQL: {history_sql}\n"
-            formatted_history += "\n"
-        
-        system_prompt = SIMILARITY_PROMPTS["system"]
-        user_prompt = SIMILARITY_PROMPTS["history_user"].format(
-            query=query,
-            history_records=formatted_history,
-            record_count=len(candidate_history)
-        )
-        
-        messages = [
-            Message(role="system", content=system_prompt),
-            Message(role="user", content=user_prompt)
-        ]
-        
-        response = llm_client.chat(messages)
-        
-        # 从响应中提取相似度值
-        similarity_values = await _extract_similarity_values(response.content, len(candidate_history))
-        
-        # 组合结果
-        results = []
-        for i, record in enumerate(candidate_history):
-            similarity = 0.0
-            if i < len(similarity_values):
-                similarity = similarity_values[i]
-            
-            # 构建结果对象，复制原始记录的所有字段
-            result = dict(record)
-            result["similarity"] = similarity
-            
-            results.append(result)
-        
         return results
         
     except Exception as e:

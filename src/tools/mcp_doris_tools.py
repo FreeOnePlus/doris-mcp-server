@@ -258,7 +258,7 @@ async def mcp_doris_fix_sql(sql: str = None, error_message: str = "", db_name: s
                         "sql": sql,
                         "error_message": error_message,
                         "db_name": db_name,
-                        "message": "请使用提供的完整修复提示词对SQL进行修复",
+                        "message": "请使用提供的完整修复提示词对SQL进行修复，并返回修复好的SQL语句",
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                     }, ensure_ascii=False)
                 }
@@ -396,17 +396,20 @@ async def mcp_doris_status() -> Dict[str, Any]:
             ]
         }
 
-async def mcp_doris_exec_query(sql: str = None) -> Dict[str, Any]:
+async def mcp_doris_exec_query(sql: str = None, db_name: str = None, max_rows: int = 100, timeout: int = 30) -> Dict[str, Any]:
     """
     执行SQL查询并返回结果
     
     Args:
         sql: 需要执行的SQL语句
+        db_name: 目标数据库名称
+        max_rows: 最大返回行数
+        timeout: 查询超时时间（秒）
         
     Returns:
         Dict[str, Any]: 查询结果
     """
-    logger.info(f"MCP工具调用: mcp_doris_exec_query, SQL: {sql}")
+    logger.info(f"MCP工具调用: mcp_doris_exec_query, SQL: {sql}, DB: {db_name}, max_rows: {max_rows}, timeout: {timeout}")
     
     try:
         # 检查参数是否为None
@@ -431,7 +434,10 @@ async def mcp_doris_exec_query(sql: str = None) -> Dict[str, Any]:
         
         # 使用sql_executor_tools执行SQL
         from src.tools.sql_executor_tools import execute_sql_query
-        db_name = os.getenv("DB_DATABASE", "")
+        
+        # 如果未提供db_name，使用环境变量中的默认数据库
+        if not db_name:
+            db_name = os.getenv("DB_DATABASE", "")
         
         # 检查SQL是否只读
         from src.utils.db import is_read_only_query
@@ -449,7 +455,14 @@ async def mcp_doris_exec_query(sql: str = None) -> Dict[str, Any]:
             }
         
         # 使用SimpleContext传递参数
-        ctx = SimpleContext({"params": {"sql": formatted_sql, "db_name": db_name}})
+        ctx = SimpleContext({
+            "params": {
+                "sql": formatted_sql,
+                "db_name": db_name,
+                "max_rows": max_rows,
+                "timeout": timeout
+            }
+        })
         result = await execute_sql_query(ctx)
         
         # 直接返回结果
@@ -463,7 +476,8 @@ async def mcp_doris_exec_query(sql: str = None) -> Dict[str, Any]:
                     "type": "text",
                     "text": json.dumps({
                         "error": str(e),
-                        "sql": sql
+                        "sql": sql,
+                        "db_name": db_name
                     }, ensure_ascii=False)
                 }
             ]
@@ -535,19 +549,18 @@ async def mcp_doris_save_metadata(metadata: str = None, metadata_type: str = Non
             ]
         }
 
-async def mcp_doris_get_schema_list(table_name: str = "", db_name: str = None, simple_mode: bool = False) -> Dict[str, Any]:
+async def mcp_doris_get_schema_list(table_name: str = "", db_name: str = None) -> Dict[str, Any]:
     """
     获取数据库或表结构信息
     
     Args:
         table_name: 表名（可选，如果提供则只返回该表的结构）
         db_name: 目标数据库名称，默认使用当前数据库
-        simple_mode: 是否使用简化模式（只返回表列表，不包含提示信息），默认为false
         
     Returns:
         Dict[str, Any]: 数据库或表结构信息
     """
-    logger.info(f"MCP工具调用: mcp_doris_get_schema_list, 表名: {table_name}, 数据库: {db_name}, 简化模式: {simple_mode}")
+    logger.info(f"MCP工具调用: mcp_doris_get_schema_list, 表名: {table_name}, 数据库: {db_name}")
     
     try:
         # 如果未提供db_name，使用环境变量中的默认数据库
@@ -584,7 +597,7 @@ async def mcp_doris_get_schema_list(table_name: str = "", db_name: str = None, s
         from src.tools.metadata_tools import get_schema_list
         
         # 使用SimpleContext传递参数
-        ctx = SimpleContext({"params": {"table_name": table_name, "db_name": db_name, "simple_mode": simple_mode}})
+        ctx = SimpleContext({"params": {"table_name": table_name, "db_name": db_name}})
         result = await get_schema_list(ctx)
         
         # 直接返回结果
