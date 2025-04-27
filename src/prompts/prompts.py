@@ -138,6 +138,25 @@ CLIENT_METADATA_PROMPT = {
 请确保返回有效的JSON格式，不要包含任何其他文本。
 """,
 
+    # 数据库结构信息元数据生成
+    "database_metadata": """你是一个数据库业务分析专家。请根据以下数据库结构信息，分析并提取其业务含义和数据模型。
+
+数据库名称: {db_name}
+表数量: {table_count}
+
+表结构信息:
+{tables_info}
+
+请以JSON格式返回以下内容:
+1. "business_domain": 整个数据库的业务领域概述（字符串）
+2. "core_entities": 核心业务实体列表，每个实体包含name和description字段
+3. "business_processes": 业务流程列表，每个流程包含name和description字段
+4. "tables_summary": 表摘要列表，每个表摘要包含name字段和description字段
+
+请使用中文回答。
+请确保返回有效的JSON格式，不要包含任何其他文本。
+""",
+
     # 表级元数据生成
     "table_metadata": """你是一个数据库业务分析专家。请根据以下表结构信息，分析并提取其业务含义和数据模型。
 

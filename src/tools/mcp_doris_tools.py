@@ -22,69 +22,7 @@ logger = logging.getLogger("doris-mcp-tools")
 from src.utils.context import SimpleContext
 
 # 注意：所有函数不再使用装饰器，直接作为普通异步函数定义
-async def mcp_doris_explain_table(table_name: str) -> Dict[str, Any]:
-    """
-    获取表结构的详细信息
-    
-    Args:
-        table_name: 表名
-        
-    Returns:
-        Dict[str, Any]: 表结构详细信息
-    """
-    logger.info(f"MCP工具调用: mcp_doris_explain_table, 表名: {table_name}")
-    
-    try:
-        # 检查参数是否为None
-        if not table_name:
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": json.dumps({
-                            "error": "缺少表名参数",
-                            "message": "请提供表名"
-                        }, ensure_ascii=False)
-                    }
-                ]
-            }
-        
-        # 获取数据库名称
-        db_name = os.getenv("DB_DATABASE", "")
-        
-        # 处理跨库表名格式 (db_name.table_name)
-        if table_name and "." in table_name:
-            parts = table_name.split(".", 1)
-            if len(parts) == 2:
-                extracted_db_name, extracted_table_name = parts
-                # 使用表名中提取的db_name
-                logger.info(f"从表名 {table_name} 中提取数据库名 {extracted_db_name}")
-                db_name = extracted_db_name
-                table_name = extracted_table_name
-        
-        # 使用metadata_tools获取表信息
-        from src.tools.metadata_tools import get_table_info
-        
-        # 使用SimpleContext传递参数
-        ctx = SimpleContext({"params": {"table_name": table_name, "db_name": db_name}})
-        result = await get_table_info(ctx)
-        
-        # 直接返回结果
-        return result
-    except Exception as e:
-        logger.error(f"MCP工具执行失败 mcp_doris_explain_table: {str(e)}")
-        # 返回错误结果
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": json.dumps({
-                        "error": str(e),
-                        "table_name": table_name
-                    }, ensure_ascii=False)
-                }
-            ]
-        }
+# mcp_doris_explain_table函数已被移除，功能已合并到mcp_doris_get_schema_list中
 
 async def mcp_doris_refresh_metadata(db_name: str = None, force_refresh: bool = False) -> Dict[str, Any]:
     """

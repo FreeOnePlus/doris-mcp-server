@@ -19,7 +19,7 @@ from mcp.server.fastmcp import Context
 
 # 导入doris mcp工具
 from src.tools.mcp_doris_tools import (
-    mcp_doris_explain_table,
+    mcp_doris_get_schema_list,
     mcp_doris_refresh_metadata,
     mcp_doris_sql_optimize,
     mcp_doris_fix_sql,
@@ -39,9 +39,7 @@ from src.tools.mcp_doris_tools import (
     mcp_doris_calculate_query_similarity,
     mcp_doris_adapt_similar_query,
     mcp_doris_get_metadata,
-    mcp_doris_save_metadata,
-    mcp_doris_get_schema_list,
-    mcp_doris_get_nl2sql_prompt
+    mcp_doris_save_metadata
 )
 
 # 获取日志记录器
@@ -56,13 +54,6 @@ async def register_mcp_tools(mcp):
     logger.info("开始注册MCP工具...")
     
     try:
-        # 注册工具: 获取表结构详情
-        @mcp.tool("explain_table", description="[功能描述]：获取表结构的详细信息。\n[参数内容]：\n- random_string (string) [必填] - 调用工具的唯一标识符\n- table_name (string) [必填] - 表名称\n- db_name (string) [选填] - 目标数据库名称，默认使用当前数据库\n- include_stats (boolean) [选填] - 是否包含统计信息，默认为false")
-        async def explain_table(ctx: Context) -> Dict[str, Any]:
-            """获取表结构的详细信息"""
-            table_name = ctx.params.get("table_name", "")
-            return await mcp_doris_explain_table(table_name)
-        
         # 注册工具: 刷新元数据
         @mcp.tool("refresh_metadata", description="[功能描述]：刷新并保存元数据。\n[参数内容]：\n- random_string (string) [必填] - 调用工具的唯一标识符\n- db_name (string) [选填] - 目标数据库名称，默认刷新所有数据库\n- force_refresh (boolean) [选填] - 是否强制全量刷新，默认为false")
         async def refresh_metadata(ctx: Context) -> Dict[str, Any]:
@@ -224,13 +215,13 @@ async def register_mcp_tools(mcp):
             db_name = ctx.params.get("db_name", "")
             return await mcp_doris_save_metadata(metadata, metadata_type, table_name, db_name)
         
-        # 注册工具: 获取结构信息（用于Client端生成元数据）
-        @mcp.tool("get_schema_list", description="[功能描述]：获取数据库或表结构信息。\n[参数内容]：\n- random_string (string) [必填] - 调用工具的唯一标识符\n- table_name (string) [选填] - 表名，如果不提供则获取整个数据库表列表\n- db_name (string) [选填] - 目标数据库名称，默认使用当前数据库\n- simple_mode (boolean) [选填] - 是否使用简化模式（只返回基本信息，不包含提示信息），默认为false")
+        # 注册工具: 获取结构信息
+        @mcp.tool("get_schema_list", description="[功能描述]：获取数据库或表结构信息，默认仅返回表结构信息，simple_mode 传入参数为 false 时，返回完整库表结构信息和元数据信息。\n[参数内容]：\n- random_string (string) [必填] - 调用工具的唯一标识符\n- table_name (string) [选填] - 表名，如果不提供则获取整个数据库表列表\n- db_name (string) [选填] - 目标数据库名称，默认使用当前数据库\n- simple_mode (boolean) [选填] - 是否使用简化模式（只返回基本信息，不包含提示信息），默认为true")
         async def get_schema_list(ctx: Context) -> Dict[str, Any]:
             """获取数据库或表结构信息"""
             table_name = ctx.params.get("table_name", "")
             db_name = ctx.params.get("db_name", "")
-            simple_mode = ctx.params.get("simple_mode", False)
+            simple_mode = ctx.params.get("simple_mode", True)
             return await mcp_doris_get_schema_list(table_name, db_name, simple_mode)
         
         # 注册工具: 获取NL2SQL工具流程指南（该工具为测试工具，逻辑应由 Agent 管理，故暂不开放）

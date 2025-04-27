@@ -24,9 +24,7 @@ logger = get_logger(__name__)
 load_dotenv(override=True)
 
 # 导入本地模块
-from src.utils.db import execute_query_df, execute_query, get_db_connection, ENABLE_MULTI_DATABASE, MULTI_DATABASE_NAMES
-from src.utils.llm_client import get_llm_client, Message
-from src.prompts.prompts import BUSINESS_METADATA_PROMPTS
+from src.utils.db import execute_query_df, execute_query, ENABLE_MULTI_DATABASE, MULTI_DATABASE_NAMES
 from src.prompts.metadata_schema import METADATA_DB_NAME, METADATA_TABLES, CREATE_DATABASE_SQL
 
 class MetadataExtractor:
@@ -72,13 +70,6 @@ class MetadataExtractor:
         logger.info(f"元数据提取器初始化完成,默认数据库:{self.db_name},元数据库:{self.metadata_db}")
         logger.info(f"已排除系统数据库:{self.excluded_databases}")
         
-        # 尝试加载LLM客户端
-        try:
-            self.llm_client = get_llm_client()
-        except Exception as e:
-            logger.warning(f"加载LLM客户端失败: {str(e)}")
-            self.llm_client = None
-    
     def _load_excluded_databases(self) -> List[str]:
         """
         加载排除的数据库列表配置
@@ -1023,13 +1014,12 @@ class MetadataExtractor:
         else:
             return 'OTHER'
     
-    def summarize_business_metadata(self, db_name: Optional[str] = None, generate_with_llm: bool = False) -> Dict[str, Any]:
+    def summarize_business_metadata(self, db_name: Optional[str] = None) -> Dict[str, Any]:
         """
-        获取业务元数据摘要,优先从元数据库获取,若不存在则根据参数决定是否通过LLM生成
+        获取业务元数据摘要,优先从元数据库获取
         
         Args:
             db_name: 数据库名称,如果为None则使用初始化时指定的数据库
-            generate_with_llm: 是否使用LLM生成元数据,默认为False
             
         Returns:
             Dict[str, Any]: 业务元数据总结
@@ -1081,348 +1071,13 @@ class MetadataExtractor:
                             return db_metadata
                     except json.JSONDecodeError as e:
                         logger.warning(f"解析元数据JSON时出错: {str(e)}")
-                        # 根据参数决定是否继续执行,通过LLM生成新的元数据
-                
-                if not generate_with_llm:
-                    logger.info(f"元数据库中没有找到 {db_name} 的业务元数据，且不允许使用LLM生成，返回默认元数据")
-                    return default_metadata
-                    
-                logger.info(f"元数据库中没有找到 {db_name} 的业务元数据,将通过LLM生成")
+                return default_metadata
             except Exception as e:
                 logger.warning(f"查询元数据时出错: {str(e)}")
-                if not generate_with_llm:
-                    logger.info(f"不允许使用LLM生成元数据，返回默认元数据")
-                    return default_metadata
-                logger.info(f"将通过LLM生成新的元数据")
-            
-            # 如果不允许使用LLM生成元数据，到这里直接返回默认元数据
-            if not generate_with_llm:
                 return default_metadata
-            
-            # 获取数据库所有表
-            tables = self.get_database_tables(db_name)
-            logger.info(f"为 {db_name} 总结业务元数据,发现 {len(tables)} 个表")
-            
-            # 收集所有表的元数据
-            tables_metadata = []
-            for table_name in tables:
-                schema = self.get_table_schema(table_name, db_name)
-                if schema:  # 只添加成功获取的表结构
-                    tables_metadata.append(schema)
-            
-            # 提取SQL模式
-            sql_patterns = self.extract_common_sql_patterns(limit=50)
-            
-            # 准备表结构信息文本
-            tables_info = ""
-            for table_meta in tables_metadata:
-                table_name = table_meta.get("name", "")
-                table_comment = table_meta.get("comment", "")
-                columns = table_meta.get("columns", [])
-                
-                tables_info += f"- 表名: {table_name} (注释: {table_comment})\n"
-                tables_info += "  列:\n"
-                for column in columns:
-                    name = column.get("name", "")
-                    type = column.get("type", "")
-                    comment = column.get("comment", "")
-                    tables_info += f"    - {name} ({type}) - {comment}\n"
-                tables_info += "\n"
-            
-            # 准备SQL模式信息文本
-            sql_patterns_text = ""
-            if isinstance(sql_patterns, list):
-                for pattern in sql_patterns[:5]:  # 最多展示5个模式
-                    sql_type = pattern.get("type", "未知")
-                    pattern_text = pattern.get("pattern", "")
-                    frequency = pattern.get("frequency", 0)
-                    sql_patterns_text += f"- {sql_type}查询 (频率: {frequency}):\n  {pattern_text}\n\n"
-            
-            # 使用提示词模板
-            system_prompt = BUSINESS_METADATA_PROMPTS["system"]
-            user_prompt = BUSINESS_METADATA_PROMPTS["user"].format(
-                db_name=db_name,
-                tables_info=tables_info,
-                sql_patterns=sql_patterns_text
-            )
-            
-            # 创建日志目录
-            from pathlib import Path
-            project_root = Path(__file__).parents[3]
-            log_dir = project_root / "log" / "llm_calls"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            
-            # 记录LLM请求
-            llm_request_log = {
-                "function": "summarize_business_metadata",
-                "db_name": db_name,
-                "system_prompt": system_prompt,
-                "user_prompt": user_prompt,
-                "timestamp": datetime.now().isoformat()
-            }
-            
-            # 保存请求日志
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            request_log_path = log_dir / f"{timestamp}_business_metadata_request.json"
-            with open(request_log_path, 'a', encoding='utf-8') as f:
-                json.dump(llm_request_log, f, ensure_ascii=False, indent=2)
-            
-            logger.info("调用LLM生成业务元数据摘要")
-            logger.info(f"LLM请求日志保存到: {request_log_path}")
-            
-            # 调用LLM
-            try:
-                from src.utils.llm_client import get_llm_client, Message
-                
-                client = get_llm_client(stage="metadata")
-                
-                # 如果LLM客户端为None（可能是程序正在退出）,返回默认值
-                if client is None:
-                    logger.warning("无法获取LLM客户端,可能是程序正在退出")
-                    return default_metadata
-                
-                response = client.chat([
-                    Message.system(system_prompt),
-                    Message.user(user_prompt)
-                ])
-                
-                if not response or not response.content:
-                    logger.warning("LLM响应为空")
-                    return default_metadata
-                
-                # 预处理响应内容，修复编码问题
-                try:
-                    # 明确处理编码问题
-                    cleaned_content = response.content
-                    # 尝试检测并修复编码问题
-                    try:
-                        if not isinstance(cleaned_content, str):
-                            cleaned_content = str(cleaned_content)
-                        # 确保正确处理UTF-8编码
-                        cleaned_content = cleaned_content.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
-                    except Exception as encoding_error:
-                        logger.warning(f"处理响应编码时出错: {str(encoding_error)}")
-                        
-                    logger.info(f"预处理后的LLM响应(前200字符): {cleaned_content[:200]}...")
-                    
-                    # 正则表达式处理响应中的格式问题
-                    preprocessed_content = self._preprocess_llm_response(cleaned_content)
-                    
-                    # 提取JSON内容
-                    metadata = self._extract_json_from_llm_response(preprocessed_content)
-                    
-                    # 记录原始响应以便调试
-                    log_dir = os.path.join("logs", "llm_calls")
-                    os.makedirs(log_dir, exist_ok=True)
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    
-                    with open(os.path.join(log_dir, f"{timestamp}_raw_response.txt"), 'a', encoding='utf-8') as f:
-                        f.write(response.content)
-                    with open(os.path.join(log_dir, f"{timestamp}_cleaned_response.txt"), 'a', encoding='utf-8') as f:
-                        f.write(cleaned_content)
-                except Exception as e:
-                    logger.error(f"预处理LLM响应时出错: {str(e)}")
-                    return default_metadata
-                
-                if not metadata or metadata.get("extraction_failed", False):
-                    logger.warning(f"从LLM响应中提取JSON失败: {response.content[:200]}...")
-                    return default_metadata
-                
-                # 确保必要字段存在
-                if not isinstance(metadata, dict):
-                    logger.warning("LLM返回的不是有效的字典对象")
-                    return default_metadata
-                
-                if "tables_summary" not in metadata:
-                    metadata["tables_summary"] = {}
-                
-                # 记录业务元数据以供参考
-                metadata_log_path = os.path.join(log_dir, f"metadata_{db_name}_{timestamp}.json")
-                with open(metadata_log_path, 'a', encoding='utf-8') as f:
-                    json.dump(metadata, f, ensure_ascii=False, indent=2)
-                
-                logger.info(f"业务元数据保存到: {metadata_log_path}")
-                
-                return metadata
-            except Exception as e:
-                logger.error(f"调用LLM生成业务元数据摘要时出错: {str(e)}")
-                return default_metadata
-                
         except Exception as e:
-            logger.error(f"调用LLM生成业务元数据摘要时出错: {str(e)}")
+            logger.error(f"生成业务元数据摘要时出错: {str(e)}")
             return default_metadata
-    
-    def _preprocess_llm_response(self, content: str) -> str:
-        """
-        预处理LLM响应内容，处理常见的格式问题
-        
-        Args:
-            content: 原始LLM响应内容
-            
-        Returns:
-            str: 处理后的内容
-        """
-        try:
-            # 移除可能的Markdown格式标记
-            content = re.sub(r'#+ ', '', content)
-            
-            # 处理代码块
-            if '```json' in content and not content.endswith('```'):
-                content += '\n```'
-            
-            # 处理不完整的JSON
-            if 'core_e...' in content:
-                # 尝试补全常见字段名
-                content = content.replace('core_e...', 'core_entities')
-            
-            # 移除Unicode转义序列
-            content = content.encode('utf-8').decode('unicode_escape')
-            
-            # 清理空白字符
-            content = content.strip()
-            
-            return content
-        except Exception as e:
-            logger.warning(f"预处理LLM响应时出错: {str(e)}")
-            return content
-            
-    def _extract_json_from_llm_response(self, content: str) -> Dict:
-        """
-        从LLM响应中提取JSON内容
-        
-        Args:
-            content: LLM响应内容
-            
-        Returns:
-            Dict: 提取的JSON对象
-        """
-        try:
-            logger.info("开始从LLM响应中提取JSON内容")
-            # 移除Markdown格式的代码块标记
-            if '```json' in content:
-                content = content.replace('```json', '')
-            if '```' in content:
-                content = content.replace('```', '')
-                
-            # 修复常见的JSON格式问题
-            content = self._fix_json_format(content)
-            
-            # 尝试解析JSON
-            metadata = json.loads(content)
-            logger.info(f"成功从LLM响应中提取JSON内容: {str(metadata.keys())}")
-            
-            # 验证和补全元数据
-            metadata = self._validate_metadata(metadata)
-            
-            return metadata
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON解析错误: {str(e)}")
-            
-        # 尝试使用正则表达式查找JSON部分
-        try:
-            # 查找可能的JSON开始和结束位置
-            json_pattern = r'\{[\s\S]*\}'
-            match = re.search(json_pattern, content)
-            
-            if match:
-                json_content = match.group(0)
-                # 再次尝试修复和解析
-                json_content = self._fix_json_format(json_content)
-                metadata = json.loads(json_content)
-                logger.info(f"使用正则表达式成功提取JSON内容: {str(metadata.keys())}")
-                return self._validate_metadata(metadata)
-        except Exception as regex_error:
-            logger.error(f"使用正则表达式提取JSON失败: {str(regex_error)}")
-            
-        # 记录失败的JSON内容到日志目录
-        try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            failure_dir = os.path.join("logs", "json_failures")
-            os.makedirs(failure_dir, exist_ok=True)
-            
-            # 确保内容是字符串并以UTF-8编码保存
-            if not isinstance(content, str):
-                content = str(content)
-            
-            failure_path = os.path.join(failure_dir, f"failure_{timestamp}.txt")
-            with open(failure_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            logger.warning(f"将解析失败的内容保存到: {failure_path}")
-        except Exception as log_error:
-            logger.error(f"保存失败内容时出错: {str(log_error)}")
-            
-        # 如果上述方法都失败，返回一个空字典而不是默认元数据
-        # 这样会触发验证过程使用默认元数据填充缺失部分
-        return {}
-            
-    def _fix_json_format(self, json_str: str) -> str:
-        """
-        修复常见的JSON格式问题
-        
-        Args:
-            json_str: 可能存在格式问题的JSON字符串
-            
-        Returns:
-            str: 修复后的JSON字符串
-        """
-        # 去除前后空白字符
-        json_str = json_str.strip()
-        
-        # 修复缺少引号的键名
-        json_str = re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', json_str)
-        
-        # 修复单引号问题（将单引号替换为双引号，但忽略已经在双引号内的单引号）
-        # 这个正则表达式难以完全处理所有情况，使用简单的替换
-        if "'" in json_str and '"' not in json_str:
-            # 如果只有单引号没有双引号，直接全部替换
-            json_str = json_str.replace("'", '"')
-        
-        # 修复尾部逗号
-        json_str = re.sub(r',\s*}', '}', json_str)
-        json_str = re.sub(r',\s*\]', ']', json_str)
-        
-        # 修复缺少值的情况
-        json_str = re.sub(r':\s*,', ': null,', json_str)
-        json_str = re.sub(r':\s*}', ': null}', json_str)
-        
-        # 修复换行符和制表符
-        json_str = json_str.replace('\n', ' ').replace('\t', ' ')
-        
-        return json_str
-    
-    def _validate_metadata(self, metadata: Dict) -> Dict:
-        """
-        验证并补全元数据
-        
-        Args:
-            metadata: 从LLM响应中提取的元数据
-            
-        Returns:
-            Dict: 验证并补全后的元数据
-        """
-        if not isinstance(metadata, dict):
-            return self._get_default_metadata()
-            
-        # 确保必要字段存在
-        default_metadata = self._get_default_metadata()
-        
-        # 检查和补全business_domain
-        if "business_domain" not in metadata or not metadata["business_domain"]:
-            metadata["business_domain"] = default_metadata["business_domain"]
-        
-        # 检查和补全core_entities
-        if "core_entities" not in metadata or not metadata["core_entities"]:
-            metadata["core_entities"] = default_metadata["core_entities"]
-            
-        # 检查和补全business_processes
-        if "business_processes" not in metadata or not metadata["business_processes"]:
-            metadata["business_processes"] = default_metadata["business_processes"]
-            
-        # 检查和补全tables_summary
-        if "tables_summary" not in metadata or not metadata["tables_summary"]:
-            metadata["tables_summary"] = default_metadata["tables_summary"]
-            
-        return metadata
     
     def refresh_all_databases_metadata(self, force: bool = False) -> bool:
         """
@@ -1667,7 +1322,7 @@ class MetadataExtractor:
                 
             # 尝试使用LLM生成业务元数据摘要
             logger.info("开始生成业务元数据摘要")
-            metadata = self.summarize_business_metadata(db_name, generate_with_llm=True)
+            metadata = self.summarize_business_metadata(db_name)
             
             # 检查业务元数据是否成功获取
             if not metadata or not isinstance(metadata, dict):
@@ -2458,37 +2113,3 @@ class MetadataExtractor:
         except Exception as e:
             logger.error(f"保存业务关键词到元数据数据库出错: {str(e)}")
             return False
-
-    def _get_default_metadata(self) -> Dict:
-        """
-        获取默认元数据，当无法从LLM响应提取时使用
-        
-        Returns:
-            Dict: 默认元数据
-        """
-        db_name = self.db_name
-        return {
-            "business_domain": f"{db_name}数据库是TPC-H基准测试数据库，模拟全球供应链管理系统，包含供应商、客户、订单、零件等业务实体，用于评估决策支持系统性能。",
-            "core_entities": [
-                {"name": "供应商", "description": "提供零件的企业或个人", "related_tables": ["supplier", "partsupp", "nation"]},
-                {"name": "客户", "description": "购买产品的企业或个人", "related_tables": ["customer", "orders", "nation"]},
-                {"name": "订单", "description": "客户下的购买订单", "related_tables": ["orders", "lineitem"]},
-                {"name": "零件", "description": "产品的基本组成部分", "related_tables": ["part", "partsupp", "lineitem"]},
-                {"name": "地区", "description": "地理区域划分", "related_tables": ["region", "nation"]}
-            ],
-            "business_processes": [
-                {"name": "订单处理", "description": "从客户下单到订单完成的整个流程", "related_tables": ["orders", "lineitem", "customer"]},
-                {"name": "供应链管理", "description": "零件供应和库存管理", "related_tables": ["partsupp", "supplier", "part"]},
-                {"name": "区域分析", "description": "按地区分析销售和供应情况", "related_tables": ["region", "nation", "customer", "supplier"]}
-            ],
-            "tables_summary": {
-                "customer": {"description": "客户信息表", "purpose": "存储客户的基本信息和属性"},
-                "lineitem": {"description": "订单明细表", "purpose": "记录订单中的每个商品明细"},
-                "nation": {"description": "国家信息表", "purpose": "存储国家信息及所属区域"},
-                "orders": {"description": "订单主表", "purpose": "记录客户订单的基本信息"},
-                "part": {"description": "零件信息表", "purpose": "存储所有零件的信息"},
-                "partsupp": {"description": "零件供应表", "purpose": "记录每个零件的供应商信息"},
-                "region": {"description": "区域信息表", "purpose": "定义大地理区域划分"},
-                "supplier": {"description": "供应商信息表", "purpose": "存储供应商的基本信息"}
-            }
-        }

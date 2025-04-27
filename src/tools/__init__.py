@@ -1,6 +1,5 @@
 from .docs_tools import search_doris_docs, search_doris_online 
 from .mcp_doris_tools import (
-    mcp_doris_explain_table,
     mcp_doris_refresh_metadata,
     mcp_doris_sql_optimize,
     mcp_doris_fix_sql,
@@ -27,7 +26,6 @@ from .mcp_doris_tools import (
 
 from src.tools.metadata_tools import (
     refresh_metadata,
-    list_tables,
     get_business_overview_data,
     get_metadata,
     get_schema_list
@@ -54,7 +52,6 @@ __all__ = [
     "get_nl2sql_prompt",
     
     # mcp wrappers
-    "mcp_doris_explain_table",
     "mcp_doris_refresh_metadata",
     "mcp_doris_sql_optimize",
     "mcp_doris_fix_sql",
