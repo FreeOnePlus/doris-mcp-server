@@ -253,13 +253,24 @@ class DorisServer:
     async def _extract_auth_info_from_scope(self, scope, headers):
         """Extract authentication information from ASGI scope and headers"""
         auth_info = {}
-        
-        # Extract client IP
-        client = scope.get("client")
-        if client:
-            auth_info["client_ip"] = client[0]
+
+        # Extract client IP (with support for X-Forwarded-For from proxies)
+        # Check for X-Forwarded-For header first (most reliable when behind proxy)
+        x_forwarded_for = headers.get(b'x-forwarded-for', b'').decode('utf-8')
+        if x_forwarded_for:
+            # X-Forwarded-For can contain multiple IPs, take the first one
+            client_ip = x_forwarded_for.split(',')[0].strip()
+            auth_info["client_ip"] = client_ip
+            auth_info["proxy_used"] = True
         else:
-            auth_info["client_ip"] = "unknown"
+            # Fall back to direct client from ASGI scope
+            client = scope.get("client")
+            if client:
+                auth_info["client_ip"] = client[0]
+                auth_info["proxy_used"] = False
+            else:
+                auth_info["client_ip"] = "unknown"
+                auth_info["proxy_used"] = False
         
         # Extract token from Authorization header
         authorization = headers.get(b'authorization', b'').decode('utf-8')
@@ -531,7 +542,29 @@ class DorisServer:
             # Health check endpoint
             async def health_check(request):
                 return JSONResponse({"status": "healthy", "service": "doris-mcp-server"})
-            
+
+            async def graceful_restart(request):
+                """Trigger graceful server restart (for hot-reload without losing connections)"""
+                self.logger.warning("Graceful restart endpoint called - will shutdown in 3 seconds")
+                # Return response before shutting down
+                try:
+                    return JSONResponse({
+                        "status": "restarting",
+                        "message": "Server will gracefully restart in 3 seconds"
+                    })
+                finally:
+                    # Schedule shutdown after response is sent
+                    import asyncio
+                    asyncio.create_task(self._delayed_shutdown(3))
+
+            async def _delayed_shutdown(self, delay_seconds):
+                """Shutdown server after delay (allows response to be sent)"""
+                await asyncio.sleep(delay_seconds)
+                self.logger.info("Initiating scheduled shutdown...")
+                # For uvicorn server instance
+                if hasattr(self, '_server_instance'):
+                    self._server_instance.should_exit = True
+
             # OAuth endpoints
             from .auth.oauth_handlers import OAuthHandlers
             oauth_handlers = OAuthHandlers(self.security_manager)
@@ -585,6 +618,7 @@ class DorisServer:
                 debug=True,
                 routes=[
                     Route("/health", health_check, methods=["GET"]),
+                    Route("/admin/restart", graceful_restart, methods=["POST"]),
                     # OAuth endpoints
                     Route("/auth/login", oauth_login, methods=["GET"]),
                     Route("/auth/callback", oauth_callback, methods=["GET"]),
@@ -614,10 +648,11 @@ class DorisServer:
                     self.logger.info(f"Received request for path: {path}")
                     
                     try:
-                        # Handle health check, auth, and token management endpoints  
-                        if (path.startswith("/health") or 
-                            path.startswith("/auth/") or 
-                            path.startswith("/token/")):
+                        # Handle health check, auth, token management, and admin endpoints
+                        if (path.startswith("/health") or
+                            path.startswith("/auth/") or
+                            path.startswith("/token/") or
+                            path.startswith("/admin/")):
                             await starlette_app(scope, receive, send)
                             return
                         
@@ -637,7 +672,9 @@ class DorisServer:
 
                                 # Authenticate the request
                                 auth_context = await self.security_manager.authenticate_request(auth_info)
-                                self.logger.info(f"MCP request authenticated: token_id={auth_context.token_id}, client_ip={auth_context.client_ip}")
+                                # Log authentication with IP source information
+                                proxy_note = " (via proxy)" if auth_info.get("proxy_used") else " (direct)"
+                                self.logger.info(f"MCP request authenticated: token_id={auth_context.token_id}, client_ip={auth_context.client_ip}{proxy_note}")
 
                                 # Store auth context in scope for potential use by tools/resources
                                 scope["auth_context"] = auth_context
@@ -704,19 +741,22 @@ class DorisServer:
                     # For other scope types, just return
                     self.logger.warning(f"Unsupported scope type: {scope['type']}")
                     return
-            
+
             # Choose startup method based on worker count
             if workers > 1:
                 self.logger.info(f"Using multi-process mode with {workers} workers")
                 self.logger.info("Note: Multi-worker mode provides full MCP functionality with independent worker processes")
-                
+                self.logger.info("Press Ctrl+C once for graceful shutdown (3 sec), twice for immediate exit")
+
                 # Use the dedicated multiworker app module with full MCP support
                 uvicorn.run(
                     "doris_mcp_server.multiworker_app:app",
                     host=host,
                     port=port,
                     workers=workers,
-                    log_level="info"
+                    log_level="info",
+                    # Reduce graceful shutdown timeout to 3 seconds for faster restart
+                    timeout_graceful_shutdown=3
                 )
                 
             else:
@@ -726,14 +766,48 @@ class DorisServer:
                     app=mcp_app,
                     host=host,
                     port=port,
-                    log_level="info"
+                    log_level="info",
+                    # Reduce graceful shutdown timeout to 3 seconds for faster restart
+                    timeout_graceful_shutdown=3
                 )
                 server = uvicorn.Server(config)
-                
+
+                # Set up signal handlers for graceful but fast shutdown
+                import signal
+                import os
+
+                # Track shutdown attempts
+                shutdown_attempts = 0
+                max_shutdown_attempts = 2
+
+                def signal_handler(signum, frame):
+                    nonlocal shutdown_attempts
+                    shutdown_attempts += 1
+
+                    if shutdown_attempts == 1:
+                        self.logger.warning(f"Received signal {signum}, initiating graceful shutdown (3 second timeout)...")
+                        # First attempt: graceful shutdown
+                        server.should_exit = True
+                    elif shutdown_attempts >= 2:
+                        # Second attempt: force immediate exit
+                        self.logger.critical(f"Received signal {signum} again, forcing immediate exit!")
+                        # Force immediate exit without cleanup
+                        os._exit(0)
+
+                # Register signal handlers (works on Unix systems)
+                signal.signal(signal.SIGINT, signal_handler)
+                signal.signal(signal.SIGTERM, signal_handler)
+
                 # Run session manager and server together
-                async with session_manager.run():
-                    self.logger.info("Session manager started, now starting HTTP server")
-                    await server.serve()
+                try:
+                    async with session_manager.run():
+                        self.logger.info("Session manager started, now starting HTTP server")
+                        self.logger.info("Press Ctrl+C once for graceful shutdown (3 sec), twice for immediate exit")
+                        await server.serve()
+                except KeyboardInterrupt:
+                    # Handle keyboard interrupt gracefully
+                    self.logger.info("Keyboard interrupt received during server startup")
+                    raise
 
         except Exception as e:
             self.logger.error(f"Streamable HTTP server startup failed: {e}")

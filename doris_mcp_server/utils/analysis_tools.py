@@ -26,6 +26,23 @@ import uuid
 import aiohttp
 import hashlib
 from pathlib import Path
+from contextvars import ContextVar
+
+# Global context variable for multi-worker mode auth_context
+# This ensures all parts of the application can access the authenticated context
+from .security import AuthContext
+
+# Declare at module level to ensure single instance across the application
+_AUTH_CONTEXT_VAR: ContextVar = ContextVar('mcp_auth_context', default=None)
+
+# Try to import the global auth_context storage from multiworker_app
+# This allows us to share the same auth_context across modules in multi-worker mode
+try:
+    from ..multiworker_app import _current_auth_context
+except ImportError:
+    # Fallback to local storage if import fails (e.g., in single-worker mode)
+    # DO NOT create a local dictionary - this causes data sharing issues!
+    _current_auth_context = None
 
 from .db import DorisConnectionManager
 from .logger import get_logger
@@ -340,10 +357,33 @@ class PerformanceMonitor:
 
 class SQLAnalyzer:
     """SQL analyzer for EXPLAIN and PROFILE operations"""
-    
+
     def __init__(self, connection_manager: DorisConnectionManager):
         self.connection_manager = connection_manager
-    
+
+    async def _get_auth_context(self) -> Any:
+        """Retrieve auth_context from global storage or contextvars for multi-worker mode"""
+        # Try to get from global storage first (shared with multiworker_app)
+        try:
+            if _current_auth_context is not None:
+                auth_context = _current_auth_context.get('auth_context')
+                if auth_context:
+                    logger.debug(f"Retrieved auth_context from global storage, token_id={getattr(auth_context, 'token_id', 'N/A')}")
+                    return auth_context
+        except Exception as storage_error:
+            logger.debug(f"Could not get auth_context from global storage: {storage_error}")
+
+        # If not found in global storage, try contextvars
+        try:
+            auth_context = _AUTH_CONTEXT_VAR.get()
+            if auth_context:
+                logger.debug(f"Retrieved auth_context from contextvars, token_id={getattr(auth_context, 'token_id', 'N/A')}")
+                return auth_context
+        except Exception as ctx_error:
+            logger.debug(f"Could not retrieve auth_context from contextvars: {ctx_error}")
+
+        return None
+
     async def get_sql_explain(
         self, 
         sql: str,
@@ -378,19 +418,22 @@ class SQLAnalyzer:
             explain_file = temp_dir / f"explain_{query_id}.txt"
             
             logger.info(f"Generating SQL explain for query ID: {query_id}")
-            
+
+            # FIX: Get auth_context for multi-worker mode
+            auth_context = await self._get_auth_context()
+
             # Switch database if specified
             if db_name:
-                await self.connection_manager.execute_query("explain_session", f"USE {db_name}")
-            
+                await self.connection_manager.execute_query("explain_session", f"USE {db_name}", None, auth_context)
+
             # Construct EXPLAIN query
             explain_type = "EXPLAIN VERBOSE" if verbose else "EXPLAIN"
             explain_sql = f"{explain_type} {sql.strip().rstrip(';')}"
-            
+
             logger.info(f"Executing explain query: {explain_sql}")
-            
+
             # Execute explain query
-            result = await self.connection_manager.execute_query("explain_session", explain_sql)
+            result = await self.connection_manager.execute_query("explain_session", explain_sql, None, auth_context)
             
             # Format explain output
             explain_content = []

@@ -15,6 +15,19 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# Global context variable for multi-worker mode auth_context
+# This ensures all parts of the application can access the authenticated context
+from contextvars import ContextVar
+from .utils.security import AuthContext
+
+# Declare at module level to ensure single instance across the application
+_AUTH_CONTEXT_VAR: ContextVar = ContextVar('mcp_auth_context', default=None)
+
+# Global storage for current request's auth_context
+# This is a simple dictionary that stores the auth_context for the current request
+# It's not thread-safe but works for single-threaded async operations
+_current_auth_context = {}
 """
 Multi-worker application module for doris-mcp-server
 
@@ -285,9 +298,33 @@ async def initialize_worker():
         # Initialize security manager first (includes JWT setup if enabled)
         await _worker_security_manager.initialize()
         logger.info(f"Worker {os.getpid()} security manager initialization completed")
-        
+
+        # Check and log TokenManager status
+        token_manager = None
+        if hasattr(_worker_security_manager, 'auth_provider') and _worker_security_manager.auth_provider:
+            if hasattr(_worker_security_manager.auth_provider, 'token_manager'):
+                token_manager = _worker_security_manager.auth_provider.token_manager
+                if token_manager:
+                    # Check if tokens are loaded
+                    if hasattr(token_manager, '_tokens'):
+                        token_count = len(token_manager._tokens)
+                        logger.info(f"Worker {os.getpid()} TokenManager loaded with {token_count} tokens")
+                        if token_count > 0:
+                            # Log first few token IDs for debugging
+                            first_tokens = list(token_manager._tokens.keys())[:3]
+                            logger.info(f"Worker {os.getpid()} First tokens: {[tid[:16]+'...' for tid in first_tokens]}")
+                        else:
+                            logger.warning(f"Worker {os.getpid()} TokenManager has 0 tokens - may cause authentication failures!")
+                    else:
+                        logger.error(f"Worker {os.getpid()} TokenManager missing _tokens attribute!")
+                else:
+                    logger.error(f"Worker {os.getpid()} TokenManager is None - token authentication will fail!")
+            else:
+                logger.error(f"Worker {os.getpid()} auth_provider missing token_manager attribute!")
+        else:
+            logger.error(f"Worker {os.getpid()} security_manager missing auth_provider!")
+
         # Create connection manager with token manager for token-bound DB config
-        token_manager = _worker_security_manager.auth_provider.token_manager if hasattr(_worker_security_manager, 'auth_provider') and hasattr(_worker_security_manager.auth_provider, 'token_manager') else None
         _worker_connection_manager = DorisConnectionManager(config, _worker_security_manager, token_manager)
         
         # Set connection manager reference in security manager for database validation
@@ -348,6 +385,69 @@ async def initialize_worker():
             """Handle tool call request"""
             try:
                 logger.info(f"Handling tool call request in worker: {name}")
+
+                # FIX for multi-worker: Extract auth_context from global storage
+                # Since contextvars might not work across MCP internal boundaries,
+                # we use a global dictionary that stores the current request's auth_context
+                auth_context = None
+
+                # Try 1: Get from global context dictionary (set by mcp_asgi_app)
+                try:
+                    auth_context = _current_auth_context.get('auth_context')
+                    if auth_context:
+                        logger.info(f"✅ Retrieved auth_context from global storage, token_id={getattr(auth_context, 'token_id', 'N/A')}")
+                    else:
+                        logger.warning("❌ No auth_context found in global storage!")
+                except Exception as global_error:
+                    logger.warning(f"Could not get auth_context from global storage: {global_error}")
+
+                # Try 2: Try to get from MCP RequestContext
+                if not auth_context:
+                    try:
+                        from mcp.shared.context import RequestContext
+                        if hasattr(RequestContext, 'get_current_context'):
+                            current_context = RequestContext.get_current_context()
+                            if current_context and hasattr(current_context, 'auth_context'):
+                                auth_context = current_context.auth_context
+                                logger.info(f"✅ Retrieved auth_context from MCP RequestContext, token_id={getattr(auth_context, 'token_id', 'N/A')}")
+                                logger.info(f"DEBUG: MCP RequestContext has token: {bool(getattr(auth_context, 'token', None))}")
+                                if not getattr(auth_context, 'token', None):
+                                    logger.warning("⚠️ WARNING: AuthContext from MCP RequestContext is missing token field!")
+                    except Exception as ctx_error:
+                        logger.warning(f"Could not get auth_context from MCP RequestContext: {ctx_error}")
+
+                # Try 3: Get from contextvars (as backup)
+                if not auth_context:
+                    try:
+                        auth_context = _AUTH_CONTEXT_VAR.get()
+                        if auth_context:
+                            logger.info(f"✅ Retrieved auth_context from contextvars, token_id={getattr(auth_context, 'token_id', 'N/A')}")
+                            logger.info(f"DEBUG: Contextvars has token: {bool(getattr(auth_context, 'token', None))}")
+                            if not getattr(auth_context, 'token', None):
+                                logger.warning("⚠️ WARNING: AuthContext from contextvars is missing token field!")
+                        else:
+                            logger.warning("❌ No auth_context found in contextvars!")
+                    except Exception as ctx_error:
+                        logger.warning(f"Could not get auth_context from contextvars: {ctx_error}")
+
+                # Set auth_context in global storage for downstream use
+                if auth_context:
+                    try:
+                        # Store the exact object we retrieved
+                        _current_auth_context['auth_context'] = auth_context
+                        _AUTH_CONTEXT_VAR.set(auth_context)
+
+                        # Verify the stored object
+                        stored_context = _current_auth_context.get('auth_context')
+                        logger.info(f"✅ Set auth_context for tool '{name}', token_id={getattr(auth_context, 'token_id', 'N/A')}")
+                        logger.info(f"DEBUG: Object id in handle_call_tool: {id(auth_context)}")
+                        logger.info(f"DEBUG: Token in handle_call_tool: {getattr(auth_context, 'token', 'MISSING')}")
+                        logger.info(f"DEBUG: Same object after storage? {stored_context is auth_context}")
+                    except Exception as ctx_set_error:
+                        logger.warning(f"Could not set auth_context: {ctx_set_error}")
+                else:
+                    logger.warning(f"❌ No auth_context found for tool '{name}' - will use default database configuration")
+
                 result = await tools_manager.call_tool(name, arguments)
                 return [TextContent(type="text", text=result)]
             except Exception as e:
@@ -579,16 +679,71 @@ async def mcp_asgi_app(scope, receive, send):
             'body': b'{"error": "Worker not initialized"}'
         })
         return
-    
+
     # Import logger properly
     from .utils.logger import get_logger
     logger = get_logger(__name__)
-    
+
     # Get request path for logging
     path = scope.get('path', '')
     method = scope.get('method', 'UNKNOWN')
     logger.debug(f"Worker {os.getpid()} handling MCP request: {method} {path}")
-    
+
+    # Set auth_context in context variable for token-bound database configuration
+    # This allows downstream tools to access the authenticated token
+    try:
+        # Extract token from Authorization header or query parameter
+        headers = dict(scope.get('headers', []))
+        auth_context = None
+
+        # Try Authorization header first
+        authorization = headers.get(b'authorization', b'').decode('utf-8')
+        token = None
+        if authorization:
+            if authorization.startswith('Bearer '):
+                token = authorization[7:]
+            elif authorization.startswith('Token '):
+                token = authorization[6:]
+
+        # If not in header, try query parameter
+        if not token:
+            query_string = scope.get("query_string", b"").decode('utf-8')
+            if query_string and "token=" in query_string:
+                import urllib.parse
+                query_params = urllib.parse.parse_qs(query_string)
+                if "token" in query_params:
+                    token = query_params["token"][0]
+
+        # If we have a token, set it for tools to use
+        if token:
+            # Create a minimal auth context with the token
+            # The token will be used by connection manager to get the database config
+            from .utils.security import SecurityLevel
+            auth_context = AuthContext(
+                token_id=token[:10] + "...",
+                user_id="mcp_user",
+                token=token,  # IMPORTANT: This is the raw token for database config
+                roles=["read_only_user"],
+                permissions=["read_data"],
+                security_level=SecurityLevel.INTERNAL,
+                client_ip="127.0.0.1",
+                session_id="mcp_session"
+            )
+
+            # Store in global context dictionary for tool handlers
+            _current_auth_context['auth_context'] = auth_context
+            # Also set in contextvars as backup
+            _AUTH_CONTEXT_VAR.set(auth_context)
+            logger.info(f"✅ Set auth_context with token: {token[:20]}...")
+            logger.info(f"   auth_context.token = {auth_context.token[:20]}...")
+        else:
+            logger.warning("❌ No token found in Authorization header or query parameter!")
+            # Clear any previous auth_context
+            _current_auth_context.pop('auth_context', None)
+
+    except Exception as ctx_error:
+        logger.warning(f"Failed to set auth_context in contextvars: {ctx_error}")
+
     # Handle the request directly without nested run context
     await _worker_session_manager.handle_request(scope, receive, send)
 

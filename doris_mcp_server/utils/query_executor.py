@@ -28,6 +28,23 @@ import time
 import os
 import uuid
 import traceback
+from contextvars import ContextVar
+
+# Global context variable for multi-worker mode auth_context
+# This ensures all parts of the application can access the authenticated context
+from .security import AuthContext
+
+# Declare at module level to ensure single instance across the application
+_AUTH_CONTEXT_VAR: ContextVar = ContextVar('mcp_auth_context', default=None)
+
+# Try to import the global auth_context storage from multiworker_app
+# This allows us to share the same auth_context across modules in multi-worker mode
+try:
+    from ..multiworker_app import _current_auth_context
+except ImportError:
+    # Fallback to local storage if import fails (e.g., in single-worker mode)
+    # DO NOT create a local dictionary - this causes data sharing issues!
+    _current_auth_context = None
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import Any, Dict
@@ -388,6 +405,33 @@ class DorisQueryExecutor:
         self.metrics.concurrent_queries += 1
 
         try:
+            # FIX: Retrieve auth_context from global storage or contextvars (for multi-worker mode)
+            # Must check for None explicitly, not falsy values (auth_context with empty token would be falsy)
+            if auth_context is None:
+                # Try to get from global storage first (shared with multiworker_app)
+                try:
+                    if _current_auth_context is not None:
+                        auth_context = _current_auth_context.get('auth_context')
+                        if auth_context:
+                            self.logger.info(f"Retrieved auth_context from global storage, token_id={getattr(auth_context, 'token_id', 'N/A')}")
+                        else:
+                            self.logger.debug("No auth_context in global storage, trying contextvars...")
+                    else:
+                        self.logger.debug("Global storage not available (import failed), using contextvars...")
+                except Exception as storage_error:
+                    self.logger.debug(f"Could not get auth_context from global storage: {storage_error}")
+
+                # If not found in global storage, try contextvars
+                if auth_context is None:
+                    try:
+                        auth_context = _AUTH_CONTEXT_VAR.get()
+                        if auth_context:
+                            self.logger.info(f"Retrieved auth_context from contextvars, token_id={getattr(auth_context, 'token_id', 'N/A')}")
+                        else:
+                            self.logger.warning("No auth_context in contextvars!")
+                    except Exception as ctx_error:
+                        self.logger.warning(f"Could not retrieve auth_context from contextvars: {ctx_error}")
+
             # Check cache first
             if query_request.cache_enabled:
                 cached_result = await self.query_cache.get(
