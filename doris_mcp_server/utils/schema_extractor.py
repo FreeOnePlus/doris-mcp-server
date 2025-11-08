@@ -27,7 +27,26 @@ import re
 import uuid
 import time
 from typing import Dict, List, Any, Optional, Tuple
+from contextvars import ContextVar
 from dotenv import load_dotenv
+
+# Global context variable for multi-worker mode auth_context
+# This ensures all parts of the application can access the authenticated context
+from .security import AuthContext
+
+# Declare at module level to ensure single instance across the application
+_AUTH_CONTEXT_VAR: ContextVar = ContextVar('mcp_auth_context', default=None)
+
+# FIX for circular import: Instead of importing _current_auth_context at module level,
+# we will import it dynamically at runtime to avoid circular dependency issues
+# DO NOT import _current_auth_context here - it causes circular import with multiworker_app
+def _get_current_auth_context():
+    """Get the global auth_context storage from multiworker_app at runtime"""
+    try:
+        from ..multiworker_app import _current_auth_context
+        return _current_auth_context
+    except ImportError:
+        return None
 from datetime import datetime, timedelta
 
 # Import unified logging configuration
@@ -1135,19 +1154,54 @@ class MetadataExtractor:
     async def _execute_query_async(self, query: str, db_name: str = None, return_dataframe: bool = False):
         """
         Execute database query asynchronously
-        
+
         Args:
             query: SQL query to execute
             db_name: Database name to use (optional)
             return_dataframe: Whether to return a pandas DataFrame instead of list
-            
+
         Returns:
             Query result data (list of dictionaries or pandas DataFrame)
         """
         try:
             if self.connection_manager:
+                # FIX: Retrieve auth_context from global storage for multi-worker mode
+                # This ensures token-bound database configuration is used
+                auth_context = None
+                try:
+                    if _current_auth_context is not None:
+                        auth_context = _current_auth_context.get('auth_context')
+                        if auth_context:
+                            logger.debug(f"Session {self._session_id}: Retrieved auth_context from global storage, token_id={getattr(auth_context, 'token_id', 'N/A')}")
+                        else:
+                            logger.debug(f"Session {self._session_id}: No auth_context in global storage, trying contextvars...")
+                    else:
+                        logger.debug(f"Session {self._session_id}: Global storage not available (import failed), using contextvars...")
+                except Exception as storage_error:
+                    logger.debug(f"Session {self._session_id}: Could not get auth_context from global storage: {storage_error}")
+
+                # If not found in global storage, try contextvars
+                if not auth_context:
+                    try:
+                        auth_context = _AUTH_CONTEXT_VAR.get()
+                        if auth_context:
+                            logger.debug(f"Session {self._session_id}: Retrieved auth_context from contextvars, token_id={getattr(auth_context, 'token_id', 'N/A')}")
+                        else:
+                            logger.debug(f"Session {self._session_id}: No auth_context in contextvars!")
+                    except Exception as ctx_error:
+                        logger.debug(f"Session {self._session_id}: Could not retrieve auth_context from contextvars: {ctx_error}")
+
+                # DEBUG: Log auth_context details before passing to connection_manager
+                if auth_context:
+                    logger.info(f"Session {self._session_id}: Passing auth_context to connection_manager, token_id={getattr(auth_context, 'token_id', 'N/A')}, has_token={bool(getattr(auth_context, 'token', None))}")
+                    if hasattr(auth_context, 'token') and auth_context.token:
+                        logger.info(f"  token value: {auth_context.token[:20]}...")
+                        logger.info(f"  object id: {id(auth_context)}")
+                else:
+                    logger.warning(f"Session {self._session_id}: No auth_context - will use default database config!")
+
                 # Use the injected connection manager directly (async)
-                result = await self.connection_manager.execute_query(self._session_id, query, None)
+                result = await self.connection_manager.execute_query(self._session_id, query, None, auth_context)
                 
                 # Extract data from QueryResult
                 if hasattr(result, 'data'):
@@ -1501,28 +1555,60 @@ class MetadataExtractor:
                     final_sql = f"{context_sql}; {sql_clean}"
                     logger.debug(f"Modified SQL with context switching: {final_sql[:200]}...")
 
-            # FIX: Try to get auth_context from context variable (set by HTTP middleware)
-            # This allows token-bound database configuration to work
-            auth_context = None
+            # FIX: Get auth_context from global storage or contextvars (multi-worker mode)
+            # In multi-worker mode, auth_context is set by handle_call_tool
+            # We try to get it from the global storage first, then from contextvars
+            auth_context_from_storage = None
             try:
-                from contextvars import ContextVar
-                from .security import AuthContext
-
-                # Try to get auth_context from context variable
-                # This will be set by the HTTP request handler in main.py
-                auth_context_var: ContextVar = ContextVar('mcp_auth_context', default=None)
-                auth_context = auth_context_var.get()
-
-                if auth_context:
-                    logger.debug(f"Retrieved auth_context from context variable with token: {bool(hasattr(auth_context, 'token') and auth_context.token)}")
+                # Try to get from global storage (shared with multiworker_app)
+                if _current_auth_context is not None:
+                    auth_context_from_storage = _current_auth_context.get('auth_context')
+                    if auth_context_from_storage:
+                        has_token = hasattr(auth_context_from_storage, 'token') and auth_context_from_storage.token
+                        token_value = getattr(auth_context_from_storage, 'token', None)
+                        logger.info(f"Retrieved auth_context from global storage with token: {has_token}")
+                        if has_token:
+                            logger.info(f"  token value: {token_value[:20]}...")
+                    else:
+                        logger.debug("No auth_context found in global storage")
                 else:
-                    logger.debug("No auth_context found in context variable, using default")
-            except Exception as ctx_error:
-                logger.debug(f"Could not retrieve auth_context from context variable: {ctx_error}")
-                auth_context = None
+                    logger.debug("Global storage not available (import failed), using contextvars...")
+            except Exception as storage_error:
+                logger.warning(f"Could not get auth_context from global storage: {storage_error}")
+
+            # If not found in global storage, try contextvars
+            if not auth_context_from_storage:
+                try:
+                    auth_context_from_ctx = _AUTH_CONTEXT_VAR.get()
+                    if auth_context_from_ctx:
+                        has_token = hasattr(auth_context_from_ctx, 'token') and auth_context_from_ctx.token
+                        token_value = getattr(auth_context_from_ctx, 'token', None)
+                        logger.info(f"Retrieved auth_context from context variable with token: {has_token}")
+                        if has_token:
+                            logger.info(f"  token value: {token_value[:20]}...")
+                    else:
+                        logger.debug("No auth_context found in context variable")
+                except Exception as ctx_error:
+                    logger.debug(f"Could not retrieve auth_context from context variable: {ctx_error}")
 
             # Import query executor
             from .query_executor import execute_sql_query
+
+            # FIX: Determine which auth_context to use
+            # Must check for None explicitly, not falsy values (auth_context with empty token would be falsy)
+            if auth_context_from_storage is not None:
+                auth_context_to_use = auth_context_from_storage
+            else:
+                auth_context_to_use = _AUTH_CONTEXT_VAR.get()
+
+            # DEBUG: Log auth_context_to_use details
+            if auth_context_to_use:
+                logger.info(f"Using auth_context with token_id={getattr(auth_context_to_use, 'token_id', 'N/A')}, has_token={bool(getattr(auth_context_to_use, 'token', None))}")
+                if hasattr(auth_context_to_use, 'token') and auth_context_to_use.token:
+                    logger.info(f"  token value: {auth_context_to_use.token[:20]}...")
+                    logger.info(f"  object id: {id(auth_context_to_use)}")
+            else:
+                logger.warning("No auth_context_to_use - will use default database config!")
 
             # Call execute_sql_query to execute query with auth_context
             exec_result = await execute_sql_query(
@@ -1530,7 +1616,7 @@ class MetadataExtractor:
                 connection_manager=self.connection_manager,
                 limit=max_rows,
                 timeout=timeout,
-                auth_context=auth_context  # FIX: Pass auth_context with token
+                auth_context=auth_context_to_use  # FIX: Pass auth_context with token
             )
 
             return exec_result
@@ -1540,41 +1626,147 @@ class MetadataExtractor:
             return self._format_response(success=False, error=str(e), message="Error occurred while executing SQL query")
 
     async def get_table_schema_for_mcp(
-        self, 
-        table_name: str, 
-        db_name: str = None, 
+        self,
+        table_name: str,
+        db_name: str = None,
         catalog_name: str = None
     ) -> Dict[str, Any]:
         """Get detailed schema information for specified table (columns, types, comments, etc.) - MCP interface"""
         logger.info(f"Getting table schema: Table: {table_name}, DB: {db_name}, Catalog: {catalog_name}")
-        
+
         if not table_name:
             return self._format_response(success=False, error="Missing table_name parameter")
-        
+
         try:
+            # 🔧 FIX: Retrieve auth_context from global storage or contextvars (multi-worker mode)
+            # This ensures token-bound database configuration is used
+            auth_context_from_storage = None
+            try:
+                # Try to get from global storage first (shared with multiworker_app)
+                _current_auth_context = _get_current_auth_context()
+                if _current_auth_context is not None:
+                    auth_context_from_storage = _current_auth_context.get('auth_context')
+                    if auth_context_from_storage:
+                        logger.info(f"Session {self._session_id}: Retrieved auth_context from global storage, token_id={getattr(auth_context_from_storage, 'token_id', 'N/A')}")
+                    else:
+                        logger.debug(f"Session {self._session_id}: No auth_context in global storage, trying contextvars...")
+                else:
+                    logger.debug(f"Session {self._session_id}: Global storage not available (import failed), using contextvars...")
+            except Exception as storage_error:
+                logger.debug(f"Session {self._session_id}: Could not get auth_context from global storage: {storage_error}")
+
+            # If not found in global storage, try contextvars
+            if auth_context_from_storage is None:
+                try:
+                    auth_context_from_ctx = _AUTH_CONTEXT_VAR.get()
+                    if auth_context_from_ctx:
+                        logger.info(f"Session {self._session_id}: Retrieved auth_context from contextvars, token_id={getattr(auth_context_from_ctx, 'token_id', 'N/A')}")
+                    else:
+                        logger.debug(f"Session {self._session_id}: No auth_context in contextvars!")
+                except Exception as ctx_error:
+                    logger.debug(f"Session {self._session_id}: Could not retrieve auth_context from contextvars: {ctx_error}")
+
+            # Determine which auth_context to use
+            auth_context_to_use = None
+            if auth_context_from_storage is not None:
+                auth_context_to_use = auth_context_from_storage
+            else:
+                auth_context_to_use = _AUTH_CONTEXT_VAR.get()
+
+            # DEBUG: Log auth_context details
+            if auth_context_to_use:
+                logger.info(f"Session {self._session_id}: Using auth_context with token_id={getattr(auth_context_to_use, 'token_id', 'N/A')}, has_token={bool(getattr(auth_context_to_use, 'token', None))}")
+                if hasattr(auth_context_to_use, 'token') and auth_context_to_use.token:
+                    logger.info(f"  token value: {auth_context_to_use.token[:20]}...")
+                    logger.info(f"  object id: {id(auth_context_to_use)}")
+            else:
+                logger.warning(f"Session {self._session_id}: No auth_context_to_use - will use default database config!")
+
+            # Store auth_context in global storage for downstream use
+            try:
+                _current_auth_context = _get_current_auth_context()
+                if _current_auth_context is not None and auth_context_to_use is not None:
+                    _current_auth_context['auth_context'] = auth_context_to_use
+                    logger.debug(f"Session {self._session_id}: Stored auth_context in global storage for downstream use")
+            except Exception as store_error:
+                logger.debug(f"Session {self._session_id}: Could not store auth_context in global storage: {store_error}")
+
             schema = await self.get_table_schema_async(table_name=table_name, db_name=db_name, catalog_name=catalog_name)
-            
+
             if not schema:
                 return self._format_response(
-                    success=False, 
-                    error="Table does not exist or has no columns", 
+                    success=False,
+                    error="Table does not exist or has no columns",
                     message=f"Unable to get schema for table {catalog_name or 'default'}.{db_name or self.db_name}.{table_name}"
                 )
-            
+
             return self._format_response(success=True, result=schema)
         except Exception as e:
             logger.error(f"Failed to get table schema: {str(e)}", exc_info=True)
             return self._format_response(success=False, error=str(e), message="Error occurred while getting table schema")
 
     async def get_db_table_list_for_mcp(
-        self, 
-        db_name: str = None, 
+        self,
+        db_name: str = None,
         catalog_name: str = None
     ) -> Dict[str, Any]:
         """Get list of all table names in specified database - MCP interface"""
         logger.info(f"Getting database table list: DB: {db_name}, Catalog: {catalog_name}")
-        
+
         try:
+            # 🔧 FIX: Retrieve auth_context from global storage or contextvars (multi-worker mode)
+            # This ensures token-bound database configuration is used
+            auth_context_from_storage = None
+            try:
+                # Try to get from global storage first (shared with multiworker_app)
+                _current_auth_context = _get_current_auth_context()
+                if _current_auth_context is not None:
+                    auth_context_from_storage = _current_auth_context.get('auth_context')
+                    if auth_context_from_storage:
+                        logger.info(f"Session {self._session_id}: Retrieved auth_context from global storage, token_id={getattr(auth_context_from_storage, 'token_id', 'N/A')}")
+                    else:
+                        logger.debug(f"Session {self._session_id}: No auth_context in global storage, trying contextvars...")
+                else:
+                    logger.debug(f"Session {self._session_id}: Global storage not available (import failed), using contextvars...")
+            except Exception as storage_error:
+                logger.debug(f"Session {self._session_id}: Could not get auth_context from global storage: {storage_error}")
+
+            # If not found in global storage, try contextvars
+            if auth_context_from_storage is None:
+                try:
+                    auth_context_from_ctx = _AUTH_CONTEXT_VAR.get()
+                    if auth_context_from_ctx:
+                        logger.info(f"Session {self._session_id}: Retrieved auth_context from contextvars, token_id={getattr(auth_context_from_ctx, 'token_id', 'N/A')}")
+                    else:
+                        logger.debug(f"Session {self._session_id}: No auth_context in contextvars!")
+                except Exception as ctx_error:
+                    logger.debug(f"Session {self._session_id}: Could not retrieve auth_context from contextvars: {ctx_error}")
+
+            # Determine which auth_context to use
+            auth_context_to_use = None
+            if auth_context_from_storage is not None:
+                auth_context_to_use = auth_context_from_storage
+            else:
+                auth_context_to_use = _AUTH_CONTEXT_VAR.get()
+
+            # DEBUG: Log auth_context details
+            if auth_context_to_use:
+                logger.info(f"Session {self._session_id}: Using auth_context with token_id={getattr(auth_context_to_use, 'token_id', 'N/A')}, has_token={bool(getattr(auth_context_to_use, 'token', None))}")
+                if hasattr(auth_context_to_use, 'token') and auth_context_to_use.token:
+                    logger.info(f"  token value: {auth_context_to_use.token[:20]}...")
+                    logger.info(f"  object id: {id(auth_context_to_use)}")
+            else:
+                logger.warning(f"Session {self._session_id}: No auth_context_to_use - will use default database config!")
+
+            # Store auth_context in global storage for downstream use
+            try:
+                _current_auth_context = _get_current_auth_context()
+                if _current_auth_context is not None and auth_context_to_use is not None:
+                    _current_auth_context['auth_context'] = auth_context_to_use
+                    logger.debug(f"Session {self._session_id}: Stored auth_context in global storage for downstream use")
+            except Exception as store_error:
+                logger.debug(f"Session {self._session_id}: Could not store auth_context in global storage: {store_error}")
+
             tables = await self.get_database_tables_async(db_name=db_name, catalog_name=catalog_name)
             return self._format_response(success=True, result=tables)
         except Exception as e:
@@ -1584,8 +1776,61 @@ class MetadataExtractor:
     async def get_db_list_for_mcp(self, catalog_name: str = None) -> Dict[str, Any]:
         """Get list of all database names on server - MCP interface"""
         logger.info(f"Getting database list: Catalog: {catalog_name}")
-        
+
         try:
+            # 🔧 FIX: Retrieve auth_context from global storage or contextvars (multi-worker mode)
+            # This ensures token-bound database configuration is used
+            auth_context_from_storage = None
+            try:
+                # Try to get from global storage first (shared with multiworker_app)
+                _current_auth_context = _get_current_auth_context()
+                if _current_auth_context is not None:
+                    auth_context_from_storage = _current_auth_context.get('auth_context')
+                    if auth_context_from_storage:
+                        logger.info(f"Session {self._session_id}: Retrieved auth_context from global storage, token_id={getattr(auth_context_from_storage, 'token_id', 'N/A')}")
+                    else:
+                        logger.debug(f"Session {self._session_id}: No auth_context in global storage, trying contextvars...")
+                else:
+                    logger.debug(f"Session {self._session_id}: Global storage not available (import failed), using contextvars...")
+            except Exception as storage_error:
+                logger.debug(f"Session {self._session_id}: Could not get auth_context from global storage: {storage_error}")
+
+            # If not found in global storage, try contextvars
+            if auth_context_from_storage is None:
+                try:
+                    auth_context_from_ctx = _AUTH_CONTEXT_VAR.get()
+                    if auth_context_from_ctx:
+                        logger.info(f"Session {self._session_id}: Retrieved auth_context from contextvars, token_id={getattr(auth_context_from_ctx, 'token_id', 'N/A')}")
+                    else:
+                        logger.debug(f"Session {self._session_id}: No auth_context in contextvars!")
+                except Exception as ctx_error:
+                    logger.debug(f"Session {self._session_id}: Could not retrieve auth_context from contextvars: {ctx_error}")
+
+            # Determine which auth_context to use
+            auth_context_to_use = None
+            if auth_context_from_storage is not None:
+                auth_context_to_use = auth_context_from_storage
+            else:
+                auth_context_to_use = _AUTH_CONTEXT_VAR.get()
+
+            # DEBUG: Log auth_context details
+            if auth_context_to_use:
+                logger.info(f"Session {self._session_id}: Using auth_context with token_id={getattr(auth_context_to_use, 'token_id', 'N/A')}, has_token={bool(getattr(auth_context_to_use, 'token', None))}")
+                if hasattr(auth_context_to_use, 'token') and auth_context_to_use.token:
+                    logger.info(f"  token value: {auth_context_to_use.token[:20]}...")
+                    logger.info(f"  object id: {id(auth_context_to_use)}")
+            else:
+                logger.warning(f"Session {self._session_id}: No auth_context_to_use - will use default database config!")
+
+            # Store auth_context in global storage for downstream use
+            try:
+                _current_auth_context = _get_current_auth_context()
+                if _current_auth_context is not None and auth_context_to_use is not None:
+                    _current_auth_context['auth_context'] = auth_context_to_use
+                    logger.debug(f"Session {self._session_id}: Stored auth_context in global storage for downstream use")
+            except Exception as store_error:
+                logger.debug(f"Session {self._session_id}: Could not store auth_context in global storage: {store_error}")
+
             databases = await self.get_all_databases_async(catalog_name=catalog_name)
             return self._format_response(success=True, result=databases)
         except Exception as e:
@@ -1593,18 +1838,71 @@ class MetadataExtractor:
             return self._format_response(success=False, error=str(e), message="Error occurred while getting database list")
 
     async def get_table_comment_for_mcp(
-        self, 
-        table_name: str, 
-        db_name: str = None, 
+        self,
+        table_name: str,
+        db_name: str = None,
         catalog_name: str = None
     ) -> Dict[str, Any]:
         """Get comment information for specified table - MCP interface"""
         logger.info(f"Getting table comment: Table: {table_name}, DB: {db_name}, Catalog: {catalog_name}")
-        
+
         if not table_name:
             return self._format_response(success=False, error="Missing table_name parameter")
-        
+
         try:
+            # 🔧 FIX: Retrieve auth_context from global storage or contextvars (multi-worker mode)
+            # This ensures token-bound database configuration is used
+            auth_context_from_storage = None
+            try:
+                # Try to get from global storage first (shared with multiworker_app)
+                _current_auth_context = _get_current_auth_context()
+                if _current_auth_context is not None:
+                    auth_context_from_storage = _current_auth_context.get('auth_context')
+                    if auth_context_from_storage:
+                        logger.info(f"Session {self._session_id}: Retrieved auth_context from global storage, token_id={getattr(auth_context_from_storage, 'token_id', 'N/A')}")
+                    else:
+                        logger.debug(f"Session {self._session_id}: No auth_context in global storage, trying contextvars...")
+                else:
+                    logger.debug(f"Session {self._session_id}: Global storage not available (import failed), using contextvars...")
+            except Exception as storage_error:
+                logger.debug(f"Session {self._session_id}: Could not get auth_context from global storage: {storage_error}")
+
+            # If not found in global storage, try contextvars
+            if auth_context_from_storage is None:
+                try:
+                    auth_context_from_ctx = _AUTH_CONTEXT_VAR.get()
+                    if auth_context_from_ctx:
+                        logger.info(f"Session {self._session_id}: Retrieved auth_context from contextvars, token_id={getattr(auth_context_from_ctx, 'token_id', 'N/A')}")
+                    else:
+                        logger.debug(f"Session {self._session_id}: No auth_context in contextvars!")
+                except Exception as ctx_error:
+                    logger.debug(f"Session {self._session_id}: Could not retrieve auth_context from contextvars: {ctx_error}")
+
+            # Determine which auth_context to use
+            auth_context_to_use = None
+            if auth_context_from_storage is not None:
+                auth_context_to_use = auth_context_from_storage
+            else:
+                auth_context_to_use = _AUTH_CONTEXT_VAR.get()
+
+            # DEBUG: Log auth_context details
+            if auth_context_to_use:
+                logger.info(f"Session {self._session_id}: Using auth_context with token_id={getattr(auth_context_to_use, 'token_id', 'N/A')}, has_token={bool(getattr(auth_context_to_use, 'token', None))}")
+                if hasattr(auth_context_to_use, 'token') and auth_context_to_use.token:
+                    logger.info(f"  token value: {auth_context_to_use.token[:20]}...")
+                    logger.info(f"  object id: {id(auth_context_to_use)}")
+            else:
+                logger.warning(f"Session {self._session_id}: No auth_context_to_use - will use default database config!")
+
+            # Store auth_context in global storage for downstream use
+            try:
+                _current_auth_context = _get_current_auth_context()
+                if _current_auth_context is not None and auth_context_to_use is not None:
+                    _current_auth_context['auth_context'] = auth_context_to_use
+                    logger.debug(f"Session {self._session_id}: Stored auth_context in global storage for downstream use")
+            except Exception as store_error:
+                logger.debug(f"Session {self._session_id}: Could not store auth_context in global storage: {store_error}")
+
             comment = await self.get_table_comment_async(table_name=table_name, db_name=db_name, catalog_name=catalog_name)
             return self._format_response(success=True, result=comment)
         except Exception as e:
@@ -1612,18 +1910,71 @@ class MetadataExtractor:
             return self._format_response(success=False, error=str(e), message="Error occurred while getting table comment")
 
     async def get_table_column_comments_for_mcp(
-        self, 
-        table_name: str, 
-        db_name: str = None, 
+        self,
+        table_name: str,
+        db_name: str = None,
         catalog_name: str = None
     ) -> Dict[str, Any]:
         """Get comment information for all columns in specified table - MCP interface"""
         logger.info(f"Getting table column comments: Table: {table_name}, DB: {db_name}, Catalog: {catalog_name}")
-        
+
         if not table_name:
             return self._format_response(success=False, error="Missing table_name parameter")
-        
+
         try:
+            # 🔧 FIX: Retrieve auth_context from global storage or contextvars (multi-worker mode)
+            # This ensures token-bound database configuration is used
+            auth_context_from_storage = None
+            try:
+                # Try to get from global storage first (shared with multiworker_app)
+                _current_auth_context = _get_current_auth_context()
+                if _current_auth_context is not None:
+                    auth_context_from_storage = _current_auth_context.get('auth_context')
+                    if auth_context_from_storage:
+                        logger.info(f"Session {self._session_id}: Retrieved auth_context from global storage, token_id={getattr(auth_context_from_storage, 'token_id', 'N/A')}")
+                    else:
+                        logger.debug(f"Session {self._session_id}: No auth_context in global storage, trying contextvars...")
+                else:
+                    logger.debug(f"Session {self._session_id}: Global storage not available (import failed), using contextvars...")
+            except Exception as storage_error:
+                logger.debug(f"Session {self._session_id}: Could not get auth_context from global storage: {storage_error}")
+
+            # If not found in global storage, try contextvars
+            if auth_context_from_storage is None:
+                try:
+                    auth_context_from_ctx = _AUTH_CONTEXT_VAR.get()
+                    if auth_context_from_ctx:
+                        logger.info(f"Session {self._session_id}: Retrieved auth_context from contextvars, token_id={getattr(auth_context_from_ctx, 'token_id', 'N/A')}")
+                    else:
+                        logger.debug(f"Session {self._session_id}: No auth_context in contextvars!")
+                except Exception as ctx_error:
+                    logger.debug(f"Session {self._session_id}: Could not retrieve auth_context from contextvars: {ctx_error}")
+
+            # Determine which auth_context to use
+            auth_context_to_use = None
+            if auth_context_from_storage is not None:
+                auth_context_to_use = auth_context_from_storage
+            else:
+                auth_context_to_use = _AUTH_CONTEXT_VAR.get()
+
+            # DEBUG: Log auth_context details
+            if auth_context_to_use:
+                logger.info(f"Session {self._session_id}: Using auth_context with token_id={getattr(auth_context_to_use, 'token_id', 'N/A')}, has_token={bool(getattr(auth_context_to_use, 'token', None))}")
+                if hasattr(auth_context_to_use, 'token') and auth_context_to_use.token:
+                    logger.info(f"  token value: {auth_context_to_use.token[:20]}...")
+                    logger.info(f"  object id: {id(auth_context_to_use)}")
+            else:
+                logger.warning(f"Session {self._session_id}: No auth_context_to_use - will use default database config!")
+
+            # Store auth_context in global storage for downstream use
+            try:
+                _current_auth_context = _get_current_auth_context()
+                if _current_auth_context is not None and auth_context_to_use is not None:
+                    _current_auth_context['auth_context'] = auth_context_to_use
+                    logger.debug(f"Session {self._session_id}: Stored auth_context in global storage for downstream use")
+            except Exception as store_error:
+                logger.debug(f"Session {self._session_id}: Could not store auth_context in global storage: {store_error}")
+
             comments = await self.get_column_comments_async(table_name=table_name, db_name=db_name, catalog_name=catalog_name)
             return self._format_response(success=True, result=comments)
         except Exception as e:
@@ -1631,18 +1982,71 @@ class MetadataExtractor:
             return self._format_response(success=False, error=str(e), message="Error occurred while getting table column comments")
 
     async def get_table_indexes_for_mcp(
-        self, 
-        table_name: str, 
-        db_name: str = None, 
+        self,
+        table_name: str,
+        db_name: str = None,
         catalog_name: str = None
     ) -> Dict[str, Any]:
         """Get index information for specified table - MCP interface"""
         logger.info(f"Getting table indexes: Table: {table_name}, DB: {db_name}, Catalog: {catalog_name}")
-        
+
         if not table_name:
             return self._format_response(success=False, error="Missing table_name parameter")
-        
+
         try:
+            # 🔧 FIX: Retrieve auth_context from global storage or contextvars (multi-worker mode)
+            # This ensures token-bound database configuration is used
+            auth_context_from_storage = None
+            try:
+                # Try to get from global storage first (shared with multiworker_app)
+                _current_auth_context = _get_current_auth_context()
+                if _current_auth_context is not None:
+                    auth_context_from_storage = _current_auth_context.get('auth_context')
+                    if auth_context_from_storage:
+                        logger.info(f"Session {self._session_id}: Retrieved auth_context from global storage, token_id={getattr(auth_context_from_storage, 'token_id', 'N/A')}")
+                    else:
+                        logger.debug(f"Session {self._session_id}: No auth_context in global storage, trying contextvars...")
+                else:
+                    logger.debug(f"Session {self._session_id}: Global storage not available (import failed), using contextvars...")
+            except Exception as storage_error:
+                logger.debug(f"Session {self._session_id}: Could not get auth_context from global storage: {storage_error}")
+
+            # If not found in global storage, try contextvars
+            if auth_context_from_storage is None:
+                try:
+                    auth_context_from_ctx = _AUTH_CONTEXT_VAR.get()
+                    if auth_context_from_ctx:
+                        logger.info(f"Session {self._session_id}: Retrieved auth_context from contextvars, token_id={getattr(auth_context_from_ctx, 'token_id', 'N/A')}")
+                    else:
+                        logger.debug(f"Session {self._session_id}: No auth_context in contextvars!")
+                except Exception as ctx_error:
+                    logger.debug(f"Session {self._session_id}: Could not retrieve auth_context from contextvars: {ctx_error}")
+
+            # Determine which auth_context to use
+            auth_context_to_use = None
+            if auth_context_from_storage is not None:
+                auth_context_to_use = auth_context_from_storage
+            else:
+                auth_context_to_use = _AUTH_CONTEXT_VAR.get()
+
+            # DEBUG: Log auth_context details
+            if auth_context_to_use:
+                logger.info(f"Session {self._session_id}: Using auth_context with token_id={getattr(auth_context_to_use, 'token_id', 'N/A')}, has_token={bool(getattr(auth_context_to_use, 'token', None))}")
+                if hasattr(auth_context_to_use, 'token') and auth_context_to_use.token:
+                    logger.info(f"  token value: {auth_context_to_use.token[:20]}...")
+                    logger.info(f"  object id: {id(auth_context_to_use)}")
+            else:
+                logger.warning(f"Session {self._session_id}: No auth_context_to_use - will use default database config!")
+
+            # Store auth_context in global storage for downstream use
+            try:
+                _current_auth_context = _get_current_auth_context()
+                if _current_auth_context is not None and auth_context_to_use is not None:
+                    _current_auth_context['auth_context'] = auth_context_to_use
+                    logger.debug(f"Session {self._session_id}: Stored auth_context in global storage for downstream use")
+            except Exception as store_error:
+                logger.debug(f"Session {self._session_id}: Could not store auth_context in global storage: {store_error}")
+
             indexes = await self.get_table_indexes_async(table_name=table_name, db_name=db_name, catalog_name=catalog_name)
             return self._format_response(success=True, result=indexes)
         except Exception as e:
@@ -1665,10 +2069,63 @@ class MetadataExtractor:
     async def get_recent_audit_logs_for_mcp(self, days: int = 7, limit: int = 100) -> Dict[str, Any]:
         """Get recent audit log records - MCP interface"""
         logger.info(f"Getting audit logs: Days: {days}, Limit: {limit}")
-        
+
         try:
+            # 🔧 FIX: Retrieve auth_context from global storage or contextvars (multi-worker mode)
+            # This ensures token-bound database configuration is used
+            auth_context_from_storage = None
+            try:
+                # Try to get from global storage first (shared with multiworker_app)
+                _current_auth_context = _get_current_auth_context()
+                if _current_auth_context is not None:
+                    auth_context_from_storage = _current_auth_context.get('auth_context')
+                    if auth_context_from_storage:
+                        logger.info(f"Session {self._session_id}: Retrieved auth_context from global storage, token_id={getattr(auth_context_from_storage, 'token_id', 'N/A')}")
+                    else:
+                        logger.debug(f"Session {self._session_id}: No auth_context in global storage, trying contextvars...")
+                else:
+                    logger.debug(f"Session {self._session_id}: Global storage not available (import failed), using contextvars...")
+            except Exception as storage_error:
+                logger.debug(f"Session {self._session_id}: Could not get auth_context from global storage: {storage_error}")
+
+            # If not found in global storage, try contextvars
+            if auth_context_from_storage is None:
+                try:
+                    auth_context_from_ctx = _AUTH_CONTEXT_VAR.get()
+                    if auth_context_from_ctx:
+                        logger.info(f"Session {self._session_id}: Retrieved auth_context from contextvars, token_id={getattr(auth_context_from_ctx, 'token_id', 'N/A')}")
+                    else:
+                        logger.debug(f"Session {self._session_id}: No auth_context in contextvars!")
+                except Exception as ctx_error:
+                    logger.debug(f"Session {self._session_id}: Could not retrieve auth_context from contextvars: {ctx_error}")
+
+            # Determine which auth_context to use
+            auth_context_to_use = None
+            if auth_context_from_storage is not None:
+                auth_context_to_use = auth_context_from_storage
+            else:
+                auth_context_to_use = _AUTH_CONTEXT_VAR.get()
+
+            # DEBUG: Log auth_context details
+            if auth_context_to_use:
+                logger.info(f"Session {self._session_id}: Using auth_context with token_id={getattr(auth_context_to_use, 'token_id', 'N/A')}, has_token={bool(getattr(auth_context_to_use, 'token', None))}")
+                if hasattr(auth_context_to_use, 'token') and auth_context_to_use.token:
+                    logger.info(f"  token value: {auth_context_to_use.token[:20]}...")
+                    logger.info(f"  object id: {id(auth_context_to_use)}")
+            else:
+                logger.warning(f"Session {self._session_id}: No auth_context_to_use - will use default database config!")
+
+            # Store auth_context in global storage for downstream use
+            try:
+                _current_auth_context = _get_current_auth_context()
+                if _current_auth_context is not None and auth_context_to_use is not None:
+                    _current_auth_context['auth_context'] = auth_context_to_use
+                    logger.debug(f"Session {self._session_id}: Stored auth_context in global storage for downstream use")
+            except Exception as store_error:
+                logger.debug(f"Session {self._session_id}: Could not store auth_context in global storage: {store_error}")
+
             logs_df = await self.get_recent_audit_logs_async(days=days, limit=limit)
-            
+
             # Convert DataFrame to JSON format
             if hasattr(logs_df, 'to_dict'):
                 try:
@@ -1684,7 +2141,7 @@ class MetadataExtractor:
                 logs_data = self._serialize_datetime_objects(logs_data)
             else:
                 logs_data = self._serialize_datetime_objects(logs_df)
-                
+
             return self._format_response(success=True, result=logs_data)
         except Exception as e:
             logger.error(f"Failed to get audit logs: {str(e)}", exc_info=True)
@@ -1693,8 +2150,61 @@ class MetadataExtractor:
     async def get_catalog_list_for_mcp(self) -> Dict[str, Any]:
         """Get Doris catalog list - MCP interface"""
         logger.info("Getting catalog list")
-        
+
         try:
+            # 🔧 FIX: Retrieve auth_context from global storage or contextvars (multi-worker mode)
+            # This ensures token-bound database configuration is used
+            auth_context_from_storage = None
+            try:
+                # Try to get from global storage first (shared with multiworker_app)
+                _current_auth_context = _get_current_auth_context()
+                if _current_auth_context is not None:
+                    auth_context_from_storage = _current_auth_context.get('auth_context')
+                    if auth_context_from_storage:
+                        logger.info(f"Session {self._session_id}: Retrieved auth_context from global storage, token_id={getattr(auth_context_from_storage, 'token_id', 'N/A')}")
+                    else:
+                        logger.debug(f"Session {self._session_id}: No auth_context in global storage, trying contextvars...")
+                else:
+                    logger.debug(f"Session {self._session_id}: Global storage not available (import failed), using contextvars...")
+            except Exception as storage_error:
+                logger.debug(f"Session {self._session_id}: Could not get auth_context from global storage: {storage_error}")
+
+            # If not found in global storage, try contextvars
+            if auth_context_from_storage is None:
+                try:
+                    auth_context_from_ctx = _AUTH_CONTEXT_VAR.get()
+                    if auth_context_from_ctx:
+                        logger.info(f"Session {self._session_id}: Retrieved auth_context from contextvars, token_id={getattr(auth_context_from_ctx, 'token_id', 'N/A')}")
+                    else:
+                        logger.debug(f"Session {self._session_id}: No auth_context in contextvars!")
+                except Exception as ctx_error:
+                    logger.debug(f"Session {self._session_id}: Could not retrieve auth_context from contextvars: {ctx_error}")
+
+            # Determine which auth_context to use
+            auth_context_to_use = None
+            if auth_context_from_storage is not None:
+                auth_context_to_use = auth_context_from_storage
+            else:
+                auth_context_to_use = _AUTH_CONTEXT_VAR.get()
+
+            # DEBUG: Log auth_context details
+            if auth_context_to_use:
+                logger.info(f"Session {self._session_id}: Using auth_context with token_id={getattr(auth_context_to_use, 'token_id', 'N/A')}, has_token={bool(getattr(auth_context_to_use, 'token', None))}")
+                if hasattr(auth_context_to_use, 'token') and auth_context_to_use.token:
+                    logger.info(f"  token value: {auth_context_to_use.token[:20]}...")
+                    logger.info(f"  object id: {id(auth_context_to_use)}")
+            else:
+                logger.warning(f"Session {self._session_id}: No auth_context_to_use - will use default database config!")
+
+            # Store auth_context in global storage for downstream use
+            try:
+                _current_auth_context = _get_current_auth_context()
+                if _current_auth_context is not None and auth_context_to_use is not None:
+                    _current_auth_context['auth_context'] = auth_context_to_use
+                    logger.debug(f"Session {self._session_id}: Stored auth_context in global storage for downstream use")
+            except Exception as store_error:
+                logger.debug(f"Session {self._session_id}: Could not store auth_context in global storage: {store_error}")
+
             catalogs = await self.get_catalog_list_async()
             return self._format_response(success=True, result=catalogs, message="Successfully retrieved catalog list")
         except Exception as e:

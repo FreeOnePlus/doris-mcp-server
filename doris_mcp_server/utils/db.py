@@ -24,9 +24,29 @@ Supports asynchronous operations and concurrent connection management, ensuring 
 
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+
+# Global context variable for multi-worker mode auth_context
+# This ensures all parts of the application can access the authenticated context
+from .security import AuthContext
+
+# Declare at module level to ensure single instance across the application
+_AUTH_CONTEXT_VAR: ContextVar = ContextVar('mcp_auth_context', default=None)
+
+# FIX for circular import: Instead of importing _current_auth_context at module level,
+# we will import it dynamically at runtime to avoid circular dependency issues
+# DO NOT import _current_auth_context here - it causes circular import with multiworker_app
+def _get_current_auth_context():
+    """Get the global auth_context storage from multiworker_app at runtime"""
+    try:
+        from ..multiworker_app import _current_auth_context
+        return _current_auth_context
+    except ImportError:
+        return None
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -321,9 +341,18 @@ class DorisConnectionManager:
         return config_value is None or config_value == '' or str(config_value).lower() == 'null'
     
     def _has_valid_global_config(self) -> bool:
-        """Check if global database configuration is valid and non-empty"""
-        return (not self._is_config_empty(self.original_db_config['host']) and
-                not self._is_config_empty(self.original_db_config['user']))
+        """Check if global database configuration is valid and non-empty (excluding default values)"""
+        # Default values from config.py that should be considered as "not configured"
+        default_values = {'localhost', '127.0.0.1', ''}
+
+        host = self.original_db_config.get('host', '')
+        user = self.original_db_config.get('user', '')
+
+        # Check if host and user are provided AND not default values
+        return (not self._is_config_empty(host) and
+                host not in default_values and
+                not self._is_config_empty(user) and
+                user not in default_values)
     
     def _find_available_token_with_db_config(self) -> str:
         """Find the first available token with database configuration
@@ -603,8 +632,10 @@ class DorisConnectionManager:
             # Token-bound configs will be handled dynamically during requests
             if not self._has_valid_global_config():
                 self.logger.info("No valid global database config, pool will be created dynamically for token-bound configs")
+                # DON'T start background monitoring tasks when pool is not created
+                # They will be started when pool is created dynamically via configure_for_token()
                 return
-            
+
             # Create connection pool
             self.pool = await aiomysql.create_pool(
                 host=self.host,
@@ -619,12 +650,20 @@ class DorisConnectionManager:
                 connect_timeout=self.connect_timeout,
                 autocommit=True
             )
-            
-            # Test initial connection
-            if not await self._test_pool_health():
-                raise RuntimeError("Connection pool health check failed")
 
-            # Start background monitoring tasks
+            # Test initial connection
+            # Skip health check in multi-worker mode to avoid connection conflicts
+            # Users can set DISABLE_POOL_HEALTH_CHECK=true in .env to disable this check
+            skip_health_check = os.environ.get("DISABLE_POOL_HEALTH_CHECK", "").lower() in ("true", "1", "yes")
+            if not skip_health_check:
+                if not await self._test_pool_health():
+                    self.logger.warning("Connection pool health check failed, but continuing (multi-worker mode?)")
+                    # In multi-worker mode, allow initialization to continue even if health check fails
+                    # This is because multiple workers may cause transient connection issues
+            else:
+                self.logger.info("Skipping connection pool health check (disabled by environment variable)")
+
+            # Start background monitoring tasks ONLY when pool was successfully created
             self.pool_health_check_task = asyncio.create_task(self._pool_health_monitor())
             self.pool_cleanup_task = asyncio.create_task(self._pool_cleanup_monitor())
             
@@ -1112,24 +1151,56 @@ class DorisConnectionManager:
                 
                 # Check if pool is available
                 if not self.pool:
-                    self.logger.warning("Connection pool is not available, attempting recovery...")
-                    
-                    # Try to use token-bound configuration if available
-                    if self.token_manager and not self._has_valid_global_config():
+                    self.logger.warning(f"Connection pool is not available for session {session_id}, attempting to configure with token...")
+
+                    # FIX: Try to get token from current auth_context (multi-worker mode)
+                    token_from_context = None
+                    try:
+                        # Try to get from global storage first
+                        _current_auth_context = _get_current_auth_context()
+                        if _current_auth_context is not None:
+                            auth_ctx = _current_auth_context.get('auth_context')
+                            if auth_ctx and hasattr(auth_ctx, 'token') and auth_ctx.token:
+                                token_from_context = auth_ctx.token
+                                self.logger.info(f"✅ Found token in global storage for pool creation: {token_from_context[:20]}...")
+
+                        # If not found, try contextvars
+                        if not token_from_context:
+                            auth_ctx = _AUTH_CONTEXT_VAR.get()
+                            if auth_ctx and hasattr(auth_ctx, 'token') and auth_ctx.token:
+                                token_from_context = auth_ctx.token
+                                self.logger.info(f"✅ Found token in contextvars for pool creation: {token_from_context[:20]}...")
+                    except Exception as ctx_error:
+                        self.logger.debug(f"Could not get token from context: {ctx_error}")
+
+                    # Try to use token-bound configuration if token is available
+                    if token_from_context and self.token_manager:
+                        self.logger.info(f"🔧 Configuring database with token from context...")
+                        try:
+                            success, config_source = await self.configure_for_token(token_from_context)
+                            if success:
+                                self.logger.info(f"✅ Successfully configured {config_source} database for session {session_id}")
+                            else:
+                                self.logger.warning(f"❌ Token configuration failed for session {session_id}")
+                        except Exception as e:
+                            self.logger.error(f"Failed to configure with token from context: {e}")
+                    elif self.token_manager and not self._has_valid_global_config():
+                        # Fallback: Try to find any available token with db config
                         available_token = self._find_available_token_with_db_config()
                         if available_token:
-                            self.logger.info(f"Using token-bound configuration for pool creation: {available_token}")
+                            self.logger.info(f"Using fallback token-bound configuration for pool creation: {available_token[:20]}...")
                             try:
                                 await self.configure_for_token(available_token)
                             except Exception as e:
-                                self.logger.error(f"Failed to configure with token-bound config: {e}")
-                    
-                    # Fallback to recovery
+                                self.logger.error(f"Failed to configure with fallback token: {e}")
+
+                    # Fallback to recovery if still no pool
                     if not self.pool:
+                        self.logger.warning("No token-bound config succeeded, attempting pool recovery...")
                         await self._recover_pool_with_lock()
-                    
+
                     if not self.pool:
-                        raise RuntimeError("Connection pool is not available and recovery failed")
+                        raise RuntimeError(f"Connection pool is not available for session {session_id} and all recovery attempts failed")
                 
                 # Check if pool is closed
                 if self.pool.closed:
@@ -1275,13 +1346,52 @@ class DorisConnectionManager:
         """
         connection = None
         try:
+            # FIX: Retrieve auth_context from global storage or contextvars (for multi-worker mode)
+            # Must check for None explicitly, not falsy values (auth_context with empty token would be falsy)
+            if auth_context is None:
+                # Try to get from global storage first (shared with multiworker_app)
+                try:
+                    if _current_auth_context is not None:
+                        auth_context = _current_auth_context.get('auth_context')
+                        if auth_context:
+                            self.logger.info(f"Session {session_id}: Retrieved auth_context from global storage, token_id={getattr(auth_context, 'token_id', 'N/A')}")
+                        else:
+                            self.logger.debug(f"Session {session_id}: No auth_context in global storage, trying contextvars...")
+                    else:
+                        self.logger.debug(f"Session {session_id}: Global storage not available (import failed), using contextvars...")
+                except Exception as storage_error:
+                    self.logger.debug(f"Session {session_id}: Could not get auth_context from global storage: {storage_error}")
+
+                # If not found in global storage, try contextvars
+                if auth_context is None:
+                    try:
+                        auth_context = _AUTH_CONTEXT_VAR.get()
+                        if auth_context:
+                            self.logger.info(f"Session {session_id}: Retrieved auth_context from contextvars, token_id={getattr(auth_context, 'token_id', 'N/A')}")
+                        else:
+                            self.logger.debug(f"Session {session_id}: No auth_context in contextvars!")
+                    except Exception as ctx_error:
+                        self.logger.debug(f"Session {session_id}: Could not retrieve auth_context from contextvars: {ctx_error}")
+
+            # DEBUG: Log auth_context status for multi-worker debugging
+            if auth_context:
+                self.logger.debug(f"Session {session_id}: auth_context exists, token_id={getattr(auth_context, 'token_id', 'N/A')}")
+                if hasattr(auth_context, 'token') and auth_context.token:
+                    self.logger.debug(f"Session {session_id}: token exists (length={len(auth_context.token)})")
+                else:
+                    self.logger.debug(f"Session {session_id}: NO token in auth_context (this may be the problem!)")
+            else:
+                self.logger.debug(f"Session {session_id}: NO auth_context provided (will use global config)")
+
             # FIX: Configure database for token BEFORE getting connection
             # This ensures token-bound database configuration is used instead of global config
             if auth_context and hasattr(auth_context, 'token') and auth_context.token:
                 try:
+                    self.logger.info(f"Session {session_id}: FOUND token in auth_context! Token: {auth_context.token[:20]}...")
+                    self.logger.info(f"Session {session_id}: Calling configure_for_token with token")
                     success, config_source = await self.configure_for_token(auth_context.token)
                     if success:
-                        self.logger.info(f"Session {session_id}: Using {config_source} database configuration")
+                        self.logger.info(f"Session {session_id}: ✅ Using {config_source} database configuration")
                     else:
                         self.logger.warning(f"Session {session_id}: Token configuration failed, may use global config")
                 except Exception as token_config_error:
@@ -1297,6 +1407,8 @@ class DorisConnectionManager:
                     else:
                         # No token manager, can use global config
                         self.logger.warning(f"Session {session_id}: No token manager, using global config")
+            else:
+                self.logger.warning(f"Session {session_id}: ❌ No token found in auth_context! auth_context exists: {bool(auth_context)}, has token: {bool(auth_context and hasattr(auth_context, 'token') and auth_context.token)}")
 
             # Always get fresh connection from pool (with configured database)
             connection = await self.get_connection(session_id)
