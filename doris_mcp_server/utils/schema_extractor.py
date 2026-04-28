@@ -1190,13 +1190,6 @@ class MetadataExtractor:
                             logger.debug(f"Session {self._session_id}: No auth_context in contextvars!")
                     except Exception as ctx_error:
                         logger.debug(f"Session {self._session_id}: Could not retrieve auth_context from contextvars: {ctx_error}")
-
-                # DEBUG: Log auth_context details before passing to connection_manager
-                if auth_context:
-                    logger.info(f"Session {self._session_id}: Passing auth_context to connection_manager, token_id={getattr(auth_context, 'token_id', 'N/A')}, has_token={bool(getattr(auth_context, 'token', None))}")
-                    if hasattr(auth_context, 'token') and auth_context.token:
-                        logger.info(f"  token value: {auth_context.token[:20]}...")
-                        logger.info(f"  object id: {id(auth_context)}")
                 else:
                     logger.warning(f"Session {self._session_id}: No auth_context - will use default database config!")
 
